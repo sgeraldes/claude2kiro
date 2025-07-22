@@ -1,6 +1,11 @@
 # Kiro Auth Token 管理工具
 
 这是一个Go命令行工具，用于管理Kiro认证token和提供Anthropic API代理服务。
+### Claude Code
+<img width="1920" height="1040" alt="image" src="https://github.com/user-attachments/assets/25f02026-f316-4a27-831c-6bc28cb03fca" />
+
+### Cherry Studio
+<img width="1920" height="1040" alt="image" src="https://github.com/user-attachments/assets/9bb24690-1e96-4a85-a7fc-bf7cdee95c09" />
 
 ## 功能
 
