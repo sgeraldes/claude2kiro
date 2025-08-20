@@ -609,6 +609,25 @@ func startServer(port string) {
 			return
 		}
 
+		// 基础校验，给出明确的错误提示
+		if anthropicReq.Model == "" {
+			http.Error(w, `{"message":"Missing required field: model"}`, http.StatusBadRequest)
+			return
+		}
+		if len(anthropicReq.Messages) == 0 {
+			http.Error(w, `{"message":"Missing required field: messages"}`, http.StatusBadRequest)
+			return
+		}
+		if _, ok := ModelMap[anthropicReq.Model]; !ok {
+			// 提示可用的模型名称
+			available := make([]string, 0, len(ModelMap))
+			for k := range ModelMap {
+				available = append(available, k)
+			}
+			http.Error(w, fmt.Sprintf("{\"message\":\"Unknown or unsupported model: %s\",\"availableModels\":[%s]}", anthropicReq.Model, "\""+strings.Join(available, "\",\"")+"\""), http.StatusBadRequest)
+			return
+		}
+
 		// 如果是流式请求
 		if anthropicReq.Stream {
 			handleStreamRequest(w, anthropicReq, token.AccessToken)
@@ -915,6 +934,15 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			}
 		}
 	}
+
+	// 回退：如果已累积到文本但未收到 content_block_stop(index=0)，也要返回文本
+	if len(contexts) == 0 && strings.TrimSpace(context) != "" {
+		contexts = append(contexts, map[string]any{
+			"type": "text",
+			"text": context,
+		})
+	}
+	
 	// 检查是否是错误响应
 	if strings.Contains(string(cwRespBody), "Improperly formed request.") {
 		fmt.Printf("错误: CodeWhisperer返回格式错误: %s\n", respBodyStr)
