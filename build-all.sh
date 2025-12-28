@@ -1,0 +1,36 @@
+#!/bin/bash
+set -e
+
+# Get version from datetime
+VERSION="0.2.$(date +%y%m%d%H%M)"
+LDFLAGS="-ldflags \"-X github.com/bestk/kiro2cc/internal/tui/menu.Version=${VERSION}\""
+
+echo "Building kiro2cc v${VERSION} for all platforms..."
+echo
+
+# Create dist directory
+mkdir -p dist
+
+# Windows AMD64
+echo "Building Windows AMD64..."
+GOOS=windows GOARCH=amd64 go build -ldflags "-X github.com/bestk/kiro2cc/internal/tui/menu.Version=${VERSION}" -o dist/kiro2cc-windows-amd64.exe main.go
+
+# Linux AMD64
+echo "Building Linux AMD64..."
+GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/bestk/kiro2cc/internal/tui/menu.Version=${VERSION}" -o dist/kiro2cc-linux-amd64 main.go
+
+# Linux ARM64
+echo "Building Linux ARM64..."
+GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/bestk/kiro2cc/internal/tui/menu.Version=${VERSION}" -o dist/kiro2cc-linux-arm64 main.go
+
+# macOS AMD64 (Intel)
+echo "Building macOS AMD64..."
+GOOS=darwin GOARCH=amd64 go build -ldflags "-X github.com/bestk/kiro2cc/internal/tui/menu.Version=${VERSION}" -o dist/kiro2cc-darwin-amd64 main.go
+
+# macOS ARM64 (Apple Silicon)
+echo "Building macOS ARM64..."
+GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/bestk/kiro2cc/internal/tui/menu.Version=${VERSION}" -o dist/kiro2cc-darwin-arm64 main.go
+
+echo
+echo "Build successful! Binaries in dist/"
+ls -la dist/

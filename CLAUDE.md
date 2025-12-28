@@ -4,19 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Go CLI tool called `kiro2cc` that manages Kiro authentication tokens and provides an Anthropic API proxy service. The tool acts as a bridge between Anthropic API requests and AWS CodeWhisperer, translating requests and responses between the two formats.
+**kiro2cc** is a Go CLI tool that enables Claude Code (and other Anthropic API-compatible tools) to work with Kiro subscriptions instead of direct Anthropic subscriptions.
+
+### Background: Kiro and Its Relationship to Claude
+
+**Kiro** is Amazon's agentic AI IDE (launched July 2025) that uses Claude models as its AI backend:
+- Claude Sonnet 4.0, 4.5
+- Claude Haiku 4.5
+- Claude Opus 4.5 (experimental)
+
+The backend API uses the legacy `codewhisperer.amazonaws.com` endpoint because:
+- **CodeWhisperer** (2022) → **Amazon Q Developer** (April 2024) → **Kiro** (July 2025)
+- The API endpoints haven't been renamed yet
+
+### How It Works
+
+1. User logs into Kiro IDE (creates auth token at `~/.aws/sso/cache/kiro-auth-token.json`)
+2. kiro2cc reads this token and starts a local proxy server
+3. Claude Code sends requests to the proxy in Anthropic API format
+4. Proxy translates to CodeWhisperer format and forwards to AWS
+5. AWS responds with binary event stream
+6. Proxy parses and converts back to Anthropic SSE format
+7. Claude Code receives standard Anthropic responses
 
 ## Build and Development Commands
 
+**IMPORTANT**: Go is not in bash PATH. Always use full path:
+
 ```bash
 # Build the application
-go build -o kiro2cc main.go
+"C:/Program Files/Go/bin/go.exe" build -o kiro2cc.exe main.go
 
 # Run tests
-go test ./...
+"C:/Program Files/Go/bin/go.exe" test ./...
 
 # Run specific test in parser package
-go test ./parser -v
+"C:/Program Files/Go/bin/go.exe" test ./parser -v
 
 # Run the application
 ./kiro2cc [command]
@@ -24,54 +47,160 @@ go test ./parser -v
 
 ## Application Commands
 
-- `./kiro2cc read` - Read and display token information
-- `./kiro2cc refresh` - Refresh the access token using refresh token
-- `./kiro2cc export` - Export environment variables for other tools
-- `./kiro2cc server [port]` - Start HTTP proxy server (default port 8080)
+| Command | Description |
+|---------|-------------|
+| `./kiro2cc read` | Display current token information |
+| `./kiro2cc refresh` | Refresh access token using refresh token |
+| `./kiro2cc export` | Output environment variable commands |
+| `./kiro2cc claude` | Configure Claude Code's `~/.claude.json` |
+| `./kiro2cc server [port]` | Start HTTP proxy server (default: 8080) |
 
 ## Architecture
 
+### Project Structure
+
+```
+kiro2cc/
+├── main.go                 # Core application (~1000 lines)
+├── parser/
+│   ├── sse_parser.go       # Binary response parser
+│   └── sse_parser_test.go  # Parser tests
+├── go.mod                  # Go module (no external deps)
+├── README.md               # User documentation
+├── CLAUDE.md               # This file
+└── build.bat               # Windows build script
+```
+
 ### Core Components
 
-1. **Token Management** (`main.go:337-486`)
-   - Reads tokens from `~/.aws/sso/cache/kiro-auth-token.json`
-   - Handles token refresh via Kiro auth service
-   - Cross-platform environment variable export
+#### 1. Token Management (`main.go:337-545`)
 
-2. **API Translation** (`main.go:232-303`)
-   - Converts Anthropic API requests to CodeWhisperer format
-   - Maps model names via `ModelMap` (line 218-221)
-   - Handles conversation history and system messages
+- **Token file**: `~/.aws/sso/cache/kiro-auth-token.json`
+- **Refresh endpoint**: `https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken`
+- **Functions**:
+  - `getTokenFilePath()` - Cross-platform token path resolution
+  - `readToken()` - Display token info
+  - `refreshToken()` - Refresh expired tokens
+  - `exportEnvVars()` - Output env var commands for shell
+  - `setClaude()` - Configure Claude Code's settings
 
-3. **HTTP Proxy Server** (`main.go:514-893`)
-   - Serves on `/v1/messages` endpoint
-   - Supports both streaming and non-streaming requests
-   - Automatic token refresh on 403 errors
+#### 2. API Translation (`main.go:232-303`)
 
-4. **Response Parser** (`parser/sse_parser.go`)
-   - Parses binary CodeWhisperer responses
-   - Converts to Anthropic-compatible SSE events
-   - Handles tool use and text content blocks
+- **Function**: `buildCodeWhispererRequest()`
+- **Model mapping** (`main.go:218-221`):
+  ```go
+  var ModelMap = map[string]string{
+      "claude-sonnet-4-20250514":  "CLAUDE_SONNET_4_20250514_V1_0",
+      "claude-3-5-haiku-20241022": "CLAUDE_3_7_SONNET_20250219_V1_0",
+  }
+  ```
+- Converts Anthropic messages to CodeWhisperer conversation format
+- Handles system messages as conversation history
+- Transforms tool definitions to CodeWhisperer format
+
+#### 3. HTTP Proxy Server (`main.go:571-970`)
+
+- **Endpoint**: `POST /v1/messages`
+- **Backend**: `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse`
+- **Features**:
+  - Streaming (SSE) and non-streaming responses
+  - Automatic token refresh on 403 errors
+  - Random delay (0-300ms) between SSE events for natural streaming
+
+#### 4. Response Parser (`parser/sse_parser.go`)
+
+Parses AWS CodeWhisperer's binary event stream format:
+
+```
+┌─────────────┬──────────────┬─────────────┬─────────────┬──────────┐
+│ Total len   │ Header len   │ Headers     │ Payload     │ CRC32    │
+│ (4 bytes)   │ (4 bytes)    │ (variable)  │ (variable)  │ (4 bytes)│
+└─────────────┴──────────────┴─────────────┴─────────────┴──────────┘
+```
+
+Converts to Anthropic SSE events:
+- `message_start`
+- `content_block_start`
+- `content_block_delta` (text or tool input JSON)
+- `content_block_stop`
+- `message_delta`
+- `message_stop`
 
 ### Key Data Structures
 
-- `AnthropicRequest` - Incoming API requests
-- `CodeWhispererRequest` - Outgoing AWS requests  
-- `TokenData` - Authentication token storage
-- `SSEEvent` - Streaming response events
+| Structure | Purpose |
+|-----------|---------|
+| `TokenData` | Auth token storage (access, refresh, expiry) |
+| `AnthropicRequest` | Incoming API request format |
+| `CodeWhispererRequest` | Outgoing AWS request format |
+| `HistoryUserMessage` | Conversation history (user) |
+| `HistoryAssistantMessage` | Conversation history (assistant) |
+| `CodeWhispererTool` | Tool definition for AWS format |
 
-### Request Flow
+### Request Flow Diagram
 
-1. Client sends Anthropic API request to `/v1/messages`
-2. Server reads token from filesystem
-3. Request converted to CodeWhisperer format
-4. Proxied to AWS CodeWhisperer API
-5. Response parsed and converted back to Anthropic format
-6. Streamed or returned as JSON to client
+```
+Claude Code ──────► POST /v1/messages ──────► kiro2cc proxy
+                    (Anthropic format)              │
+                                                    ▼
+                                        Read ~/.aws/sso/cache/
+                                        kiro-auth-token.json
+                                                    │
+                                                    ▼
+                                        buildCodeWhispererRequest()
+                                                    │
+                                                    ▼
+                          POST to codewhisperer.us-east-1.amazonaws.com
+                               /generateAssistantResponse
+                                                    │
+                                                    ▼
+                                        parser.ParseEvents()
+                                        (binary → SSE events)
+                                                    │
+                                                    ▼
+Claude Code ◄────── SSE stream ◄────────────────────┘
+                    (Anthropic format)
+```
 
 ## Development Notes
 
-- Uses hardcoded proxy `127.0.0.1:9000` for AWS requests
-- Model mapping required between Anthropic and CodeWhisperer model IDs
-- Response files saved as `msg_[timestamp]response.raw` for debugging
-- Automatic token refresh on authentication failures
+- **No external dependencies**: Uses only Go standard library
+- **Cross-platform**: Windows, Linux, macOS support with appropriate path handling
+- **Debug output**: Uncomment `os.WriteFile()` calls to save raw responses for debugging
+- **Model mapping**: Update `ModelMap` when Kiro adds new models
+- **ProfileArn**: Hardcoded AWS profile ARN for CodeWhisperer access
+
+## Kiro Context
+
+### Pricing (as of Dec 2025)
+
+| Plan | Credits | Price |
+|------|---------|-------|
+| Free | 50 | $0/month |
+| Pro | 1,000 | $20/month |
+| Pro+ | 2,000 | $40/month |
+| Power | 10,000 | $200/month |
+
+### Model Credit Multipliers
+
+| Model | Multiplier |
+|-------|------------|
+| Auto | 1.0x |
+| Haiku 4.5 | 0.4x |
+| Sonnet 4.0/4.5 | 1.3x |
+| Opus 4.5 | 2.2x |
+
+## Testing
+
+```bash
+# Run all tests
+"C:/Program Files/Go/bin/go.exe" test ./...
+
+# Run parser tests with verbose output
+"C:/Program Files/Go/bin/go.exe" test ./parser -v
+
+# Test the server manually
+curl -X POST http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-4-20250514", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}'
+```

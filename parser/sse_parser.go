@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
-	"log"
 	"strings"
 )
 
@@ -41,7 +40,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 		}
 
 		if int(totalLen) > r.Len()+8 {
-			log.Println("Frame length invalid")
+			// Frame length invalid - silently break
 			break
 		}
 
@@ -86,7 +85,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 
 			}
 		} else {
-			log.Println("json unmarshal error:", err)
+			// json unmarshal error - silently continue
 		}
 	}
 

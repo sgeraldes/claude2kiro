@@ -1,3 +1,23 @@
+# Binaries
 *.exe
+*.exe~
+kiro2cc
+kiro2cc-*
 
+# Build output
+dist/
+build_output.txt
+
+# Debug files
 *response.raw
+
+# OS files
+NUL
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
