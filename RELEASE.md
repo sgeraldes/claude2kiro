@@ -1,4 +1,4 @@
-# Release Plan for kiro2cc v0.2.0
+# Release Plan for Claude2Kiro v0.2.0
 
 ## Release Summary
 
@@ -64,7 +64,7 @@ github.com/charmbracelet/lipgloss v1.0.0
 
 ### Single Platform
 ```bash
-go build -o kiro2cc main.go
+go build -o claude2kiro main.go
 ```
 
 ### All Platforms
@@ -91,7 +91,7 @@ Outputs to `dist/` directory.
 ## GitHub Release Notes Template
 
 ```markdown
-## kiro2cc v0.2.0
+## Claude2Kiro v0.2.0
 
 ### Highlights
 - **Interactive TUI** - Beautiful terminal interface with real-time dashboard
@@ -113,21 +113,21 @@ Outputs to `dist/` directory.
 ### Download
 | Platform | File |
 |----------|------|
-| Windows | kiro2cc-windows-amd64.exe |
-| Linux (Intel/AMD) | kiro2cc-linux-amd64 |
-| Linux (ARM) | kiro2cc-linux-arm64 |
-| macOS (Intel) | kiro2cc-darwin-amd64 |
-| macOS (Apple Silicon) | kiro2cc-darwin-arm64 |
+| Windows | claude2kiro-windows-amd64.exe |
+| Linux (Intel/AMD) | claude2kiro-linux-amd64 |
+| Linux (ARM) | claude2kiro-linux-arm64 |
+| macOS (Intel) | claude2kiro-darwin-amd64 |
+| macOS (Apple Silicon) | claude2kiro-darwin-arm64 |
 
 ### Quick Start
 ```bash
 # Run the TUI
-./kiro2cc
+./claude2kiro
 
 # Or use commands directly
-./kiro2cc login github
-./kiro2cc claude  # Creates claude-kiro script
-./kiro2cc server
+./claude2kiro login github
+./claude2kiro claude  # Creates claude-kiro script
+./claude2kiro server
 ```
 ```
 

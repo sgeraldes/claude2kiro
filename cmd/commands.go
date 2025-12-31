@@ -7,14 +7,17 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/bestk/kiro2cc/internal/tui/dashboard"
-	"github.com/bestk/kiro2cc/internal/tui/logger"
+	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
+	"github.com/sgeraldes/claude2kiro/internal/tui/messages"
 )
 
 // TokenData represents the token file structure
@@ -124,6 +127,16 @@ func HasToken() bool {
 	return err == nil
 }
 
+// IsTokenExpired returns true if the token is expired or will expire within the configured threshold
+func IsTokenExpired() bool {
+	expiry := GetTokenExpiry()
+	if expiry.IsZero() {
+		return true
+	}
+	cfg := config.Get()
+	return time.Until(expiry) < cfg.Network.TokenRefreshThreshold
+}
+
 // ReadClientRegistration reads cached client registration
 func ReadClientRegistration(clientIdHash string) (*SSOClientRegistration, error) {
 	path := GetClientRegistrationPath(clientIdHash)
@@ -145,9 +158,10 @@ func RefreshTokenIdC(currentToken TokenData) (TokenData, error) {
 		return TokenData{}, fmt.Errorf("failed to read client registration: %v (try logging in again)", err)
 	}
 
+	cfg := config.Get()
 	region := currentToken.Region
 	if region == "" {
-		region = "us-east-1"
+		region = cfg.Advanced.AWSRegion
 	}
 
 	tokenUrl := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
@@ -172,14 +186,17 @@ func RefreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: config.Get().Network.HTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return TokenData{}, fmt.Errorf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return TokenData{}, fmt.Errorf("failed to read response body: %v", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return TokenData{}, fmt.Errorf("token refresh failed (status %d): %s", resp.StatusCode, string(body))
@@ -206,6 +223,7 @@ func RefreshTokenIdC(currentToken TokenData) (TokenData, error) {
 
 // RefreshTokenSocial refreshes token using Kiro's social auth endpoint
 func RefreshTokenSocial(currentToken TokenData) (TokenData, error) {
+	cfg := config.Get()
 	refreshReq := RefreshRequest{
 		RefreshToken: currentToken.RefreshToken,
 	}
@@ -216,7 +234,7 @@ func RefreshTokenSocial(currentToken TokenData) (TokenData, error) {
 	}
 
 	resp, err := http.Post(
-		"https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+		cfg.Advanced.KiroRefreshEndpoint,
 		"application/json",
 		bytes.NewBuffer(reqBody),
 	)
@@ -226,7 +244,10 @@ func RefreshTokenSocial(currentToken TokenData) (TokenData, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return TokenData{}, fmt.Errorf("status code: %d (failed to read response: %v)", resp.StatusCode, err)
+		}
 		return TokenData{}, fmt.Errorf("status code: %d, response: %s", resp.StatusCode, string(body))
 	}
 
@@ -317,7 +338,7 @@ type StatusMsg struct {
 func LoginCmd() tea.Msg {
 	// TODO: Implement browser-based login that works with TUI
 	return StatusMsg{
-		Message: "Login requires running 'kiro2cc login' separately for now",
+		Message: "Login requires running 'claude2kiro login' separately for now",
 		IsError: false,
 	}
 }
@@ -357,12 +378,16 @@ func ExportEnvCmd() tea.Msg {
 		}
 	}
 
-	// Return instructions
+	// Return instructions with truncated token preview
 	var msg string
+	tokenPreview := token.AccessToken
+	if len(tokenPreview) > 20 {
+		tokenPreview = tokenPreview[:20] + "..."
+	}
 	if runtime.GOOS == "windows" {
-		msg = fmt.Sprintf("CMD: set ANTHROPIC_BASE_URL=http://localhost:8080 && set ANTHROPIC_API_KEY=%s", token.AccessToken[:20]+"...")
+		msg = fmt.Sprintf("CMD: set ANTHROPIC_BASE_URL=http://localhost:8080 && set ANTHROPIC_API_KEY=%s", tokenPreview)
 	} else {
-		msg = fmt.Sprintf("export ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=%s...", token.AccessToken[:20])
+		msg = fmt.Sprintf("export ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=%s", tokenPreview)
 	}
 
 	return StatusMsg{
@@ -373,7 +398,7 @@ func ExportEnvCmd() tea.Msg {
 
 // LogoutCmd returns a function that logs out
 func LogoutCmd() tea.Msg {
-	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), "kiro2cc-login-config.json")
+	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), "claude2kiro-login-config.json")
 	tokenPath := GetTokenFilePath()
 
 	os.Remove(configPath)
@@ -385,53 +410,110 @@ func LogoutCmd() tea.Msg {
 	}
 }
 
-// ConfigureClaudeCmd creates launch scripts for Claude Code with kiro2cc proxy
-func ConfigureClaudeCmd() tea.Msg {
-	if runtime.GOOS == "windows" {
-		// Windows: put scripts next to kiro2cc executable (should be in PATH)
-		exePath, err := os.Executable()
-		if err != nil {
-			return StatusMsg{
-				Message: fmt.Sprintf("Failed to get executable path: %v", err),
-				IsError: true,
-			}
-		}
-		exeDir := filepath.Dir(exePath)
+// addToWindowsPath adds a directory to the user PATH environment variable
+// Returns (added bool, err error) where added is true if the path was added
+func addToWindowsPath(dir string) (bool, error) {
+	if runtime.GOOS != "windows" {
+		return false, nil
+	}
 
-		// Create CMD batch file
-		batPath := filepath.Join(exeDir, "claude-kiro.bat")
-		batScript := `@echo off
-set ANTHROPIC_BASE_URL=http://localhost:8080
-set ANTHROPIC_API_KEY=kiro2cc
-claude %*
-`
-		if err := os.WriteFile(batPath, []byte(batScript), 0755); err != nil {
-			return StatusMsg{
-				Message: fmt.Sprintf("Failed to create batch script: %v", err),
-				IsError: true,
-			}
-		}
+	// Get current PATH from environment (includes both user and system PATH)
+	currentPath := os.Getenv("PATH")
+	pathDirs := strings.Split(currentPath, ";")
 
-		// Create PowerShell script
-		ps1Path := filepath.Join(exeDir, "claude-kiro.ps1")
-		ps1Script := `$env:ANTHROPIC_BASE_URL = "http://localhost:8080"
-$env:ANTHROPIC_API_KEY = "kiro2cc"
-claude @args
-`
-		if err := os.WriteFile(ps1Path, []byte(ps1Script), 0755); err != nil {
-			return StatusMsg{
-				Message: fmt.Sprintf("Failed to create PowerShell script: %v", err),
-				IsError: true,
-			}
-		}
-
-		return StatusMsg{
-			Message: fmt.Sprintf("Created scripts in %s", exeDir),
-			IsError: false,
+	// Check if already in PATH (case-insensitive on Windows)
+	dirLower := strings.ToLower(dir)
+	for _, p := range pathDirs {
+		if strings.ToLower(strings.TrimSpace(p)) == dirLower {
+			return false, nil // Already in PATH
 		}
 	}
 
-	// Unix (Linux/macOS): create shell script in ~/.local/bin
+	// Use PowerShell to add to user PATH via registry
+	// This modifies HKCU\Environment\Path which persists across sessions
+	psScript := fmt.Sprintf(`
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($userPath -eq $null) { $userPath = '' }
+$newDir = '%s'
+$paths = $userPath -split ';' | Where-Object { $_ -ne '' }
+$found = $false
+foreach ($p in $paths) {
+    if ($p.ToLower() -eq $newDir.ToLower()) {
+        $found = $true
+        break
+    }
+}
+if (-not $found) {
+    if ($userPath -ne '') {
+        $userPath = $userPath + ';' + $newDir
+    } else {
+        $userPath = $newDir
+    }
+    [Environment]::SetEnvironmentVariable('Path', $userPath, 'User')
+    Write-Output 'ADDED'
+} else {
+    Write-Output 'EXISTS'
+}
+`, dir)
+
+	// Execute PowerShell
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("failed to update PATH: %v (output: %s)", err, string(output))
+	}
+
+	result := strings.TrimSpace(string(output))
+	return result == "ADDED", nil
+}
+
+// removeFromWindowsPath removes a directory from the user PATH environment variable
+// Returns (removed bool, err error) where removed is true if the path was removed
+func removeFromWindowsPath(dir string) (bool, error) {
+	if runtime.GOOS != "windows" {
+		return false, nil
+	}
+
+	// Use PowerShell to remove from user PATH via registry
+	psScript := fmt.Sprintf(`
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($userPath -eq $null) {
+    Write-Output 'NOTFOUND'
+    exit
+}
+$removeDir = '%s'
+$paths = $userPath -split ';' | Where-Object { $_ -ne '' }
+$newPaths = @()
+$found = $false
+foreach ($p in $paths) {
+    if ($p.ToLower() -eq $removeDir.ToLower()) {
+        $found = $true
+    } else {
+        $newPaths += $p
+    }
+}
+if ($found) {
+    $newPath = $newPaths -join ';'
+    [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    Write-Output 'REMOVED'
+} else {
+    Write-Output 'NOTFOUND'
+}
+`, dir)
+
+	// Execute PowerShell
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("failed to update PATH: %v (output: %s)", err, string(output))
+	}
+
+	result := strings.TrimSpace(string(output))
+	return result == "REMOVED", nil
+}
+
+// ConfigureClaudeCmd creates launch scripts and configures ~/.claude.json for Claude2Kiro proxy
+func ConfigureClaudeCmd() tea.Msg {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return StatusMsg{
@@ -440,28 +522,264 @@ claude @args
 		}
 	}
 
-	binDir := filepath.Join(homeDir, ".local", "bin")
-	if err := os.MkdirAll(binDir, 0755); err != nil {
+	// Configure ~/.claude.json
+	claudePath := filepath.Join(homeDir, ".claude.json")
+	var config map[string]interface{}
+	claudeConfigured := false
+
+	// Read existing config or create new one
+	if data, err := os.ReadFile(claudePath); err == nil {
+		json.Unmarshal(data, &config)
+
+		// Check if already configured correctly
+		claude2kiroSet := false
+		apiKeySet := false
+
+		if k, ok := config["claude2kiro"].(bool); ok && k {
+			claude2kiroSet = true
+		}
+		if oauth, ok := config["oauthAccount"].(map[string]interface{}); ok {
+			if t, ok := oauth["type"].(string); ok && t == "api_key" {
+				apiKeySet = true
+			}
+		}
+
+		if claude2kiroSet && apiKeySet {
+			// Already configured, skip modification
+			claudeConfigured = true
+		} else {
+			// Need to modify - create backup atomically (only if it doesn't exist)
+			backupPath := claudePath + ".backup"
+			// Use O_CREATE|O_EXCL for atomic "create if not exists" - prevents TOCTOU race
+			backupFile, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err == nil {
+				// Backup file was created, write the data
+				_, writeErr := backupFile.Write(data)
+				backupFile.Close()
+				if writeErr != nil {
+					return StatusMsg{
+						Message: fmt.Sprintf("Failed to write backup ~/.claude.json: %v", writeErr),
+						IsError: true,
+					}
+				}
+			}
+			// If err != nil (file already exists), that's fine - we skip backup creation
+		}
+	}
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+
+	// Only modify if not already configured
+	if !claudeConfigured {
+		// Set claude2kiro flag
+		config["claude2kiro"] = true
+
+		// Set oauthAccount type to api_key (preserve other fields if they exist)
+		if existingOauth, ok := config["oauthAccount"].(map[string]interface{}); ok {
+			existingOauth["type"] = "api_key"
+		} else {
+			config["oauthAccount"] = map[string]interface{}{
+				"type": "api_key",
+			}
+		}
+
+		// Write updated config
+		configData, err := json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Failed to serialize config: %v", err),
+				IsError: true,
+			}
+		}
+		if err := os.WriteFile(claudePath, configData, 0600); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Failed to write ~/.claude.json: %v", err),
+				IsError: true,
+			}
+		}
+	}
+
+	// Create platform-specific launch scripts in PATH-accessible location
+	var scriptMsg string
+	binDir := filepath.Join(homeDir, ".claude2kiro", "bin")
+
+	if runtime.GOOS == "windows" {
+		// Windows: create scripts in ~/.claude2kiro/bin and add to PATH
+		if err := os.MkdirAll(binDir, 0755); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Configured ~/.claude.json but failed to create bin directory: %v", err),
+				IsError: true,
+			}
+		}
+
+		// Create CMD batch file
+		batPath := filepath.Join(binDir, "claude-kiro.bat")
+		batScript := `@echo off
+set ANTHROPIC_BASE_URL=http://localhost:8080
+set ANTHROPIC_API_KEY=claude2kiro
+claude %*
+`
+		if err := os.WriteFile(batPath, []byte(batScript), 0755); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Configured ~/.claude.json but failed to create batch script: %v", err),
+				IsError: true,
+			}
+		}
+
+		// Create PowerShell script
+		ps1Path := filepath.Join(binDir, "claude-kiro.ps1")
+		ps1Script := `$env:ANTHROPIC_BASE_URL = "http://localhost:8080"
+$env:ANTHROPIC_API_KEY = "claude2kiro"
+claude @args
+`
+		if err := os.WriteFile(ps1Path, []byte(ps1Script), 0755); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Configured ~/.claude.json but failed to create PowerShell script: %v", err),
+				IsError: true,
+			}
+		}
+
+		// Add binDir to user PATH if not already present
+		pathAdded, pathErr := addToWindowsPath(binDir)
+		if pathErr != nil {
+			scriptMsg = fmt.Sprintf("scripts in %s (add to PATH manually: %v)", binDir, pathErr)
+		} else if pathAdded {
+			scriptMsg = fmt.Sprintf("claude-kiro added to PATH (%s)", binDir)
+		} else {
+			scriptMsg = fmt.Sprintf("claude-kiro ready (already in PATH)")
+		}
+	} else {
+		// Unix (Linux/macOS): create shell script in ~/.local/bin
+		binDir = filepath.Join(homeDir, ".local", "bin")
+		if err := os.MkdirAll(binDir, 0755); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Configured ~/.claude.json but failed to create ~/.local/bin: %v", err),
+				IsError: true,
+			}
+		}
+
+		scriptPath := filepath.Join(binDir, "claude-kiro")
+		script := `#!/bin/bash
+export ANTHROPIC_BASE_URL=http://localhost:8080
+export ANTHROPIC_API_KEY=claude2kiro
+claude "$@"
+`
+		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Configured ~/.claude.json but failed to create script: %v", err),
+				IsError: true,
+			}
+		}
+
+		scriptMsg = scriptPath
+	}
+
+	return StatusMsg{
+		Message: fmt.Sprintf("Configured Claude Code + created %s", scriptMsg),
+		IsError: false,
+	}
+}
+
+// UnconfigureCmd removes Claude2Kiro settings and restores original Claude config
+func UnconfigureCmd() tea.Msg {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
 		return StatusMsg{
-			Message: fmt.Sprintf("Failed to create ~/.local/bin: %v", err),
+			Message: fmt.Sprintf("Failed to get home directory: %v", err),
 			IsError: true,
 		}
 	}
 
-	scriptPath := filepath.Join(binDir, "claude-kiro")
-	script := `#!/bin/bash
-export ANTHROPIC_BASE_URL=http://localhost:8080
-export ANTHROPIC_API_KEY=kiro2cc
-claude "$@"
-`
-	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
-		return StatusMsg{
-			Message: fmt.Sprintf("Failed to create script: %v", err),
-			IsError: true,
+	var actions []string
+
+	// Restore ~/.claude.json from backup or remove Claude2Kiro settings
+	claudePath := filepath.Join(homeDir, ".claude.json")
+	backupPath := claudePath + ".backup"
+
+	if _, err := os.Stat(backupPath); err == nil {
+		// Backup exists - restore it
+		if err := os.Rename(backupPath, claudePath); err != nil {
+			return StatusMsg{
+				Message: fmt.Sprintf("Failed to restore ~/.claude.json from backup: %v", err),
+				IsError: true,
+			}
+		}
+		actions = append(actions, "restored ~/.claude.json")
+	} else if data, err := os.ReadFile(claudePath); err == nil {
+		// No backup, but config exists - remove Claude2Kiro settings
+		var config map[string]interface{}
+		if err := json.Unmarshal(data, &config); err == nil {
+			modified := false
+			if _, ok := config["claude2kiro"]; ok {
+				delete(config, "claude2kiro")
+				modified = true
+			}
+			if _, ok := config["oauthAccount"]; ok {
+				delete(config, "oauthAccount")
+				modified = true
+			}
+			if modified {
+				configData, _ := json.MarshalIndent(config, "", "  ")
+				if err := os.WriteFile(claudePath, configData, 0600); err != nil {
+					return StatusMsg{
+						Message: fmt.Sprintf("Failed to update ~/.claude.json: %v", err),
+						IsError: true,
+					}
+				}
+				actions = append(actions, "removed Claude2Kiro settings from ~/.claude.json")
+			}
 		}
 	}
+
+	// Remove launch scripts
+	if runtime.GOOS == "windows" {
+		// New location: ~/.claude2kiro/bin
+		binDir := filepath.Join(homeDir, ".claude2kiro", "bin")
+		batPath := filepath.Join(binDir, "claude-kiro.bat")
+		ps1Path := filepath.Join(binDir, "claude-kiro.ps1")
+
+		if err := os.Remove(batPath); err == nil {
+			actions = append(actions, "removed claude-kiro.bat")
+		}
+		if err := os.Remove(ps1Path); err == nil {
+			actions = append(actions, "removed claude-kiro.ps1")
+		}
+
+		// Also check old location (next to executable) for backward compatibility
+		if exePath, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exePath)
+			oldBatPath := filepath.Join(exeDir, "claude-kiro.bat")
+			oldPs1Path := filepath.Join(exeDir, "claude-kiro.ps1")
+
+			if err := os.Remove(oldBatPath); err == nil {
+				actions = append(actions, "removed old claude-kiro.bat")
+			}
+			if err := os.Remove(oldPs1Path); err == nil {
+				actions = append(actions, "removed old claude-kiro.ps1")
+			}
+		}
+
+		// Remove binDir from PATH
+		if removed, _ := removeFromWindowsPath(binDir); removed {
+			actions = append(actions, "removed from PATH")
+		}
+	} else {
+		scriptPath := filepath.Join(homeDir, ".local", "bin", "claude-kiro")
+		if err := os.Remove(scriptPath); err == nil {
+			actions = append(actions, "removed claude-kiro script")
+		}
+	}
+
+	if len(actions) == 0 {
+		return StatusMsg{
+			Message: "Nothing to unconfigure",
+			IsError: false,
+		}
+	}
+
 	return StatusMsg{
-		Message: fmt.Sprintf("Created %s", scriptPath),
+		Message: "Unconfigured: " + strings.Join(actions, ", "),
 		IsError: false,
 	}
 }
@@ -471,12 +789,13 @@ claude "$@"
 func StartServerCmd(port string, lg *logger.Logger, program *tea.Program) tea.Msg {
 	// The actual server start will be done in main.go
 	// Here we just signal that it should start
-	return dashboard.ServerStartedMsg{Port: port}
+	return messages.ServerStartedMsg{Port: port}
 }
 
 // UsageLimitsResponse represents the response from getUsageLimits API
 type UsageLimitsResponse struct {
-	DaysUntilReset     int `json:"daysUntilReset"`
+	DaysUntilReset     int     `json:"daysUntilReset"`
+	NextDateReset      float64 `json:"nextDateReset"`
 	UsageBreakdownList []struct {
 		CurrentUsage              float64 `json:"currentUsage"`
 		CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
@@ -506,18 +825,27 @@ func GetCreditsInfo() CreditsInfo {
 	}
 
 	// Build URL with query params
-	baseURL := "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits"
+	cfg := config.Get()
+	baseURL := cfg.Advanced.CreditsEndpoint
 	req, err := http.NewRequest("GET", baseURL, nil)
 	if err != nil {
 		return CreditsInfo{Error: fmt.Errorf("failed to create request: %v", err)}
 	}
 
-	// Add query parameters
+	// Add query parameters - different for IdC vs social auth
 	q := req.URL.Query()
-	if token.ProfileArn != "" {
-		q.Add("profileArn", token.ProfileArn)
+	if token.AuthMethod == "IdC" {
+		// Enterprise SSO - use AI_EDITOR origin
+		q.Add("origin", "AI_EDITOR")
+		q.Add("resourceType", "AGENTIC_REQUEST")
+	} else {
+		// Social auth - include profileArn
+		if token.ProfileArn != "" {
+			q.Add("profileArn", token.ProfileArn)
+		}
+		q.Add("origin", "AI_EDITOR")
+		q.Add("resourceType", "AGENTIC_REQUEST")
 	}
-	q.Add("origin", "CHAT")
 	req.URL.RawQuery = q.Encode()
 
 	// Add headers
@@ -525,17 +853,25 @@ func GetCreditsInfo() CreditsInfo {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: config.Get().Network.HTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return CreditsInfo{Error: fmt.Errorf("request failed: %v", err)}
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return CreditsInfo{Error: fmt.Errorf("failed to read response: %v", err)}
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		return CreditsInfo{Error: fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))}
+		// Include more detail in error for debugging
+		bodyPreview := string(body)
+		if len(bodyPreview) > 200 {
+			bodyPreview = bodyPreview[:200] + "..."
+		}
+		return CreditsInfo{Error: fmt.Errorf("status %d: %s", resp.StatusCode, bodyPreview)}
 	}
 
 	var usageResp UsageLimitsResponse
@@ -543,9 +879,19 @@ func GetCreditsInfo() CreditsInfo {
 		return CreditsInfo{Error: fmt.Errorf("failed to parse response: %v", err)}
 	}
 
+	// Calculate days until reset from timestamp if not provided
+	daysUntilReset := usageResp.DaysUntilReset
+	if daysUntilReset == 0 && usageResp.NextDateReset > 0 {
+		resetTime := time.Unix(int64(usageResp.NextDateReset), 0)
+		daysUntilReset = int(time.Until(resetTime).Hours() / 24)
+		if daysUntilReset < 0 {
+			daysUntilReset = 0
+		}
+	}
+
 	// Extract credit info from response
 	info := CreditsInfo{
-		DaysUntilReset:   usageResp.DaysUntilReset,
+		DaysUntilReset:   daysUntilReset,
 		SubscriptionName: usageResp.SubscriptionInfo.SubscriptionTitle,
 	}
 
@@ -580,4 +926,23 @@ func ViewCreditsCmd() tea.Msg {
 			info.CreditsUsed, info.CreditsLimit, info.CreditsRemaining, info.DaysUntilReset, info.SubscriptionName),
 		IsError: false,
 	}
+}
+
+// GetKiroUsageURL returns the URL to the Kiro usage/billing page
+func GetKiroUsageURL() string {
+	return config.Get().Advanced.KiroUsageURL
+}
+
+// OpenBrowser opens the specified URL in the default browser
+func OpenBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default: // Linux and others
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
 }

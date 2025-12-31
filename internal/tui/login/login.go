@@ -76,7 +76,7 @@ type MenuItem struct {
 
 func (i MenuItem) Title() string       { return i.title }
 func (i MenuItem) Description() string { return i.description }
-func (i MenuItem) FilterValue() string { return i.title }
+func (i MenuItem) FilterValue() string { return "" }
 
 // ItemDelegate handles rendering of menu items
 type ItemDelegate struct {
@@ -163,7 +163,7 @@ func New(width, height int) Model {
 	l := list.New(items, delegate, listWidth, listHeight)
 	l.Title = ""
 	l.SetShowStatusBar(false)
-	l.SetShowFilter(false)
+	l.SetFilteringEnabled(false)
 	l.SetShowHelp(true)
 	l.SetShowPagination(false)
 	l.Styles.HelpStyle = lipgloss.NewStyle().
@@ -319,7 +319,49 @@ func (m Model) View() string {
 			subtitleStyle.Render("Choose your authentication method"),
 			"",
 		)
-		content := lipgloss.JoinVertical(lipgloss.Left, header, m.list.View())
+
+		// Render menu items manually (to avoid the filter cursor box)
+		var menuLines []string
+		items := m.list.Items()
+		selectedIdx := m.list.Index()
+
+		selectedStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#7D56F4")).
+			Bold(true).
+			PaddingLeft(2)
+		normalStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FAFAFA")).
+			PaddingLeft(2)
+		descStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#A0A0A0")).
+			PaddingLeft(4)
+		descDimStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#626262")).
+			PaddingLeft(4)
+
+		for i, item := range items {
+			if menuItem, ok := item.(MenuItem); ok {
+				var title, desc string
+				if i == selectedIdx {
+					title = selectedStyle.Render("* " + menuItem.Title())
+					desc = descStyle.Render(menuItem.Description())
+				} else {
+					title = normalStyle.Render("  " + menuItem.Title())
+					desc = descDimStyle.Render(menuItem.Description())
+				}
+				menuLines = append(menuLines, title)
+				menuLines = append(menuLines, desc)
+			}
+		}
+		menuContent := strings.Join(menuLines, "\n")
+
+		// Help text
+		helpStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#626262")).
+			MarginTop(1)
+		helpText := helpStyle.Render("↑/k up • ↓/j down • q quit • ? more")
+
+		content := lipgloss.JoinVertical(lipgloss.Left, header, menuContent, helpText)
 		return boxStyle.Render(content)
 
 	case ViewIdCForm:

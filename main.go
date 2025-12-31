@@ -19,16 +19,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/manifoldco/promptui"
 
-	"github.com/bestk/kiro2cc/cmd"
-	"github.com/bestk/kiro2cc/internal/tui"
-	"github.com/bestk/kiro2cc/internal/tui/logger"
-	"github.com/bestk/kiro2cc/internal/tui/dashboard"
-	"github.com/bestk/kiro2cc/parser"
+	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/tui"
+	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
+	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
+	"github.com/sgeraldes/claude2kiro/parser"
 )
 
 // TokenData represents the token file structure
@@ -223,7 +225,7 @@ func getMessageContent(content any) string {
 	switch v := content.(type) {
 	case string:
 		if len(v) == 0 {
-			return "answer for user qeustion"
+			return "answer for user question"
 		}
 		return v
 	case []interface{}:
@@ -236,9 +238,13 @@ func getMessageContent(content any) string {
 					if err := jsonStr.Unmarshal(data, &cb); err == nil {
 						switch cb.Type {
 						case "tool_result":
-							texts = append(texts, *cb.Content)
+							if cb.Content != nil {
+								texts = append(texts, *cb.Content)
+							}
 						case "text":
-							texts = append(texts, *cb.Text)
+							if cb.Text != nil {
+								texts = append(texts, *cb.Text)
+							}
 						}
 					}
 
@@ -249,21 +255,21 @@ func getMessageContent(content any) string {
 		if len(texts) == 0 {
 			_, err := jsonStr.Marshal(content)
 			if err != nil {
-				return "answer for user qeustion"
+				return "answer for user question"
 			}
 
 			// uncatch event
-			return "answer for user qeustion"
+			return "answer for user question"
 		}
 		return strings.Join(texts, "\n")
 	default:
 		_, err := jsonStr.Marshal(content)
 		if err != nil {
-			return "answer for user qeustion"
+			return "answer for user question"
 		}
 
 		// uncatch event
-		return "answer for user qeustion"
+		return "answer for user question"
 	}
 }
 
@@ -301,6 +307,9 @@ type CodeWhispererEvent struct {
 	Content     string `json:"content"`
 	EventType   string `json:"event-type"`
 }
+
+// tokenRefreshMutex prevents concurrent token refresh operations
+var tokenRefreshMutex sync.Mutex
 
 var ModelMap = map[string]string{
 	// Auto - lets Kiro choose the best model
@@ -342,7 +351,12 @@ func getKiroModelID(anthropicModel string) string {
 // generateUUID generates a simple UUID v4
 func generateUUID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to math/rand if crypto/rand fails (should never happen)
+		for i := range b {
+			b[i] = byte(mathrand.Intn(256))
+		}
+	}
 	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant bits
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
@@ -521,7 +535,7 @@ func main() {
 		case "idc":
 			if config.StartUrl == "" {
 				fmt.Println("Error: No start URL configured for idc method")
-				fmt.Println("Usage: kiro2cc login idc <start-url> [region]")
+				fmt.Println("Usage: claude2kiro login idc <start-url> [region]")
 				os.Exit(1)
 			}
 			region := config.Region
@@ -562,23 +576,23 @@ func main() {
 // printUsage displays CLI usage information
 func printUsage() {
 	fmt.Println("Usage:")
-	fmt.Println("  kiro2cc                         - Launch interactive TUI")
-	fmt.Println("  kiro2cc login [method]          - Login via browser (interactive menu)")
+	fmt.Println("  claude2kiro                         - Launch interactive TUI")
+	fmt.Println("  claude2kiro login [method]          - Login via browser (interactive menu)")
 	fmt.Println("    Methods (optional - shows menu if omitted):")
-	fmt.Println("      github                      - Login with GitHub")
-	fmt.Println("      google                      - Login with Google")
-	fmt.Println("      builderid                   - Login with AWS Builder ID")
-	fmt.Println("      idc [start-url] [region]    - Login with Enterprise Identity Center")
-	fmt.Println("    Tip: Just run 'kiro2cc login' for interactive selection")
+	fmt.Println("      github                          - Login with GitHub")
+	fmt.Println("      google                          - Login with Google")
+	fmt.Println("      builderid                       - Login with AWS Builder ID")
+	fmt.Println("      idc [start-url] [region]        - Login with Enterprise Identity Center")
+	fmt.Println("    Tip: Just run 'claude2kiro login' for interactive selection")
 	fmt.Println("")
-	fmt.Println("  kiro2cc read    - Read and display token")
-	fmt.Println("  kiro2cc refresh - Refresh the access token")
-	fmt.Println("  kiro2cc logout  - Clear saved credentials and token")
-	fmt.Println("  kiro2cc export  - Export environment variables")
-	fmt.Println("  kiro2cc claude  - Configure Claude Code settings")
-	fmt.Println("  kiro2cc server [port] - Start Anthropic API proxy server (headless)")
+	fmt.Println("  claude2kiro read    - Read and display token")
+	fmt.Println("  claude2kiro refresh - Refresh the access token")
+	fmt.Println("  claude2kiro logout  - Clear saved credentials and token")
+	fmt.Println("  claude2kiro export  - Export environment variables")
+	fmt.Println("  claude2kiro claude  - Configure Claude Code settings")
+	fmt.Println("  claude2kiro server [port] - Start Anthropic API proxy server (headless)")
 	fmt.Println("")
-	fmt.Println("  Author: https://github.com/bestK/kiro2cc")
+	fmt.Println("  Author: https://github.com/sgeraldes/claude2kiro")
 }
 
 // runTUI launches the interactive TUI
@@ -586,10 +600,10 @@ func runTUI() {
 	// Create TUI commands
 	commands := tui.Commands{
 		Login: cmd.LoginCmd,
-		StartServer: func(port string, lg *logger.Logger, program *tea.Program) func() tea.Msg {
+		StartServer: func(port string, lg *logger.Logger) func() tea.Msg {
 			return func() tea.Msg {
 				// Start the server in a goroutine
-				go startServerWithLogger(port, lg, program)
+				go startServerWithLogger(port, lg)
 				return nil
 			}
 		},
@@ -597,10 +611,13 @@ func runTUI() {
 		ViewToken:       cmd.ViewTokenCmd,
 		ExportEnv:       cmd.ExportEnvCmd,
 		ConfigureClaude: cmd.ConfigureClaudeCmd,
+		Unconfigure:     cmd.UnconfigureCmd,
 		ViewCredits:     cmd.ViewCreditsCmd,
 		Logout:          cmd.LogoutCmd,
 		GetTokenExpiry:  cmd.GetTokenExpiry,
 		HasToken:        cmd.HasToken,
+		IsTokenExpired:  cmd.IsTokenExpired,
+		TryRefreshToken: cmd.TryRefreshToken,
 	}
 
 	// Create root model
@@ -619,8 +636,36 @@ func runTUI() {
 	}
 }
 
+
+// extractSessionID extracts a short session identifier from the request metadata
+// The user_id format is like: "user_..._session_ce40736e-1347-467a-9cce-181e245edd92"
+// Returns the last 8 characters of the UUID for a compact display
+func extractSessionID(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	userID, ok := metadata["user_id"].(string)
+	if !ok || userID == "" {
+		return ""
+	}
+	// Extract session UUID from the end of the user_id string
+	// Format: user_..._session_<uuid>
+	if idx := strings.LastIndex(userID, "_session_"); idx != -1 {
+		uuid := userID[idx+9:] // Skip "_session_"
+		// Return last 8 chars of the UUID for compact display
+		if len(uuid) >= 8 {
+			return uuid[len(uuid)-8:]
+		}
+		return uuid
+	}
+	// Fallback: return last 8 chars of the whole user_id
+	if len(userID) >= 8 {
+		return userID[len(userID)-8:]
+	}
+	return userID
+}
 // startServerWithLogger starts the HTTP proxy server with TUI logging
-func startServerWithLogger(port string, lg *logger.Logger, program *tea.Program) {
+func startServerWithLogger(port string, lg *logger.Logger) {
 	// Create router
 	mux := http.NewServeMux()
 
@@ -635,12 +680,34 @@ func startServerWithLogger(port string, lg *logger.Logger, program *tea.Program)
 			return
 		}
 
-		// Get current token
+		// Get current token, refreshing proactively if expired/expiring soon
 		token, err := getToken()
 		if err != nil {
 			lg.LogError(fmt.Sprintf("Failed to get token: %v", err))
 			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
 			return
+		}
+
+		// Proactive refresh: if token expires within 5 minutes, refresh it first
+		if token.ExpiresAt != "" {
+			if expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt); err == nil {
+				if time.Until(expiresAt) < 5*time.Minute {
+					lg.LogInfo("Token expiring soon, refreshing proactively...")
+					if err := tryRefreshToken(); err != nil {
+						lg.LogError(fmt.Sprintf("Proactive token refresh failed: %v", err))
+						// Continue with current token, let 403 handler deal with it
+					} else {
+						lg.LogInfo("Token refreshed successfully")
+						// Re-read the refreshed token
+						token, err = getToken()
+						if err != nil {
+							lg.LogError(fmt.Sprintf("Failed to get refreshed token: %v", err))
+							http.Error(w, fmt.Sprintf("Failed to get refreshed token: %v", err), http.StatusInternalServerError)
+							return
+						}
+					}
+				}
+			}
 		}
 
 		// Read request body
@@ -660,8 +727,15 @@ func startServerWithLogger(port string, lg *logger.Logger, program *tea.Program)
 			return
 		}
 
-		// Log the request
-		lg.LogRequest(anthropicReq.Model, r.Method, r.URL.Path, string(body))
+		// Extract session ID from metadata for tracking
+		sessionID := extractSessionID(anthropicReq.Metadata)
+
+		// Calculate parse duration (time from request start to now)
+		parseDuration := time.Since(startTime)
+
+		// Log the request and get request ID/seqNum for correlation
+		// Status 0 = OK (request parsed successfully)
+		reqResult := lg.LogRequest(anthropicReq.Model, r.Method, r.URL.Path, string(body), sessionID, 0, parseDuration)
 
 		// Basic validation
 		if anthropicReq.Model == "" {
@@ -674,15 +748,16 @@ func startServerWithLogger(port string, lg *logger.Logger, program *tea.Program)
 		}
 
 		// Handle streaming request
+		var responsePreview string
 		if anthropicReq.Stream {
-			handleStreamRequestWithLogger(w, anthropicReq, token, lg)
+			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, token, lg)
 		} else {
 			handleNonStreamRequest(w, anthropicReq, token)
 		}
 
 		// Log response
 		duration := time.Since(startTime)
-		lg.LogResponse(http.StatusOK, r.URL.Path, duration)
+		lg.LogResponse(http.StatusOK, r.URL.Path, duration, responsePreview, sessionID, reqResult.RequestID, reqResult.SeqNum)
 	})
 
 	// Add health check endpoint
@@ -712,7 +787,7 @@ func startServerWithLogger(port string, lg *logger.Logger, program *tea.Program)
 }
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
-func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger) {
+func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger) string {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -722,7 +797,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
-		return
+		return ""
 	}
 
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
@@ -734,18 +809,19 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	cwReqBody, err := jsonStr.Marshal(cwReq)
 	if err != nil {
 		sendErrorEvent(w, flusher, "Failed to serialize request", err)
-		return
+		return ""
 	}
 
 	// Create streaming request
+	cfg := config.Get()
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
 		sendErrorEvent(w, flusher, "Failed to create proxy request", err)
-		return
+		return ""
 	}
 
 	// Set request headers
@@ -761,13 +837,17 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	if err != nil {
 		lg.LogError(fmt.Sprintf("CodeWhisperer request error: %v", err))
 		sendErrorEvent(w, flusher, "CodeWhisperer request error", err)
-		return
+		return ""
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		lg.LogError(fmt.Sprintf("CodeWhisperer error (status %d): %s", resp.StatusCode, string(body)))
+		body, readErr := io.ReadAll(resp.Body)
+		bodyStr := "(failed to read body)"
+		if readErr == nil {
+			bodyStr = string(body)
+		}
+		lg.LogError(fmt.Sprintf("CodeWhisperer error (status %d): %s", resp.StatusCode, bodyStr))
 
 		if resp.StatusCode == 403 {
 			if err := tryRefreshToken(); err != nil {
@@ -778,20 +858,21 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
 			}
 		} else {
-			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", string(body)))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", bodyStr))
 		}
-		return
+		return ""
 	}
 
 	// Read entire response body
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
-		return
+		return ""
 	}
 
 	// Use CodeWhisperer parser
 	events := parser.ParseEvents(respBody)
+	var responseText strings.Builder
 
 	if len(events) > 0 {
 		// Send start event
@@ -827,10 +908,17 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 			if e.Event == "content_block_delta" {
 				outputTokens = len(getMessageContent(e.Data))
+				if dataMap, ok := e.Data.(map[string]any); ok {
+					if delta, ok := dataMap["delta"].(map[string]any); ok {
+						if text, ok := delta["text"].(string); ok {
+							responseText.WriteString(text)
+						}
+					}
+				}
 			}
 
 			// Random delay for natural streaming
-			time.Sleep(time.Duration(mathrand.Intn(300)) * time.Millisecond)
+			time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
 		}
 
 		contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
@@ -846,6 +934,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		messageStop := map[string]any{"type": "message_stop"}
 		sendSSEEvent(w, flusher, "message_stop", messageStop)
 	}
+	return responseText.String()
 }
 
 // getTokenFilePath returns the cross-platform token file path
@@ -862,7 +951,7 @@ func getTokenFilePath() string {
 // getLoginConfigPath returns the path for login config file
 func getLoginConfigPath() string {
 	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".aws", "sso", "cache", "kiro2cc-login-config.json")
+	return filepath.Join(homeDir, ".aws", "sso", "cache", "claude2kiro-login-config.json")
 }
 
 // readLoginConfig reads the saved login configuration
@@ -1170,9 +1259,10 @@ func loginSocial(provider string) {
 	authCodeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
 
-	// Create HTTP server for callback
-	server := &http.Server{}
-	http.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
+	// Create HTTP server for callback with local mux (avoid polluting DefaultServeMux)
+	mux := http.NewServeMux()
+	server := &http.Server{Handler: mux}
+	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
 		// Validate state
 		receivedState := r.URL.Query().Get("state")
 		if receivedState != state {
@@ -1281,7 +1371,7 @@ func loginSocial(provider string) {
 		fmt.Println("\n✓ Login successful!")
 		fmt.Printf("Provider: %s\n", provider)
 		fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
-		fmt.Println("\nYou can now run 'kiro2cc server' to start the proxy.")
+		fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
 
 	case err := <-errChan:
 		server.Shutdown(context.Background())
@@ -1391,7 +1481,10 @@ func registerSSOClient(startUrl, region string) (*SSOClientRegistration, error) 
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("client registration failed (status %d): %s", resp.StatusCode, string(body))
@@ -1560,7 +1653,7 @@ func loginIdC(provider, startUrl, region string) {
 		fmt.Printf("Provider: %s\n", provider)
 		fmt.Printf("Region: %s\n", region)
 		fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
-		fmt.Println("\nYou can now run 'kiro2cc server' to start the proxy.")
+		fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
 
 	case err := <-errChan:
 		server.Shutdown(context.Background())
@@ -1607,7 +1700,10 @@ func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg 
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("token exchange failed (status %d): %s", resp.StatusCode, string(body))
@@ -1665,13 +1761,14 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("token exchange failed (status %d): %s", resp.StatusCode, string(body))
 	}
-
-	// Debug: Log raw response
 
 	var tokenResp CreateTokenResponse
 	if err := jsonStr.Unmarshal(body, &tokenResp); err != nil {
@@ -1788,7 +1885,11 @@ func refreshToken() {
 	}
 
 	fmt.Println("Token refresh successful!")
-	fmt.Printf("New Access Token: %s...\n", newToken.AccessToken[:20])
+	tokenPreview := newToken.AccessToken
+	if len(tokenPreview) > 20 {
+		tokenPreview = tokenPreview[:20]
+	}
+	fmt.Printf("New Access Token: %s...\n", tokenPreview)
 }
 
 // refreshTokenIdC refreshes token using AWS SSO OIDC
@@ -1833,7 +1934,10 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return TokenData{}, fmt.Errorf("failed to read response body: %v", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return TokenData{}, fmt.Errorf("token refresh failed (status %d): %s", resp.StatusCode, string(body))
@@ -1880,7 +1984,10 @@ func refreshTokenSocial(currentToken TokenData) (TokenData, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return TokenData{}, fmt.Errorf("status code: %d (failed to read response: %v)", resp.StatusCode, err)
+		}
 		return TokenData{}, fmt.Errorf("status code: %d, response: %s", resp.StatusCode, string(body))
 	}
 
@@ -1901,7 +2008,11 @@ func refreshTokenSocial(currentToken TokenData) (TokenData, error) {
 
 // tryRefreshToken attempts to refresh the token without exiting on failure
 // This is used by the server to handle 403 errors gracefully
+// Uses a mutex to prevent concurrent refresh attempts from racing
 func tryRefreshToken() error {
+	tokenRefreshMutex.Lock()
+	defer tokenRefreshMutex.Unlock()
+
 	tokenPath := getTokenFilePath()
 
 	data, err := os.ReadFile(tokenPath)
@@ -1912,6 +2023,16 @@ func tryRefreshToken() error {
 	var currentToken TokenData
 	if err := jsonStr.Unmarshal(data, &currentToken); err != nil {
 		return fmt.Errorf("failed to parse token file: %v", err)
+	}
+
+	// Check if token was already refreshed by another goroutine while we were waiting
+	if currentToken.ExpiresAt != "" {
+		if expiresAt, parseErr := time.Parse(time.RFC3339, currentToken.ExpiresAt); parseErr == nil {
+			if time.Until(expiresAt) > 5*time.Minute {
+				// Token was recently refreshed, no need to refresh again
+				return nil
+			}
+		}
 	}
 
 	var newToken TokenData
@@ -1956,15 +2077,18 @@ func exportEnvVars() {
 	}
 
 	// Output environment variable commands based on OS
+	cfg := config.Get()
+	port := cfg.Server.Port
 	if runtime.GOOS == "windows" {
 		fmt.Println("CMD")
-		fmt.Printf("set ANTHROPIC_BASE_URL=http://localhost:8080\n")
+		fmt.Printf("set ANTHROPIC_BASE_URL=http://localhost:%s\n", port)
 		fmt.Printf("set ANTHROPIC_API_KEY=%s\n\n", token.AccessToken)
 		fmt.Println("Powershell")
-		fmt.Println(`$env:ANTHROPIC_BASE_URL="http://localhost:8080"`)
+		fmt.Printf(`$env:ANTHROPIC_BASE_URL="http://localhost:%s"`, port)
+		fmt.Println()
 		fmt.Printf(`$env:ANTHROPIC_API_KEY="%s"`, token.AccessToken)
 	} else {
-		fmt.Printf("export ANTHROPIC_BASE_URL=http://localhost:8080\n")
+		fmt.Printf("export ANTHROPIC_BASE_URL=http://localhost:%s\n", port)
 		fmt.Printf("export ANTHROPIC_API_KEY=\"%s\"\n", token.AccessToken)
 	}
 }
@@ -2001,13 +2125,13 @@ func setClaude() {
 	}
 
 	jsonData["hasCompletedOnboarding"] = true
-	jsonData["kiro2cc"] = true
+	jsonData["claude2kiro"] = true
 	jsonData["oauthAccount"] = map[string]interface{}{
 		"type":                "api_key",
 		"isMaxSubscription":   false,
 		"isApiKeyPrimaryAuth": true,
 	}
-	jsonData["primaryAccountUuid"] = "kiro2cc-local"
+	jsonData["primaryAccountUuid"] = "claude2kiro-local"
 	jsonData["hasSeenApiKeyPrompt"] = true
 
 	newJson, err := json.MarshalIndent(jsonData, "", "  ")
@@ -2190,9 +2314,10 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 	// fmt.Printf("CodeWhisperer streaming request body:\n%s\n", string(cwReqBody))
 
 	// Create streaming request
+	cfg := config.Get()
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
@@ -2211,14 +2336,18 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		sendErrorEvent(w, flusher, "CodeWhisperer reqeust error", fmt.Errorf("reqeust error: %s", err.Error()))
+		sendErrorEvent(w, flusher, "CodeWhisperer request error", fmt.Errorf("request error: %s", err.Error()))
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("CodeWhisperer response error, status code: %d, response: %s\n", resp.StatusCode, string(body))
+		body, readErr := io.ReadAll(resp.Body)
+		bodyStr := "(failed to read body)"
+		if readErr == nil {
+			bodyStr = string(body)
+		}
+		fmt.Printf("CodeWhisperer response error, status code: %d, response: %s\n", resp.StatusCode, bodyStr)
 
 		if resp.StatusCode == 403 {
 			// Try to refresh token inline (don't exit on failure)
@@ -2229,7 +2358,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
 			}
 		} else {
-			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", string(body)))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", bodyStr))
 		}
 		return
 	}
@@ -2293,7 +2422,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 			}
 
 			// Random delay for natural streaming
-			time.Sleep(time.Duration(mathrand.Intn(300)) * time.Millisecond)
+			time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
 		}
 
 		contentBlockStop := map[string]any{
@@ -2333,9 +2462,10 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// fmt.Printf("CodeWhisperer request body:\n%s\n", string(cwReqBody))
 
 	// Create request
+	cfg := config.Get()
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
@@ -2493,15 +2623,19 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 
 // sendErrorEvent sends an error event
 func sendErrorEvent(w http.ResponseWriter, flusher http.Flusher, message string, err error) {
+	// Include error details in the message
+	fullMessage := message
+	if err != nil {
+		fullMessage = fmt.Sprintf("%s: %v", message, err)
+	}
+
 	errorResp := map[string]any{
 		"type": "error",
 		"error": map[string]any{
 			"type":    "overloaded_error",
-			"message": message,
+			"message": fullMessage,
 		},
 	}
-
-	// data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
 
 	sendSSEEvent(w, flusher, "error", errorResp)
 }

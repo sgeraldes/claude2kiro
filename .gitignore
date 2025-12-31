@@ -1,8 +1,8 @@
 # Binaries
 *.exe
 *.exe~
-kiro2cc
-kiro2cc-*
+claude2kiro
+claude2kiro-*
 
 # Build output
 dist/

@@ -1,14 +1,20 @@
 package logger
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/sgeraldes/claude2kiro/internal/config"
 )
 
 // LogType categorizes log entries
@@ -44,10 +50,29 @@ type LogEntry struct {
 	Model     string        // For requests: the model being used
 	Method    string        // HTTP method
 	Path      string        // URL path
-	Status    int           // HTTP status code (for responses)
-	Duration  time.Duration // Request duration (for responses)
+	Status    int           // HTTP status code (for responses), or parse status for requests (0=OK, 400=parse error)
+	Duration  time.Duration // Request duration (for responses), or parse time (for requests)
 	Preview   string        // Truncated body preview for list
 	Body      string        // Full body content for detail view
+	SessionID string        // Short session identifier (last 8 chars of UUID)
+	RequestID string        // Unique request ID for correlation (6 chars)
+	BodySize  int           // Original body size in bytes (for display)
+	SeqNum    int           // Sequential request number for display (#01, #02) - same for matching req/res pairs
+}
+
+// EstimatedMemorySize returns an estimate of memory used by this entry in bytes
+func (e LogEntry) EstimatedMemorySize() int {
+	// Base struct overhead (approx 128 bytes for fields, pointers, etc.)
+	size := 128
+	// Add string lengths (Go strings are counted by their length)
+	size += len(e.Model)
+	size += len(e.Method)
+	size += len(e.Path)
+	size += len(e.Preview)
+	size += len(e.Body)
+	size += len(e.SessionID)
+	size += len(e.RequestID)
+	return size
 }
 
 // LogEntryMsg carries a log entry to the TUI
@@ -85,6 +110,17 @@ func (e LogEntry) Format(maxWidth int) string {
 	timeStyle := lipgloss.NewStyle().Foreground(colorTime)
 	previewStyle := lipgloss.NewStyle().Foreground(colorPreview)
 
+	// Build session/request ID prefix for requests and responses
+	var idPrefix string
+	if (e.Type == LogTypeReq || e.Type == LogTypeRes) && (e.SessionID != "" || e.RequestID != "") {
+		idStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+		if e.SessionID != "" && e.RequestID != "" {
+			idPrefix = idStyle.Render(fmt.Sprintf("[%s:%s] ", e.SessionID, e.RequestID))
+		} else if e.RequestID != "" {
+			idPrefix = idStyle.Render(fmt.Sprintf("[%s] ", e.RequestID))
+		}
+	}
+
 	// Build the details section based on type
 	var details string
 	switch e.Type {
@@ -93,9 +129,9 @@ func (e LogEntry) Format(maxWidth int) string {
 		if len(model) > 20 {
 			model = model[:17] + "..."
 		}
-		details = fmt.Sprintf("%s %s %s", model, e.Method, e.Path)
+		details = fmt.Sprintf("%s%s %s %s", idPrefix, model, e.Method, e.Path)
 	case LogTypeRes:
-		details = fmt.Sprintf("%d %s (%v)", e.Status, e.Path, e.Duration.Round(time.Millisecond))
+		details = fmt.Sprintf("%s%d %s (%v)", idPrefix, e.Status, e.Path, e.Duration.Round(time.Millisecond))
 	case LogTypeErr:
 		details = e.Preview
 	default:
@@ -112,8 +148,8 @@ func (e LogEntry) Format(maxWidth int) string {
 
 	preview := truncate(e.Preview, previewWidth)
 
-	// Only show preview for requests (body content)
-	if e.Type == LogTypeReq && preview != "" {
+	// Show preview for requests and responses with body content
+	if (e.Type == LogTypeReq || e.Type == LogTypeRes) && preview != "" {
 		return fmt.Sprintf("%s %s %s | %s",
 			timeStyle.Render("["+timestamp+"]"),
 			typeStyle.Render("["+e.Type.String()+"]"),
@@ -133,18 +169,38 @@ func (e LogEntry) Format(maxWidth int) string {
 func (e LogEntry) FormatPlain() string {
 	timestamp := e.Timestamp.Format("2006-01-02 15:04:05.000")
 
+	// Build ID prefix for requests and responses
+	var idPrefix string
+	if (e.Type == LogTypeReq || e.Type == LogTypeRes) && (e.SessionID != "" || e.RequestID != "") {
+		if e.SessionID != "" && e.RequestID != "" {
+			idPrefix = fmt.Sprintf("[%s:%s] ", e.SessionID, e.RequestID)
+		} else if e.RequestID != "" {
+			idPrefix = fmt.Sprintf("[%s] ", e.RequestID)
+		}
+	}
+
 	var details string
 	switch e.Type {
 	case LogTypeReq:
-		details = fmt.Sprintf("%s %s %s", e.Model, e.Method, e.Path)
+		details = fmt.Sprintf("%s%s %s %s", idPrefix, e.Model, e.Method, e.Path)
 	case LogTypeRes:
-		details = fmt.Sprintf("%d %s (%v)", e.Status, e.Path, e.Duration.Round(time.Millisecond))
+		details = fmt.Sprintf("%s%d %s (%v)", idPrefix, e.Status, e.Path, e.Duration.Round(time.Millisecond))
 	default:
 		details = e.Preview
 	}
 
-	if e.Type == LogTypeReq && e.Preview != "" {
-		return fmt.Sprintf("[%s] [%s] %s | %s", timestamp, e.Type.String(), details, truncate(e.Preview, 200))
+	// Include body content for REQ and RES entries (use Body for full content, fallback to Preview)
+	content := e.Body
+	if content == "" {
+		content = e.Preview
+	}
+	if (e.Type == LogTypeReq || e.Type == LogTypeRes) && content != "" {
+		cfg := config.Get()
+		// FileContentLen = 0 means unlimited
+		if cfg.Logging.FileContentLen > 0 {
+			content = truncate(content, cfg.Logging.FileContentLen)
+		}
+		return fmt.Sprintf("[%s] [%s] %s | %s", timestamp, e.Type.String(), details, content)
 	}
 
 	return fmt.Sprintf("[%s] [%s] %s", timestamp, e.Type.String(), details)
@@ -166,12 +222,14 @@ func truncate(s string, maxLen int) string {
 
 // Logger manages log entries with a ring buffer
 type Logger struct {
-	entries    []LogEntry
-	maxEntries int
-	mu         sync.RWMutex
-	program    *tea.Program
-	fileWriter *os.File
-	filePath   string
+	entries      []LogEntry
+	maxEntries   int
+	mu           sync.RWMutex
+	program      *tea.Program
+	fileWriter   *os.File
+	filePath     string
+	requestCount uint64         // Counter for generating unique request IDs
+	seqNumMap    map[string]int // Maps session ID to current sequential number
 }
 
 // NewLogger creates a new logger with a maximum number of entries
@@ -179,6 +237,7 @@ func NewLogger(maxEntries int) *Logger {
 	return &Logger{
 		entries:    make([]LogEntry, 0, maxEntries),
 		maxEntries: maxEntries,
+		seqNumMap:  make(map[string]int),
 	}
 }
 
@@ -256,51 +315,105 @@ func (l *Logger) Log(entry LogEntry) {
 	}
 }
 
-// LogRequest is a convenience method for logging requests
-func (l *Logger) LogRequest(model, method, path, body string) {
-	// Create truncated preview for list view
-	preview := body
-	if len(preview) > 100 {
-		preview = preview[:97] + "..."
+// sanitizePreview creates a single-line preview from text
+func sanitizePreview(text string, maxLen int) string {
+	// Replace newlines and tabs with single space
+	preview := strings.ReplaceAll(text, "\n", " ")
+	preview = strings.ReplaceAll(preview, "\r", " ")
+	preview = strings.ReplaceAll(preview, "\t", " ")
+	// Collapse multiple spaces
+	for strings.Contains(preview, "  ") {
+		preview = strings.ReplaceAll(preview, "  ", " ")
 	}
+	preview = strings.TrimSpace(preview)
+	// Truncate
+	if len(preview) > maxLen {
+		preview = preview[:maxLen-3] + "..."
+	}
+	return preview
+}
+
+// generateRequestID generates a unique request ID (6 hex chars)
+func (l *Logger) generateRequestID() string {
+	l.requestCount++
+	return fmt.Sprintf("%06x", l.requestCount%0xFFFFFF)
+}
+
+// LogRequestResult contains the IDs generated for a logged request
+type LogRequestResult struct {
+	RequestID string // Hex ID for correlation (6 chars)
+	SeqNum    int    // Sequential number for display (#01, #02)
+}
+
+// LogRequest is a convenience method for logging requests
+// Returns the generated request ID and sequential number for correlation with the response
+// status: 0 = OK (request parsed successfully), non-zero = error status code
+// parseDuration: time taken to receive/parse the request
+func (l *Logger) LogRequest(model, method, path, body, sessionID string, status int, parseDuration time.Duration) LogRequestResult {
+	l.mu.Lock()
+	requestID := l.generateRequestID()
+	// Get or create sequential number for this session
+	seqNum := l.seqNumMap[sessionID] + 1
+	l.seqNumMap[sessionID] = seqNum
+	l.mu.Unlock()
+
+	cfg := config.Get()
 	l.Log(LogEntry{
 		Timestamp: time.Now(),
 		Type:      LogTypeReq,
 		Model:     model,
 		Method:    method,
 		Path:      path,
-		Preview:   preview,
+		Status:    status,
+		Duration:  parseDuration,
+		Preview:   sanitizePreview(body, cfg.Logging.PreviewLength),
 		Body:      body,
+		SessionID: sessionID,
+		RequestID: requestID,
+		BodySize:  len(body),
+		SeqNum:    seqNum,
 	})
+	return LogRequestResult{RequestID: requestID, SeqNum: seqNum}
 }
 
 // LogResponse is a convenience method for logging responses
-func (l *Logger) LogResponse(status int, path string, duration time.Duration) {
+// sessionID, requestID, and seqNum are used for correlation with the request
+func (l *Logger) LogResponse(status int, path string, duration time.Duration, responsePreview, sessionID, requestID string, seqNum int) {
+	cfg := config.Get()
 	l.Log(LogEntry{
 		Timestamp: time.Now(),
 		Type:      LogTypeRes,
 		Status:    status,
 		Path:      path,
 		Duration:  duration,
-		Preview:   fmt.Sprintf("%d %s (%v)", status, path, duration.Round(time.Millisecond)),
+		Preview:   sanitizePreview(responsePreview, cfg.Logging.PreviewLength),
+		Body:      responsePreview,
+		SessionID: sessionID,
+		RequestID: requestID,
+		BodySize:  len(responsePreview),
+		SeqNum:    seqNum,
 	})
 }
 
 // LogError is a convenience method for logging errors
 func (l *Logger) LogError(message string) {
+	cfg := config.Get()
 	l.Log(LogEntry{
 		Timestamp: time.Now(),
 		Type:      LogTypeErr,
-		Preview:   message,
+		Preview:   sanitizePreview(message, cfg.Logging.PreviewLength),
+		Body:      message,
 	})
 }
 
 // LogInfo is a convenience method for logging info messages
 func (l *Logger) LogInfo(message string) {
+	cfg := config.Get()
 	l.Log(LogEntry{
 		Timestamp: time.Now(),
 		Type:      LogTypeInf,
-		Preview:   message,
+		Preview:   sanitizePreview(message, cfg.Logging.PreviewLength),
+		Body:      message,
 	})
 }
 
@@ -319,6 +432,7 @@ func (l *Logger) Clear() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.entries = l.entries[:0]
+	l.seqNumMap = make(map[string]int)
 }
 
 // Count returns the number of log entries
@@ -328,9 +442,233 @@ func (l *Logger) Count() int {
 	return len(l.entries)
 }
 
+// EstimatedMemoryUsage returns the estimated total memory used by all entries in bytes
+func (l *Logger) EstimatedMemoryUsage() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	total := 0
+	for _, entry := range l.entries {
+		total += entry.EstimatedMemorySize()
+	}
+	return total
+}
+
 // FilePath returns the current log file path, if file logging is enabled
 func (l *Logger) FilePath() string {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.filePath
+}
+
+// LoadFromFile loads log entries from a file into the logger
+// This is used to restore logs from previous sessions on startup
+func (l *Logger) LoadFromFile(filePath string) (int, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	scanner := bufio.NewScanner(file)
+	// Increase buffer size for long lines
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	count := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if entry, ok := parsePlainLogLine(line); ok {
+			// Ring buffer: remove oldest if at capacity
+			if len(l.entries) >= l.maxEntries {
+				l.entries = l.entries[1:]
+			}
+			l.entries = append(l.entries, entry)
+			count++
+		}
+	}
+
+	return count, scanner.Err()
+}
+
+// Regex patterns for parsing log lines
+var (
+	// Main log line pattern: [timestamp] [TYPE] details
+	logLinePattern = regexp.MustCompile(`^\[([^\]]+)\] \[([A-Z]{3})\] (.*)$`)
+	// Session:RequestID pattern: [session:reqid]
+	sessionReqPattern = regexp.MustCompile(`^\[([^:]+):([^\]]+)\] (.*)$`)
+	// RequestID only pattern: [reqid]
+	reqOnlyPattern = regexp.MustCompile(`^\[([^\]]+)\] (.*)$`)
+	// Response details: status path (duration)
+	responsePattern = regexp.MustCompile(`^(\d+) ([^ ]+) \(([^)]+)\)$`)
+)
+
+// parsePlainLogLine parses a line from the plain text log format
+func parsePlainLogLine(line string) (LogEntry, bool) {
+	matches := logLinePattern.FindStringSubmatch(line)
+	if matches == nil {
+		return LogEntry{}, false
+	}
+
+	timestampStr := matches[1]
+	typeStr := matches[2]
+	details := matches[3]
+
+	// Parse timestamp
+	timestamp, err := time.Parse("2006-01-02 15:04:05.000", timestampStr)
+	if err != nil {
+		return LogEntry{}, false
+	}
+
+	// Parse log type
+	var logType LogType
+	switch typeStr {
+	case "REQ":
+		logType = LogTypeReq
+	case "RES":
+		logType = LogTypeRes
+	case "ERR":
+		logType = LogTypeErr
+	case "INF":
+		logType = LogTypeInf
+	default:
+		return LogEntry{}, false
+	}
+
+	entry := LogEntry{
+		Timestamp: timestamp,
+		Type:      logType,
+	}
+
+	// Split details and preview (separated by " | ")
+	parts := strings.SplitN(details, " | ", 2)
+	mainDetails := parts[0]
+	if len(parts) > 1 {
+		entry.Preview = parts[1]
+		entry.Body = parts[1]
+	}
+
+	// Parse based on log type
+	switch logType {
+	case LogTypeReq:
+		parseRequestDetails(&entry, mainDetails)
+	case LogTypeRes:
+		parseResponseDetails(&entry, mainDetails)
+	case LogTypeErr, LogTypeInf:
+		entry.Preview = mainDetails
+		entry.Body = mainDetails
+	}
+
+	return entry, true
+}
+
+// deriveSeqNumFromRequestID tries to derive a display SeqNum from the hex RequestID
+// This is used when loading entries from log files that don't have SeqNum stored
+func deriveSeqNumFromRequestID(requestID string) int {
+	if requestID == "" {
+		return 0
+	}
+	// Parse hex string to int
+	if val, err := strconv.ParseInt(requestID, 16, 64); err == nil {
+		return int(val)
+	}
+	return 0
+}
+
+// parseRequestDetails parses request-specific details
+func parseRequestDetails(entry *LogEntry, details string) {
+	remaining := details
+
+	// Check for [session:reqid] or [reqid] prefix
+	if matches := sessionReqPattern.FindStringSubmatch(remaining); matches != nil {
+		entry.SessionID = matches[1]
+		entry.RequestID = matches[2]
+		remaining = matches[3]
+	} else if matches := reqOnlyPattern.FindStringSubmatch(remaining); matches != nil {
+		entry.RequestID = matches[1]
+		remaining = matches[2]
+	}
+
+	// Derive SeqNum from RequestID for display (for entries loaded from file)
+	entry.SeqNum = deriveSeqNumFromRequestID(entry.RequestID)
+
+	// Parse: model method path
+	parts := strings.SplitN(remaining, " ", 3)
+	if len(parts) >= 1 {
+		entry.Model = parts[0]
+	}
+	if len(parts) >= 2 {
+		entry.Method = parts[1]
+	}
+	if len(parts) >= 3 {
+		entry.Path = parts[2]
+	}
+}
+
+// parseResponseDetails parses response-specific details
+func parseResponseDetails(entry *LogEntry, details string) {
+	remaining := details
+
+	// Check for [session:reqid] or [reqid] prefix
+	if matches := sessionReqPattern.FindStringSubmatch(remaining); matches != nil {
+		entry.SessionID = matches[1]
+		entry.RequestID = matches[2]
+		// Derive SeqNum from RequestID for display
+		entry.SeqNum = deriveSeqNumFromRequestID(entry.RequestID)
+		remaining = matches[3]
+	} else if matches := reqOnlyPattern.FindStringSubmatch(remaining); matches != nil {
+		entry.RequestID = matches[1]
+		// Derive SeqNum from RequestID for display
+		entry.SeqNum = deriveSeqNumFromRequestID(entry.RequestID)
+		remaining = matches[2]
+	}
+
+	// Parse: status path (duration)
+	if matches := responsePattern.FindStringSubmatch(remaining); matches != nil {
+		entry.Status, _ = strconv.Atoi(matches[1])
+		entry.Path = matches[2]
+		entry.Duration, _ = time.ParseDuration(matches[3])
+	}
+}
+
+// GetUniqueSessions returns a list of unique session IDs from the log entries
+func (l *Logger) GetUniqueSessions() []string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var sessions []string
+
+	for _, entry := range l.entries {
+		if entry.SessionID != "" && !seen[entry.SessionID] {
+			seen[entry.SessionID] = true
+			sessions = append(sessions, entry.SessionID)
+		}
+	}
+
+	return sessions
+}
+
+// GetEntriesBySession returns log entries filtered by session ID
+// If sessionID is empty, returns all entries
+func (l *Logger) GetEntriesBySession(sessionID string) []LogEntry {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if sessionID == "" {
+		result := make([]LogEntry, len(l.entries))
+		copy(result, l.entries)
+		return result
+	}
+
+	var result []LogEntry
+	for _, entry := range l.entries {
+		if entry.SessionID == sessionID {
+			result = append(result, entry)
+		}
+	}
+	return result
 }

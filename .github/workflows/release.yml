@@ -13,14 +13,14 @@ jobs:
                 os: [ubuntu-latest, windows-latest, macos-latest]
                 include:
                     - os: ubuntu-latest
-                      artifact_name: kiro2cc
-                      asset_prefix: kiro2cc-linux-amd64
+                      artifact_name: claude2kiro
+                      asset_prefix: claude2kiro-linux-amd64
                     - os: windows-latest
-                      artifact_name: kiro2cc.exe
-                      asset_prefix: kiro2cc-windows-amd64
+                      artifact_name: claude2kiro.exe
+                      asset_prefix: claude2kiro-windows-amd64
                     - os: macos-latest
-                      artifact_name: kiro2cc
-                      asset_prefix: kiro2cc-macos-amd64
+                      artifact_name: claude2kiro
+                      asset_prefix: claude2kiro-macos-amd64
 
         steps:
             - name: Checkout code

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**kiro2cc** is a Go CLI tool that enables Claude Code (and other Anthropic API-compatible tools) to work with Kiro subscriptions instead of direct Anthropic subscriptions.
+**Claude2Kiro** is a Go CLI tool that enables Claude Code (and other Anthropic API-compatible tools) to work with Kiro subscriptions instead of direct Anthropic subscriptions.
 
 ### Background: Kiro and Its Relationship to Claude
 
@@ -19,8 +19,8 @@ The backend API uses the legacy `codewhisperer.amazonaws.com` endpoint because:
 
 ### How It Works
 
-1. User logs into Kiro IDE (creates auth token at `~/.aws/sso/cache/kiro-auth-token.json`)
-2. kiro2cc reads this token and starts a local proxy server
+1. User runs `claude2kiro login` (authenticates via browser, creates token at `~/.aws/sso/cache/kiro-auth-token.json`)
+2. Claude2Kiro reads this token and starts a local proxy server
 3. Claude Code sends requests to the proxy in Anthropic API format
 4. Proxy translates to CodeWhisperer format and forwards to AWS
 5. AWS responds with binary event stream
@@ -33,7 +33,7 @@ The backend API uses the legacy `codewhisperer.amazonaws.com` endpoint because:
 
 ```bash
 # Build the application
-"C:/Program Files/Go/bin/go.exe" build -o kiro2cc.exe main.go
+"C:/Program Files/Go/bin/go.exe" build -o claude2kiro.exe main.go
 
 # Run tests
 "C:/Program Files/Go/bin/go.exe" test ./...
@@ -42,25 +42,26 @@ The backend API uses the legacy `codewhisperer.amazonaws.com` endpoint because:
 "C:/Program Files/Go/bin/go.exe" test ./parser -v
 
 # Run the application
-./kiro2cc [command]
+./claude2kiro [command]
 ```
 
 ## Application Commands
 
 | Command | Description |
 |---------|-------------|
-| `./kiro2cc read` | Display current token information |
-| `./kiro2cc refresh` | Refresh access token using refresh token |
-| `./kiro2cc export` | Output environment variable commands |
-| `./kiro2cc claude` | Configure Claude Code's `~/.claude.json` |
-| `./kiro2cc server [port]` | Start HTTP proxy server (default: 8080) |
+| `./claude2kiro login` | Authenticate via browser (GitHub, Google, AWS Builder ID, Enterprise IdC) |
+| `./claude2kiro read` | Display current token information |
+| `./claude2kiro refresh` | Refresh access token using refresh token |
+| `./claude2kiro export` | Output environment variable commands |
+| `./claude2kiro claude` | Configure Claude Code's `~/.claude.json` |
+| `./claude2kiro server [port]` | Start HTTP proxy server (default: 8080) |
 
 ## Architecture
 
 ### Project Structure
 
 ```
-kiro2cc/
+claude2kiro/
 ├── main.go                 # Core application (~1000 lines)
 ├── parser/
 │   ├── sse_parser.go       # Binary response parser
@@ -140,7 +141,7 @@ Converts to Anthropic SSE events:
 ### Request Flow Diagram
 
 ```
-Claude Code ──────► POST /v1/messages ──────► kiro2cc proxy
+Claude Code ──────► POST /v1/messages ──────► Claude2Kiro proxy
                     (Anthropic format)              │
                                                     ▼
                                         Read ~/.aws/sso/cache/

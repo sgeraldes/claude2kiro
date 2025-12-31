@@ -10,21 +10,9 @@ type AppState int
 const (
 	StateMenu AppState = iota
 	StateLogin
+	StateLoginProgress
 	StateDashboard
-)
-
-// MenuAction represents a menu selection
-type MenuAction int
-
-const (
-	ActionLogin MenuAction = iota
-	ActionServer
-	ActionRefreshToken
-	ActionViewToken
-	ActionExportEnv
-	ActionConfigureClaude
-	ActionLogout
-	ActionQuit
+	StateSettings
 )
 
 // NavigateToMenuMsg signals navigation to the main menu
@@ -49,11 +37,6 @@ type ServerStoppedMsg struct {
 // ServerErrorMsg indicates a server error
 type ServerErrorMsg struct {
 	Err error
-}
-
-// MenuActionMsg signals a menu action was selected
-type MenuActionMsg struct {
-	Action MenuAction
 }
 
 // LogType categorizes log entries

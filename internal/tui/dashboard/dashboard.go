@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -18,9 +16,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/bestk/kiro2cc/internal/tui/logger"
-	"github.com/bestk/kiro2cc/internal/tui/menu"
+	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
+	"github.com/sgeraldes/claude2kiro/internal/tui/menu"
+	"github.com/sgeraldes/claude2kiro/internal/tui/messages"
 )
+
+// RefreshTokenFunc is the function type for refreshing tokens
+type RefreshTokenFunc func() (time.Time, error)
+
+// IsTokenExpiredFunc is the function type for checking if token is expired
+type IsTokenExpiredFunc func() bool
 
 // Version from menu package
 var Version = menu.Version
@@ -33,21 +40,19 @@ const (
 	PanelLogs
 )
 
-// ServerStartedMsg indicates the server has started
-type ServerStartedMsg struct {
-	Port string
-}
-
-// ServerStoppedMsg indicates the server has stopped
-type ServerStoppedMsg struct {
-	Err error
-}
+// Type aliases for shared messages - allows backward compatibility
+// while breaking the import cycle between cmd and dashboard
+type ServerStartedMsg = messages.ServerStartedMsg
+type ServerStoppedMsg = messages.ServerStoppedMsg
 
 // BackToMenuMsg signals return to the main menu (server stopped)
 type BackToMenuMsg struct{}
 
 // GoToMenuMsg signals navigation to menu while keeping server running
 type GoToMenuMsg struct{}
+
+// OpenSettingsMsg signals navigation to settings from dashboard
+type OpenSettingsMsg struct{}
 
 // TickMsg for periodic updates
 type TickMsg time.Time
@@ -68,115 +73,65 @@ type CreditsUpdateMsg struct {
 	Info CreditsInfo
 }
 
-const kiroVersion = "0.6.0"
+// TokenRefreshedMsg signals token was refreshed on startup
+type TokenRefreshedMsg struct {
+	Success   bool
+	ExpiresAt time.Time
+	Err       error
+}
 
-// fetchCreditsInfo fetches credit information from Kiro API
+// fetchCreditsInfo fetches credit information using the shared cmd function
 func fetchCreditsInfo() CreditsInfo {
-	tokenInfo := getTokenInfo()
-	if !tokenInfo.Present {
-		return CreditsInfo{Error: fmt.Errorf("no token")}
-	}
-
-	// Read full token for access token
-	homeDir, _ := os.UserHomeDir()
-	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
-	data, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	var token struct {
-		AccessToken string `json:"accessToken"`
-		ProfileArn  string `json:"profileArn"`
-	}
-	if err := json.Unmarshal(data, &token); err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	// Build request
-	baseURL := "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits"
-	req, err := http.NewRequest("GET", baseURL, nil)
-	if err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	q := req.URL.Query()
-	if token.ProfileArn != "" {
-		q.Add("profileArn", token.ProfileArn)
-	}
-	q.Add("origin", "AI_EDITOR")
-	q.Add("resourceType", "AGENTIC_REQUEST")
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return CreditsInfo{Error: err}
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return CreditsInfo{Error: fmt.Errorf("API error %d", resp.StatusCode)}
-	}
-
-	var usageResp struct {
-		DaysUntilReset     int     `json:"daysUntilReset"`
-		NextDateReset      float64 `json:"nextDateReset"`
-		UsageBreakdownList []struct {
-			CurrentUsage              float64 `json:"currentUsage"`
-			CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
-			UsageLimit                float64 `json:"usageLimit"`
-			UsageLimitWithPrecision   float64 `json:"usageLimitWithPrecision"`
-		} `json:"usageBreakdownList"`
-		SubscriptionInfo struct {
-			SubscriptionTitle string `json:"subscriptionTitle"`
-		} `json:"subscriptionInfo"`
-	}
-	if err := json.Unmarshal(body, &usageResp); err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	// Calculate days until reset from timestamp if not provided
-	daysUntilReset := usageResp.DaysUntilReset
-	if daysUntilReset == 0 && usageResp.NextDateReset > 0 {
-		resetTime := time.Unix(int64(usageResp.NextDateReset), 0)
-		daysUntilReset = int(time.Until(resetTime).Hours() / 24)
-		if daysUntilReset < 0 {
-			daysUntilReset = 0
-		}
-	}
-
-	info := CreditsInfo{
-		DaysUntilReset:   daysUntilReset,
-		SubscriptionName: usageResp.SubscriptionInfo.SubscriptionTitle,
+	info := cmd.GetCreditsInfo()
+	return CreditsInfo{
+		CreditsUsed:      info.CreditsUsed,
+		CreditsLimit:     info.CreditsLimit,
+		CreditsRemaining: info.CreditsRemaining,
+		DaysUntilReset:   info.DaysUntilReset,
+		SubscriptionName: info.SubscriptionName,
 		LastUpdated:      time.Now(),
+		Error:            info.Error,
 	}
-
-	if len(usageResp.UsageBreakdownList) > 0 {
-		b := usageResp.UsageBreakdownList[0]
-		info.CreditsUsed = b.CurrentUsageWithPrecision
-		if info.CreditsUsed == 0 {
-			info.CreditsUsed = b.CurrentUsage
-		}
-		info.CreditsLimit = b.UsageLimitWithPrecision
-		if info.CreditsLimit == 0 {
-			info.CreditsLimit = b.UsageLimit
-		}
-		info.CreditsRemaining = info.CreditsLimit - info.CreditsUsed
-	}
-
-	return info
 }
 
 // fetchCreditsCmd returns a command that fetches credits
-func fetchCreditsCmd() tea.Cmd {
+// Skips API call entirely for AWS Builder ID accounts
+func FetchCreditsCmd() tea.Cmd {
 	return func() tea.Msg {
+		// Check if this is a BuilderId account - skip credits API entirely
+		token, err := cmd.GetToken()
+		if err == nil && token.Provider == "BuilderId" {
+			// BuilderId accounts don't support the credits API
+			// Return a special "not supported" info instead of an error
+			return CreditsUpdateMsg{Info: CreditsInfo{
+				SubscriptionName: "AWS Builder ID",
+				LastUpdated:      time.Now(),
+				// No error - this is expected behavior
+			}}
+		}
 		return CreditsUpdateMsg{Info: fetchCreditsInfo()}
+	}
+}
+
+// autoRefreshTokenCmd checks if token is expired and refreshes it
+func (m Model) autoRefreshTokenCmd() tea.Cmd {
+	return func() tea.Msg {
+		// If we don't have the functions, skip refresh and just fetch credits
+		if m.isTokenExpiredFn == nil || m.refreshTokenFn == nil {
+			return TokenRefreshedMsg{Success: true, ExpiresAt: m.tokenExpiry}
+		}
+
+		if !m.isTokenExpiredFn() {
+			// Token is still valid, just fetch credits
+			return TokenRefreshedMsg{Success: true, ExpiresAt: m.tokenExpiry}
+		}
+
+		// Token is expired, try to refresh
+		newExpiry, err := m.refreshTokenFn()
+		if err != nil {
+			return TokenRefreshedMsg{Success: false, Err: err}
+		}
+		return TokenRefreshedMsg{Success: true, ExpiresAt: newExpiry}
 	}
 }
 
@@ -184,14 +139,18 @@ func fetchCreditsCmd() tea.Cmd {
 type DashboardKeyMap struct {
 	Tab        key.Binding
 	Menu       key.Binding
+	Settings   key.Binding
 	Quit       key.Binding
 	Help       key.Binding
+	Usage      key.Binding
 	ScrollUp   key.Binding
 	ScrollDown key.Binding
 	PageUp     key.Binding
 	PageDown   key.Binding
 	Top        key.Binding
 	Bottom     key.Binding
+	Clear      key.Binding
+	Search     key.Binding
 }
 
 func DefaultDashboardKeyMap() DashboardKeyMap {
@@ -204,6 +163,10 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 			key.WithKeys("m", "esc"),
 			key.WithHelp("m/esc", "menu"),
 		),
+		Settings: key.NewBinding(
+			key.WithKeys("o"),
+			key.WithHelp("o", "settings"),
+		),
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
 			key.WithHelp("q", "stop server"),
@@ -212,13 +175,17 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 			key.WithKeys("?"),
 			key.WithHelp("?", "help"),
 		),
+		Usage: key.NewBinding(
+			key.WithKeys("u"),
+			key.WithHelp("u", "open usage page"),
+		),
 		ScrollUp: key.NewBinding(
-			key.WithKeys("up", "k"),
-			key.WithHelp("↑/k", "scroll up"),
+			key.WithKeys("up"),
+			key.WithHelp("↑", "scroll up"),
 		),
 		ScrollDown: key.NewBinding(
-			key.WithKeys("down", "j"),
-			key.WithHelp("↓/j", "scroll down"),
+			key.WithKeys("down"),
+			key.WithHelp("↓", "scroll down"),
 		),
 		PageUp: key.NewBinding(
 			key.WithKeys("pgup", "ctrl+u"),
@@ -236,44 +203,56 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 			key.WithKeys("end", "G"),
 			key.WithHelp("end", "bottom"),
 		),
+		Clear: key.NewBinding(
+			key.WithKeys("c"),
+			key.WithHelp("c", "clear from now"),
+		),
+		Search: key.NewBinding(
+			key.WithKeys("/", "s"),
+			key.WithHelp("s", "search"),
+		),
 	}
 }
 
 func (k DashboardKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.ScrollUp, k.ScrollDown, k.Tab, k.Menu, k.Quit}
+	return []key.Binding{k.ScrollUp, k.ScrollDown, k.Search, k.Clear, k.Tab, k.Menu, k.Quit}
 }
 
 func (k DashboardKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.ScrollUp, k.ScrollDown, k.PageUp, k.PageDown},
 		{k.Top, k.Bottom},
-		{k.Tab, k.Menu, k.Help, k.Quit},
+		{k.Tab, k.Settings, k.Menu, k.Help, k.Quit},
 	}
 }
 
 // Model represents the server dashboard
 type Model struct {
-	session         SessionModel
-	logViewer       LogViewerModel
-	help            help.Model
-	keys            DashboardKeyMap
-	focusedPanel    FocusedPanel
-	width           int
-	height          int
-	port            string
-	server          *http.Server
-	logger          *logger.Logger
-	quitting        bool
-	showFullHelp    bool
-	tokenExpiry     time.Time
-	credits         CreditsInfo
-	creditsProgress progress.Model
-	serverRunning   bool
+	session            SessionModel
+	logViewer          LogViewerModel
+	filterBar          FilterBarModel
+	help               help.Model
+	keys               DashboardKeyMap
+	focusedPanel       FocusedPanel
+	width              int
+	height             int
+	port               string
+	server             *http.Server
+	logger             *logger.Logger
+	quitting           bool
+	showFullHelp       bool
+	tokenExpiry        time.Time
+	credits            CreditsInfo
+	creditsProgress    progress.Model
+	serverRunning      bool
+	refreshTokenFn     RefreshTokenFunc
+	isTokenExpiredFn   IsTokenExpiredFunc
+	creditsFetchFailed bool // Stop retrying after persistent 403/access denied errors
 }
 
 
 // New creates a new dashboard model
-func New(port string, tokenExpiry time.Time, lg *logger.Logger) Model {
+func New(port string, tokenExpiry time.Time, lg *logger.Logger, refreshFn RefreshTokenFunc, isExpiredFn IsTokenExpiredFunc) Model {
 	h := help.New()
 	h.ShowAll = false
 
@@ -284,24 +263,43 @@ func New(port string, tokenExpiry time.Time, lg *logger.Logger) Model {
 		progress.WithoutPercentage(),
 	)
 
+	// Initialize filter bar
+	filterBar := NewFilterBarModel()
+
 	// Initialize log viewer with focus enabled from the start
 	logViewer := NewLogViewerModel(80, 20)
 	logViewer.SetFocused(true)
+
+	// Apply initial filters from filter bar (includes persisted AfterDate)
+	logViewer.ApplyFilters(filterBar.GetFilters())
+
+	// Load existing entries from logger (for persistence across restarts)
+	if lg != nil {
+		existingEntries := lg.GetEntries()
+		if len(existingEntries) > 0 {
+			logViewer.SetEntries(existingEntries)
+			// Re-apply filters after loading entries
+			logViewer.ApplyFilters(filterBar.GetFilters())
+		}
+	}
 
 	// Initialize session model with token expiry
 	session := NewSessionModel(port)
 	session.SetTokenExpiry(tokenExpiry)
 
 	return Model{
-		session:         session,
-		logViewer:       logViewer,
-		help:            h,
-		keys:            DefaultDashboardKeyMap(),
-		focusedPanel:    PanelLogs,
-		port:            port,
-		logger:          lg,
-		tokenExpiry:     tokenExpiry,
-		creditsProgress: prog,
+		session:          session,
+		logViewer:        logViewer,
+		filterBar:        filterBar,
+		help:             h,
+		keys:             DefaultDashboardKeyMap(),
+		focusedPanel:     PanelLogs,
+		port:             port,
+		logger:           lg,
+		tokenExpiry:      tokenExpiry,
+		creditsProgress:  prog,
+		refreshTokenFn:   refreshFn,
+		isTokenExpiredFn: isExpiredFn,
 	}
 }
 
@@ -309,7 +307,7 @@ func New(port string, tokenExpiry time.Time, lg *logger.Logger) Model {
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		tickCmd(),
-		fetchCreditsCmd(),
+		m.autoRefreshTokenCmd(), // Refresh token first if expired, then TokenRefreshedMsg will trigger credits fetch
 	)
 }
 
@@ -325,16 +323,47 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// If filter bar search is focused (typing mode), forward all keys to it
+		if m.filterBar.IsSearchFocused() {
+			var cmd tea.Cmd
+			m.filterBar, cmd = m.filterBar.Update(msg)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
+		// If filter bar is focused (navigating), forward navigation keys to it
+		if m.filterBar.IsFocused() {
+			switch msg.String() {
+			case "m", "esc":
+				// Allow menu key to work
+			case "q", "ctrl+c":
+				// Allow quit key to work
+			case "o":
+				// Allow settings key to work
+			default:
+				// Forward other keys to filter bar
+				var cmd tea.Cmd
+				m.filterBar, cmd = m.filterBar.Update(msg)
+				cmds = append(cmds, cmd)
+				return m, tea.Batch(cmds...)
+			}
+		}
+
 		switch {
 		case key.Matches(msg, m.keys.Menu):
 			// Go to menu without stopping the server
 			return m, func() tea.Msg { return GoToMenuMsg{} }
 
+		case key.Matches(msg, m.keys.Settings):
+			// Open settings
+			return m, func() tea.Msg { return OpenSettingsMsg{} }
+
 		case key.Matches(msg, m.keys.Quit):
 			m.quitting = true
 			// Graceful shutdown
 			if m.server != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				cfg := config.Get()
+				ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 				defer cancel()
 				m.server.Shutdown(ctx)
 			}
@@ -351,14 +380,69 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.showFullHelp = !m.showFullHelp
 			m.help.ShowAll = m.showFullHelp
 
+		case key.Matches(msg, m.keys.Usage):
+			// Open Kiro usage page in browser
+			if err := cmd.OpenBrowser(cmd.GetKiroUsageURL()); err != nil {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeErr,
+					Preview:   fmt.Sprintf("Failed to open browser: %v", err),
+				})
+			} else {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeInf,
+					Preview:   "Opened Kiro usage page in browser",
+				})
+			}
+
 		default:
-			// Forward to focused panel
-			if m.focusedPanel == PanelLogs {
+			// Handle filter bar keys
+			switch msg.String() {
+			case "c":
+				// Set AfterDate filter to now
+				m.filterBar.SetAfterDate(time.Now())
+				m.logViewer.ApplyFilters(m.filterBar.GetFilters())
+				return m, nil
+			case "/", "s":
+				// Focus search in filter bar
+				m.filterBar.SetFocused(true)
+				m.logViewer.SetFocused(false)
+				cmd := m.filterBar.FocusSearch()
+				return m, cmd
+			case "1", "2", "3", "4":
+				// Forward to filter bar for type toggles
 				var cmd tea.Cmd
-				m.logViewer, cmd = m.logViewer.Update(msg)
+				m.filterBar, cmd = m.filterBar.Update(msg)
 				cmds = append(cmds, cmd)
+			case "x", "X":
+				// Clear AfterDate filter
+				m.filterBar.ClearAfterDate()
+				m.logViewer.ApplyFilters(m.filterBar.GetFilters())
+				return m, nil
+			default:
+				// Forward to focused panel
+				if m.focusedPanel == PanelLogs {
+					var cmd tea.Cmd
+					m.logViewer, cmd = m.logViewer.Update(msg)
+					cmds = append(cmds, cmd)
+				}
 			}
 		}
+
+	case FilterChangedMsg:
+		// Apply filter changes to log viewer
+		m.logViewer.ApplyFilters(msg.State)
+
+	case FocusFilterBarMsg:
+		// User pressed up from first log entry, focus filter bar
+		m.filterBar.SetFocused(true)
+		m.logViewer.SetFocused(false)
+
+	case FocusLogListMsg:
+		// User pressed down from filter bar, focus log viewer
+		m.filterBar.SetFocused(false)
+		m.logViewer.SetFocused(true)
 
 	case logger.LogEntryMsg:
 		// Add to log viewer
@@ -367,9 +451,9 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		if msg.Entry.Type == logger.LogTypeReq {
 			m.session.IncrementRequests()
 		}
-		// Refresh credits after each response (credits were consumed)
-		if msg.Entry.Type == logger.LogTypeRes {
-			cmds = append(cmds, fetchCreditsCmd())
+		// Refresh credits after each response (credits were consumed), unless API is unavailable
+		if msg.Entry.Type == logger.LogTypeRes && !m.creditsFetchFailed {
+			cmds = append(cmds, FetchCreditsCmd())
 		}
 
 	case ServerStartedMsg:
@@ -392,8 +476,59 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 		cmds = append(cmds, tickCmd())
 
+		// Check if token is expired and needs refresh (retry periodically)
+		if m.isTokenExpiredFn != nil && m.isTokenExpiredFn() && m.refreshTokenFn != nil {
+			// Only attempt refresh if not already showing an error (avoid spam)
+			if m.credits.Error == nil || time.Since(m.credits.LastUpdated) > 30*time.Second {
+				cmds = append(cmds, m.autoRefreshTokenCmd())
+			}
+		}
+
 	case CreditsUpdateMsg:
 		m.credits = msg.Info
+		// Log credits errors for debugging
+		if msg.Info.Error != nil {
+			errStr := msg.Info.Error.Error()
+			// Check if this is a 403 error - stop retrying for these
+			if strings.Contains(errStr, "status 403") || strings.Contains(errStr, "Access Denied") {
+				if !m.creditsFetchFailed {
+					// Only log once
+					m.logViewer.AddEntry(logger.LogEntry{
+						Timestamp: time.Now(),
+						Type:      logger.LogTypeErr,
+						Preview:   fmt.Sprintf("Credits API unavailable: %v", msg.Info.Error),
+					})
+					m.creditsFetchFailed = true
+				}
+			} else {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeErr,
+					Preview:   fmt.Sprintf("Credits fetch failed: %v", msg.Info.Error),
+				})
+			}
+		} else {
+			// Reset flag on success
+			m.creditsFetchFailed = false
+		}
+
+	case TokenRefreshedMsg:
+		if msg.Success {
+			// Token is valid/refreshed, update expiry and fetch credits (unless we know credits API is unavailable)
+			m.tokenExpiry = msg.ExpiresAt
+			m.session.SetTokenExpiry(msg.ExpiresAt)
+			if !m.creditsFetchFailed {
+				cmds = append(cmds, FetchCreditsCmd())
+			}
+		} else {
+			// Token refresh failed, show error in credits and log it
+			m.credits = CreditsInfo{Error: msg.Err, LastUpdated: time.Now()}
+			m.logViewer.AddEntry(logger.LogEntry{
+				Timestamp: time.Now(),
+				Type:      logger.LogTypeErr,
+				Preview:   fmt.Sprintf("Token refresh failed: %v", msg.Err),
+			})
+		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -408,14 +543,19 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 func (m *Model) updateLayout() {
 	// Reserve space for borders and help
 	contentWidth := m.width - 4
-	helpHeight := 2
-	sessionHeight := 8 // Fixed session panel height
+	helpHeight := 1      // Footer with help text
+	sessionHeight := 8   // Fixed session panel height
+	filterBarHeight := 3 // Filter bar height (border + content)
 
 	// Session panel gets fixed height
 	m.session.SetWidth(contentWidth)
 
+	// Filter bar width
+	m.filterBar.SetWidth(contentWidth)
+
 	// Log viewer gets remaining space
-	logHeight := m.height - sessionHeight - helpHeight - 6 // borders, spacing
+	// Total: m.height - sessionHeight - filterBarHeight - helpHeight - 2 (margins)
+	logHeight := m.height - sessionHeight - filterBarHeight - helpHeight - 2
 	if logHeight < 5 {
 		logHeight = 5
 	}
@@ -428,46 +568,34 @@ func (m Model) View() string {
 		return ""
 	}
 
-	// Styles
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#7D56F4"))
-
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#383838")).
-		Padding(0, 1)
-
-	focusedBoxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#7D56F4")).
-		Padding(0, 1)
-
 	// Status panel (always visible at top)
-	statusPanel := renderStatusPanel(m.serverRunning, m.port, m.credits, m.creditsProgress)
+	statusPanel := renderStatusPanel(m.serverRunning, m.port, m.credits, m.creditsProgress, m.tokenExpiry)
 
-	// Log panel
-	logStyle := boxStyle
-	if m.focusedPanel == PanelLogs {
-		logStyle = focusedBoxStyle
+	// Stats panel (memory/disk usage) - render as a box next to status
+	statsPanel := m.renderStatsPanel()
+
+	// Calculate remaining width for session stats panel
+	statusWidth := lipgloss.Width(statusPanel)
+	statsWidth := lipgloss.Width(statsPanel)
+	usedWidth := statusWidth + statsWidth + 2 // +2 for spaces
+	remainingWidth := m.width - usedWidth - 4 // -4 for margins
+
+	// Session stats panel (only when a specific session is selected)
+	var topSection string
+	if sessionPanel := m.renderSessionStatsPanel(remainingWidth); sessionPanel != "" && remainingWidth > 20 {
+		topSection = lipgloss.JoinHorizontal(lipgloss.Top, statusPanel, " ", statsPanel, " ", sessionPanel)
+	} else {
+		topSection = lipgloss.JoinHorizontal(lipgloss.Top, statusPanel, " ", statsPanel)
 	}
 
-	// Add scroll indicator
-	scrollInfo := ""
-	if !m.logViewer.AtBottom() && m.logViewer.EntryCount() > 0 {
-		scrollInfo = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#626262")).
-			Render(" (scroll: " + m.logViewer.ScrollInfo() + ")")
-	}
+	// Filter bar (between status and log viewer)
+	filterBarView := m.filterBar.View()
 
-	logTitle := titleStyle.Render("Logs") + scrollInfo
-	logBox := lipgloss.JoinVertical(lipgloss.Left,
-		logTitle,
-		logStyle.Width(m.width-4).Render(m.logViewer.View()),
-	)
+	// Log viewer renders its own composable panels with focus borders
+	logView := m.logViewer.View()
 
-	// Help bar
-	helpView := m.help.View(m.keys)
+	// Help bar (italic like Claude Code style) - build custom help text
+	helpText := m.renderHelpText()
 
 	// Version in bottom right
 	versionStyle := lipgloss.NewStyle().
@@ -476,20 +604,19 @@ func (m Model) View() string {
 
 	// Build footer with help and version
 	footerWidth := m.width - 4
-	helpWidth := lipgloss.Width(helpView)
+	helpWidth := lipgloss.Width(helpText)
 	versionWidth := lipgloss.Width(versionText)
 	padding := footerWidth - helpWidth - versionWidth
 	if padding < 1 {
 		padding = 1
 	}
-	footer := helpView + strings.Repeat(" ", padding) + versionText
+	footer := helpText + strings.Repeat(" ", padding) + versionText
 
 	// Combine all panels
 	content := lipgloss.JoinVertical(lipgloss.Left,
-		statusPanel,
-		"",
-		logBox,
-		"",
+		topSection,
+		filterBarView,
+		logView,
 		footer,
 	)
 
@@ -499,6 +626,247 @@ func (m Model) View() string {
 		Height(m.height)
 
 	return containerStyle.Render(content)
+}
+
+// renderHelpText renders the help bar with context-sensitive text
+func (m Model) renderHelpText() string {
+	helpStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#626262")).
+		Italic(true)
+
+	accentStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#7D56F4")).
+		Italic(true)
+
+	var parts []string
+
+	// Determine current focus and show relevant help
+	if m.filterBar.IsFocused() {
+		if m.filterBar.IsSearchFocused() {
+			// Search input focused
+			parts = []string{
+				"type to search",
+				"enter/esc confirm",
+			}
+		} else {
+			// Filter bar navigation
+			parts = []string{
+				"←/→ select",
+				"enter toggle",
+				"/ search",
+				"1-4 type filters",
+				"↓ to list",
+				"x clear date",
+			}
+		}
+	} else if m.logViewer.IsFocused() {
+		if m.logViewer.GetPanelFocus() == FocusDetail {
+			// Detail view focused
+			parts = []string{
+				"↑/↓ scroll",
+				"pgup/pgdn page",
+				"tab to list",
+				"v view mode",
+				"e expand",
+				"y copy",
+				"o open",
+			}
+		} else {
+			// Log list focused
+			parts = []string{
+				"↑/↓ navigate",
+				"r/R req↔res",
+				"tab to detail",
+				"s/S session",
+				"c clear",
+				"v view",
+				"e expand",
+				"y copy",
+				"o open",
+			}
+		}
+	} else {
+		// Fallback - general help
+		parts = []string{
+			"↑/↓ navigate",
+			"tab switch",
+			"/ search",
+			"? settings",
+		}
+	}
+
+	// Add global keys
+	globalParts := []string{
+		accentStyle.Render("q quit"),
+		accentStyle.Render("? settings"),
+	}
+
+	allParts := append(parts, globalParts...)
+	return helpStyle.Render(strings.Join(allParts, " • "))
+}
+
+// renderStatsPanel renders the memory and disk usage stats as a boxed panel
+func (m Model) renderStatsPanel() string {
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))
+	headerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Bold(true)
+
+	var lines []string
+
+	// Header
+	lines = append(lines, headerStyle.Render("System Stats"))
+
+	// Get memory usage from logger
+	if m.logger != nil {
+		memBytes := m.logger.EstimatedMemoryUsage()
+		entryCount := m.logger.Count()
+		lines = append(lines,
+			labelStyle.Render("Memory: ")+valueStyle.Render(fmt.Sprintf("%s (%d entries)", config.FormatBytes(int64(memBytes)), entryCount)))
+	} else {
+		lines = append(lines,
+			labelStyle.Render("Memory: ")+valueStyle.Render("N/A"))
+	}
+
+	// Get disk usage
+	diskBytes, err := config.GetLogDirSize()
+	if err == nil {
+		cfg := config.Get()
+		if cfg.Logging.MaxLogSizeMB > 0 {
+			pct := float64(diskBytes) / float64(cfg.Logging.MaxLogSizeMB*1024*1024) * 100
+			lines = append(lines,
+				labelStyle.Render("Disk: ")+valueStyle.Render(fmt.Sprintf("%s / %d MB (%.0f%%)", config.FormatBytes(diskBytes), cfg.Logging.MaxLogSizeMB, pct)))
+		} else {
+			lines = append(lines,
+				labelStyle.Render("Disk: ")+valueStyle.Render(config.FormatBytes(diskBytes)))
+		}
+	} else {
+		lines = append(lines,
+			labelStyle.Render("Disk: ")+valueStyle.Render("N/A"))
+	}
+
+	// Session count
+	sessionCount := m.logViewer.GetSessionCount()
+	lines = append(lines,
+		labelStyle.Render("Sessions: ")+valueStyle.Render(fmt.Sprintf("%d", sessionCount)))
+
+	// Filtered/Total entries
+	filteredCount := m.logViewer.EntryCount()
+	totalCount := m.logViewer.TotalEntryCount()
+	if filteredCount != totalCount {
+		lines = append(lines,
+			labelStyle.Render("Showing: ")+valueStyle.Render(fmt.Sprintf("%d / %d entries", filteredCount, totalCount)))
+	} else {
+		lines = append(lines,
+			labelStyle.Render("Entries: ")+valueStyle.Render(fmt.Sprintf("%d", totalCount)))
+	}
+
+	// Current view mode
+	viewMode := m.logViewer.GetViewMode()
+	viewStr := "Parsed"
+	switch viewMode {
+	case ViewModeJSON:
+		viewStr = "JSON"
+	case ViewModeRaw:
+		viewStr = "Raw"
+	}
+	lines = append(lines,
+		labelStyle.Render("View: ")+valueStyle.Render(viewStr))
+
+	// Empty line for spacing (to match status panel height)
+	lines = append(lines, "")
+
+	// Box style similar to status panel
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#626262")).
+		Padding(0, 1)
+
+	return boxStyle.Render(strings.Join(lines, "\n"))
+}
+
+// renderSessionStatsPanel renders the session information panel
+// Only shown when a specific session is selected (not "All")
+func (m Model) renderSessionStatsPanel(availableWidth int) string {
+	meta := m.logViewer.GetCurrentSessionMetadata()
+	if meta == nil {
+		return "" // "All" selected, no session panel
+	}
+
+	// Don't render if not enough width
+	if availableWidth < 30 {
+		return ""
+	}
+
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))
+	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Bold(true)
+	headerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Bold(true)
+
+	// Content width for text (width - border(2) - padding(2))
+	contentWidth := availableWidth - 4
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
+	var lines []string
+
+	// Header
+	lines = append(lines, headerStyle.Render("Session Info"))
+
+	// Session ID (truncate to fit)
+	sessionID := meta.SessionID
+	maxIDLen := contentWidth - 4 // "ID: " is 4 chars
+	if len(sessionID) > maxIDLen && maxIDLen > 10 {
+		sessionID = sessionID[:maxIDLen-2] + ".."
+	}
+	lines = append(lines, labelStyle.Render("ID: ")+valueStyle.Render(sessionID))
+
+	// Working folder (show folder name if available, otherwise path)
+	if meta.FolderName != "" {
+		folder := meta.FolderName
+		maxFolderLen := contentWidth - 8 // "Folder: " is 8 chars
+		if len(folder) > maxFolderLen && maxFolderLen > 10 {
+			folder = folder[:maxFolderLen-2] + ".."
+		}
+		lines = append(lines, labelStyle.Render("Folder: ")+valueStyle.Render(folder))
+	} else if meta.WorkingDir != "" {
+		// Truncate path if too long
+		path := meta.WorkingDir
+		maxLen := contentWidth - 6 // "Path: " is 6 chars
+		if len(path) > maxLen && maxLen > 10 {
+			path = "..." + path[len(path)-maxLen+3:]
+		}
+		lines = append(lines, labelStyle.Render("Path: ")+valueStyle.Render(path))
+	} else {
+		lines = append(lines, labelStyle.Render("Folder: ")+valueStyle.Render("-"))
+	}
+
+	// Title (truncate with ellipsis if too long)
+	titleLabel := "Title: "
+	if meta.Title != "" {
+		titleText := meta.Title
+		maxTitleLen := contentWidth - len(titleLabel)
+		if len(titleText) > maxTitleLen && maxTitleLen > 10 {
+			titleText = titleText[:maxTitleLen-3] + "..."
+		}
+		lines = append(lines, labelStyle.Render(titleLabel)+titleStyle.Render(titleText))
+	} else {
+		lines = append(lines, labelStyle.Render(titleLabel)+valueStyle.Render("-"))
+	}
+
+	// Pad to 7 lines (2 taller than before to match other panels)
+	for len(lines) < 7 {
+		lines = append(lines, "")
+	}
+
+	// Box style with fixed width
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#626262")).
+		Padding(0, 1).
+		Width(availableWidth - 2) // Width includes padding, border adds 2 more
+
+	return boxStyle.Render(strings.Join(lines, "\n"))
 }
 
 // SetServer sets the HTTP server reference for graceful shutdown
@@ -529,32 +897,15 @@ type TokenInfo struct {
 
 // ClaudeConfigStatus holds Claude Code configuration status
 type ClaudeConfigStatus struct {
-	FileExists bool
-	Kiro2ccSet bool
-	ApiKeyAuth bool
+	FileExists     bool
+	Claude2KiroSet bool
+	ApiKeyAuth     bool
 }
 
-// getTokenInfo reads token information for display
+// getTokenInfo reads token information using the shared cmd function
 func getTokenInfo() TokenInfo {
-	homeDir, err := os.UserHomeDir()
+	token, err := cmd.GetToken()
 	if err != nil {
-		return TokenInfo{}
-	}
-
-	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
-	data, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return TokenInfo{}
-	}
-
-	var token struct {
-		AuthMethod string `json:"authMethod"`
-		Provider   string `json:"provider"`
-		ExpiresAt  string `json:"expiresAt"`
-		Region     string `json:"region"`
-		StartUrl   string `json:"startUrl"`
-	}
-	if err := json.Unmarshal(data, &token); err != nil {
 		return TokenInfo{}
 	}
 
@@ -590,8 +941,8 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 
 	status := ClaudeConfigStatus{FileExists: true}
 
-	if kiro2cc, ok := config["kiro2cc"].(bool); ok && kiro2cc {
-		status.Kiro2ccSet = true
+	if claude2kiro, ok := config["claude2kiro"].(bool); ok && claude2kiro {
+		status.Claude2KiroSet = true
 	}
 
 	if oauthAccount, ok := config["oauthAccount"].(map[string]interface{}); ok {
@@ -604,7 +955,7 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 }
 
 // renderStatusPanel renders the status panel
-func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInfo, creditsProgress progress.Model) string {
+func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInfo, creditsProgress progress.Model, tokenExpiry time.Time) string {
 	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
 	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Bold(true)
 	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6BFF6B")).Bold(true)
@@ -614,6 +965,12 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 	var statusLines []string
 	tokenInfo := getTokenInfo()
 	claudeConfig := getClaudeConfigStatus()
+
+	// Only use model cache as fallback when file data is missing
+	// Fresh file data takes priority over potentially stale model cache
+	if tokenInfo.ExpiresAt.IsZero() && !tokenExpiry.IsZero() {
+		tokenInfo.ExpiresAt = tokenExpiry
+	}
 
 	// Server status
 	if serverRunning {
@@ -626,15 +983,16 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 
 	// Token/Credentials status
 	if tokenInfo.Present {
+		// Session type - check Provider first, then AuthMethod
 		sessionType := "Unknown"
-		if tokenInfo.AuthMethod == "IdC" {
-			sessionType = "Enterprise SSO"
-		} else if tokenInfo.Provider == "github" {
-			sessionType = "GitHub"
-		} else if tokenInfo.Provider == "google" {
-			sessionType = "Google"
-		} else if tokenInfo.Provider == "aws" || tokenInfo.AuthMethod == "BuilderId" {
+		if tokenInfo.Provider == "BuilderId" {
 			sessionType = "AWS Builder ID"
+		} else if tokenInfo.Provider == "github" || tokenInfo.Provider == "GitHub" {
+			sessionType = "GitHub"
+		} else if tokenInfo.Provider == "google" || tokenInfo.Provider == "Google" {
+			sessionType = "Google"
+		} else if tokenInfo.AuthMethod == "IdC" {
+			sessionType = "Enterprise SSO"
 		} else if tokenInfo.Provider != "" {
 			sessionType = tokenInfo.Provider
 		}
@@ -665,17 +1023,20 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 			labelStyle.Render("Credentials: ")+okStyle.Render("✓ ")+valueStyle.Render(sessionType)+
 				labelStyle.Render("  Expires: ")+expiryStyle.Render(expiryStr))
 
-		if tokenInfo.Region != "" {
-			statusLines = append(statusLines,
-				labelStyle.Render("Region: ")+valueStyle.Render(tokenInfo.Region))
-		}
-		if tokenInfo.StartUrl != "" {
-			url := tokenInfo.StartUrl
-			if len(url) > 45 {
-				url = url[:42] + "..."
+		// Region and Start URL (only for Enterprise SSO, not BuilderId)
+		if tokenInfo.AuthMethod == "IdC" && tokenInfo.Provider != "BuilderId" {
+			if tokenInfo.Region != "" {
+				statusLines = append(statusLines,
+					labelStyle.Render("Region: ")+valueStyle.Render(tokenInfo.Region))
 			}
-			statusLines = append(statusLines,
-				labelStyle.Render("SSO URL: ")+valueStyle.Render(url))
+			if tokenInfo.StartUrl != "" {
+				url := tokenInfo.StartUrl
+				if len(url) > 45 {
+					url = url[:42] + "..."
+				}
+				statusLines = append(statusLines,
+					labelStyle.Render("SSO URL: ")+valueStyle.Render(url))
+			}
 		}
 	} else {
 		statusLines = append(statusLines,
@@ -684,15 +1045,15 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 
 	// Claude Code config status
 	if claudeConfig.FileExists {
-		if claudeConfig.Kiro2ccSet && claudeConfig.ApiKeyAuth {
+		if claudeConfig.Claude2KiroSet && claudeConfig.ApiKeyAuth {
 			statusLines = append(statusLines,
-				labelStyle.Render("Claude Code: ")+okStyle.Render("✓ Configured for kiro2cc"))
-		} else if claudeConfig.Kiro2ccSet {
+				labelStyle.Render("Claude Code: ")+okStyle.Render("✓ Configured for Claude2Kiro"))
+		} else if claudeConfig.Claude2KiroSet {
 			statusLines = append(statusLines,
-				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Partial config"))
+				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Partial config (press m → Configure Claude)"))
 		} else {
 			statusLines = append(statusLines,
-				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Not configured"))
+				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Not configured (press m → Configure Claude)"))
 		}
 	} else {
 		statusLines = append(statusLines,
@@ -718,29 +1079,56 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 			progressStyle = okStyle
 		}
 
-		// Format credits info
-		creditsStr := fmt.Sprintf("%.0f/%.0f", credits.CreditsRemaining, credits.CreditsLimit)
+		// Format credits info - show used/limit and remaining
+		usedStr := fmt.Sprintf("%.1f/%.0f used", credits.CreditsUsed, credits.CreditsLimit)
+		remainingStr := fmt.Sprintf("%.1f remaining", credits.CreditsRemaining)
 		planName := credits.SubscriptionName
 		if planName == "" {
 			planName = "Kiro"
 		}
 
-		// Reset text after progress bar
+		// Reset text
 		resetStr := ""
 		if credits.DaysUntilReset > 0 {
-			resetStr = fmt.Sprintf(" (resets in %dd)", credits.DaysUntilReset)
+			resetStr = fmt.Sprintf("Resets in %d days", credits.DaysUntilReset)
 		}
 
 		// Render progress bar (shows remaining)
 		progressBar := creditsProgress.ViewAs(percentRemaining)
 
+		// Line 1: Credits used [progress bar] remaining
 		statusLines = append(statusLines,
-			labelStyle.Render("Credits: ")+progressStyle.Render(creditsStr+" ")+progressBar+
-				labelStyle.Render(" "+planName)+labelStyle.Render(resetStr))
+			labelStyle.Render("Credits: ")+progressStyle.Render(usedStr+" ")+progressBar+
+				labelStyle.Render(" ")+progressStyle.Render(remainingStr))
+		// Line 2: Plan name | Resets in X days
+		if resetStr != "" {
+			statusLines = append(statusLines,
+				labelStyle.Render("         ")+valueStyle.Render(planName)+labelStyle.Render(" | ")+labelStyle.Render(resetStr))
+		} else {
+			statusLines = append(statusLines,
+				labelStyle.Render("         ")+valueStyle.Render(planName))
+		}
+	} else if tokenInfo.Provider == "BuilderId" && credits.Error == nil {
+		// AWS Builder ID - credits API not applicable, show informational message
+		statusLines = append(statusLines,
+			labelStyle.Render("Credits: ")+labelStyle.Render("Not tracked for AWS Builder ID"))
 	} else if credits.Error != nil && tokenInfo.Present {
-		// Show error if logged in
+		// Show error if logged in - clean up the message
+		errMsg := credits.Error.Error()
+		// Check for common errors and show friendlier messages
+		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "unauthorized") {
+			errMsg = "Unauthorized - please re-login"
+		} else if strings.Contains(errMsg, "403") {
+			errMsg = "API unavailable (press u to view online)"
+		} else if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "connection") {
+			errMsg = "Connection error (press u to view online)"
+		} else if strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "bearer token") {
+			errMsg = "Invalid token - please re-login"
+		} else if len(errMsg) > 50 {
+			errMsg = errMsg[:47] + "..."
+		}
 		statusLines = append(statusLines,
-			labelStyle.Render("Credits: ")+warnStyle.Render("⚠ "+credits.Error.Error()))
+			labelStyle.Render("Credits: ")+warnStyle.Render("⚠ "+errMsg))
 	} else if tokenInfo.Present && credits.LastUpdated.IsZero() {
 		// Show loading if logged in but credits not yet fetched
 		statusLines = append(statusLines,
@@ -749,7 +1137,7 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 
 	// Determine border color
 	var borderColor lipgloss.Color
-	if serverRunning && tokenInfo.Present && claudeConfig.Kiro2ccSet {
+	if serverRunning && tokenInfo.Present && claudeConfig.Claude2KiroSet {
 		borderColor = lipgloss.Color("#6BFF6B")
 	} else if tokenInfo.Present || claudeConfig.FileExists {
 		borderColor = lipgloss.Color("#FFAA00")

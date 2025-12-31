@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -16,10 +14,85 @@ import (
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/sgeraldes/claude2kiro/cmd"
 )
 
 // Version is set at build time via ldflags
 var Version = "dev"
+
+// renderBanner creates the ASCII art header with Kiro ghost
+func renderBanner() string {
+	// Colors
+	purple := lipgloss.Color("#7D56F4")
+	white := lipgloss.Color("#FAFAFA")
+	dim := lipgloss.Color("#626262")
+	orange := lipgloss.Color("#E07B53")
+
+	p := lipgloss.NewStyle().Foreground(purple).Bold(true)
+	w := lipgloss.NewStyle().Foreground(white)
+	d := lipgloss.NewStyle().Foreground(dim)
+	o := lipgloss.NewStyle().Foreground(orange).Bold(true)
+
+	// Kiro phantom ghost logo
+	ghost := []string{
+		w.Render("        @@@@@@@@@#      "),
+		w.Render("      %@@@@@@@@@@@@+    "),
+		w.Render("     @@@@@@@@@@@@@@@%   "),
+		w.Render("    .@@@@@@@  @@  @@@   "),
+		w.Render("    +@@@@@@@  @@  @@@:  "),
+		w.Render("    %@@@@@@@@@@@@@@@@=  "),
+		w.Render("    @@@@@@@@@@@@@@@@@-  "),
+		w.Render("   %@@@@@@@@@@@@@@@@@   "),
+		w.Render("  =@@@@@@@@@@@@@@@@@@   "),
+		w.Render("   @% @@@@@@@@@@@@@@    "),
+		w.Render("     :@@@@@@@@@@@@@     "),
+		w.Render("      @@@@@@ @@@@*      "),
+	}
+
+	// Claude2Kiro title - CLAUDE in orange
+	title := []string{
+		o.Render(" ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗"),
+		o.Render("██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝"),
+		o.Render("██║     ██║     ███████║██║   ██║██║  ██║█████╗  "),
+		o.Render("██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  "),
+		o.Render("╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗"),
+		o.Render(" ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝"),
+	}
+
+	// 2KIRO - 2 in white, KIRO in purple
+	title2 := []string{
+		d.Render("        ") + w.Render("██████╗ ") + p.Render("██╗  ██╗██╗██████╗  ██████╗ "),
+		d.Render("        ") + w.Render("╚════██╗") + p.Render("██║ ██╔╝██║██╔══██╗██╔═══██╗"),
+		d.Render("        ") + w.Render(" █████╔╝") + p.Render("█████╔╝ ██║██████╔╝██║   ██║"),
+		d.Render("        ") + w.Render("██╔═══╝ ") + p.Render("██╔═██╗ ██║██╔══██╗██║   ██║"),
+		d.Render("        ") + w.Render("███████╗") + p.Render("██║  ██╗██║██║  ██║╚██████╔╝"),
+		d.Render("        ") + w.Render("╚══════╝") + p.Render("╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ "),
+	}
+
+	subtitle := d.Render("Use Claude Code with your Kiro subscription")
+
+	// Combine: ghost on left, title on right
+	lines := []string{
+		ghost[0] + " " + title[0],
+		ghost[1] + " " + title[1],
+		ghost[2] + " " + title[2],
+		ghost[3] + " " + title[3],
+		ghost[4] + " " + title[4],
+		ghost[5] + " " + title[5],
+		ghost[6] + " " + title2[0],
+		ghost[7] + " " + title2[1],
+		ghost[8] + " " + title2[2],
+		ghost[9] + " " + title2[3],
+		ghost[10] + " " + title2[4],
+		ghost[11] + " " + title2[5],
+		"",
+		"  " + subtitle,
+		"",
+	}
+
+	return strings.Join(lines, "\n")
+}
 
 // TokenInfo holds token information for display
 type TokenInfo struct {
@@ -34,10 +107,10 @@ type TokenInfo struct {
 
 // ClaudeConfigStatus holds Claude Code configuration status
 type ClaudeConfigStatus struct {
-	FileExists   bool
-	Kiro2ccSet   bool
-	ApiKeyAuth   bool
-	Onboarded    bool
+	FileExists     bool
+	Claude2KiroSet bool
+	ApiKeyAuth     bool
+	Onboarded      bool
 }
 
 // StatusInfo holds all status information for the dashboard
@@ -63,114 +136,31 @@ type CreditsUpdateMsg struct {
 	Info CreditsInfo
 }
 
-const kiroVersion = "0.6.0"
-
-// fetchCreditsInfo fetches credit information from Kiro API
+// fetchCreditsInfo fetches credit information using the shared cmd function
 func fetchCreditsInfo() CreditsInfo {
-	tokenInfo := getTokenInfo()
-	if !tokenInfo.Present {
-		return CreditsInfo{Error: fmt.Errorf("no token")}
-	}
-
-	// Read full token for access token
-	homeDir, _ := os.UserHomeDir()
-	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
-	data, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	var token struct {
-		AccessToken string `json:"accessToken"`
-		ProfileArn  string `json:"profileArn"`
-	}
-	if err := json.Unmarshal(data, &token); err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	// Build request
-	baseURL := "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits"
-	req, err := http.NewRequest("GET", baseURL, nil)
-	if err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	q := req.URL.Query()
-	if token.ProfileArn != "" {
-		q.Add("profileArn", token.ProfileArn)
-	}
-	q.Add("origin", "AI_EDITOR")
-	q.Add("resourceType", "AGENTIC_REQUEST")
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return CreditsInfo{Error: err}
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return CreditsInfo{Error: fmt.Errorf("API error %d", resp.StatusCode)}
-	}
-
-	var usageResp struct {
-		DaysUntilReset     int     `json:"daysUntilReset"`
-		NextDateReset      float64 `json:"nextDateReset"`
-		UsageBreakdownList []struct {
-			CurrentUsage              float64 `json:"currentUsage"`
-			CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
-			UsageLimit                float64 `json:"usageLimit"`
-			UsageLimitWithPrecision   float64 `json:"usageLimitWithPrecision"`
-		} `json:"usageBreakdownList"`
-		SubscriptionInfo struct {
-			SubscriptionTitle string `json:"subscriptionTitle"`
-		} `json:"subscriptionInfo"`
-	}
-	if err := json.Unmarshal(body, &usageResp); err != nil {
-		return CreditsInfo{Error: err}
-	}
-
-	// Calculate days until reset from timestamp if not provided
-	daysUntilReset := usageResp.DaysUntilReset
-	if daysUntilReset == 0 && usageResp.NextDateReset > 0 {
-		resetTime := time.Unix(int64(usageResp.NextDateReset), 0)
-		daysUntilReset = int(time.Until(resetTime).Hours() / 24)
-		if daysUntilReset < 0 {
-			daysUntilReset = 0
-		}
-	}
-
-	info := CreditsInfo{
-		DaysUntilReset:   daysUntilReset,
-		SubscriptionName: usageResp.SubscriptionInfo.SubscriptionTitle,
+	info := cmd.GetCreditsInfo()
+	return CreditsInfo{
+		CreditsUsed:      info.CreditsUsed,
+		CreditsLimit:     info.CreditsLimit,
+		CreditsRemaining: info.CreditsRemaining,
+		DaysUntilReset:   info.DaysUntilReset,
+		SubscriptionName: info.SubscriptionName,
 		LastUpdated:      time.Now(),
+		Error:            info.Error,
 	}
-
-	if len(usageResp.UsageBreakdownList) > 0 {
-		b := usageResp.UsageBreakdownList[0]
-		info.CreditsUsed = b.CurrentUsageWithPrecision
-		if info.CreditsUsed == 0 {
-			info.CreditsUsed = b.CurrentUsage
-		}
-		info.CreditsLimit = b.UsageLimitWithPrecision
-		if info.CreditsLimit == 0 {
-			info.CreditsLimit = b.UsageLimit
-		}
-		info.CreditsRemaining = info.CreditsLimit - info.CreditsUsed
-	}
-
-	return info
 }
 
 // fetchCreditsCmd returns a command that fetches credits
 func fetchCreditsCmd() tea.Cmd {
 	return func() tea.Msg {
+		// Check if this is a BuilderId account - skip credits API entirely
+		token, err := cmd.GetToken()
+		if err == nil && token.Provider == "BuilderId" {
+			return CreditsUpdateMsg{Info: CreditsInfo{
+				SubscriptionName: "AWS Builder ID",
+				LastUpdated:      time.Now(),
+			}}
+		}
 		return CreditsUpdateMsg{Info: fetchCreditsInfo()}
 	}
 }
@@ -233,8 +223,8 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 
 	status := ClaudeConfigStatus{FileExists: true}
 
-	if kiro2cc, ok := config["kiro2cc"].(bool); ok && kiro2cc {
-		status.Kiro2ccSet = true
+	if claude2kiro, ok := config["claude2kiro"].(bool); ok && claude2kiro {
+		status.Claude2KiroSet = true
 	}
 
 	if onboarded, ok := config["hasCompletedOnboarding"].(bool); ok && onboarded {
@@ -258,11 +248,9 @@ const (
 	ActionServer
 	ActionDashboard
 	ActionRefreshToken
-	ActionViewToken
-	ActionExportEnv
-	ActionConfigureClaude
-	ActionViewCredits
-	ActionLogout
+	ActionConfigureClaude // Also used for Unconfigure (contextual)
+	ActionLogout          // Also used for Login (contextual)
+	ActionSettings
 	ActionQuit
 )
 
@@ -342,6 +330,19 @@ func (d ItemDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 	fmt.Fprintf(w, "%s\n%s", title, desc)
 }
 
+// Spinner frames for loading animation
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// SpinnerTickMsg triggers spinner animation
+type SpinnerTickMsg time.Time
+
+// spinnerTickCmd returns a command that triggers spinner animation
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
+		return SpinnerTickMsg(t)
+	})
+}
+
 // Model represents the menu component
 type Model struct {
 	list            list.Model
@@ -356,28 +357,23 @@ type Model struct {
 	serverPort      string
 	credits         CreditsInfo
 	creditsProgress progress.Model
+	// Loading state for slow operations
+	isLoading     bool
+	loadingAction MenuAction
+	loadingText   string
+	spinnerFrame  int
 }
 
 // New creates a new menu model
 func New(width, height int) Model {
-	items := []list.Item{
-		MenuItem{ActionLogin, "Login", "Authenticate with Kiro (social or AWS Builder ID)"},
-		MenuItem{ActionServer, "Start Server", "Launch the API proxy server"},
-		MenuItem{ActionRefreshToken, "Refresh Token", "Refresh the access token"},
-		MenuItem{ActionViewToken, "View Token", "Display current token information"},
-		MenuItem{ActionConfigureClaude, "Create Launch Script", "Create claude-kiro script to run Claude with proxy"},
-		MenuItem{ActionViewCredits, "View Credits", "Open Kiro billing page in browser"},
-		MenuItem{ActionLogout, "Logout", "Clear saved credentials"},
-		MenuItem{ActionQuit, "Quit", "Exit kiro2cc"},
-	}
-
 	delegate := NewItemDelegate()
 
 	// Calculate list dimensions (leave room for title, help, and potential status)
 	listWidth := width - 8
 	listHeight := height - 12
 
-	l := list.New(items, delegate, listWidth, listHeight)
+	// Create empty list initially - items will be populated by rebuildMenuItems
+	l := list.New([]list.Item{}, delegate, listWidth, listHeight)
 	l.Title = ""
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(false)
@@ -402,7 +398,7 @@ func New(width, height int) Model {
 		progress.WithoutPercentage(),
 	)
 
-	return Model{
+	m := Model{
 		list:            l,
 		width:           width,
 		height:          height,
@@ -410,6 +406,55 @@ func New(width, height int) Model {
 		claudeConfig:    getClaudeConfigStatus(),
 		creditsProgress: prog,
 	}
+
+	// Build menu items based on current state
+	m.rebuildMenuItems()
+	return m
+}
+
+// rebuildMenuItems rebuilds the menu items based on current state
+func (m *Model) rebuildMenuItems() {
+	var items []list.Item
+	isLoggedIn := m.tokenInfo.Present
+
+	// 1. Login (if not logged in)
+	if !isLoggedIn {
+		items = append(items, MenuItem{ActionLogin, "Login", "Authenticate with Kiro"})
+	}
+
+	// 2. Server action (contextual based on server state)
+	if m.serverRunning {
+		items = append(items, MenuItem{ActionDashboard, "View Dashboard", "View the running server dashboard"})
+	} else if isLoggedIn {
+		items = append(items, MenuItem{ActionServer, "Start Server", "Launch the API proxy server"})
+	}
+
+	// 3. Refresh Token (only when logged in)
+	if isLoggedIn {
+		items = append(items, MenuItem{ActionRefreshToken, "Refresh Token", "Refresh the access token"})
+	}
+
+	// 4. Configure/Unconfigure Claude (contextual)
+	if m.claudeConfig.FileExists {
+		if m.claudeConfig.Claude2KiroSet {
+			items = append(items, MenuItem{ActionConfigureClaude, "Unconfigure Claude", "Remove Claude2Kiro settings"})
+		} else {
+			items = append(items, MenuItem{ActionConfigureClaude, "Configure Claude", "Configure Claude Code for Claude2Kiro"})
+		}
+	}
+
+	// 5. Settings (always)
+	items = append(items, MenuItem{ActionSettings, "Settings", "Configure Claude2Kiro options"})
+
+	// 6. Logout (if logged in) - between Settings and Quit
+	if isLoggedIn {
+		items = append(items, MenuItem{ActionLogout, "Logout", "Clear saved credentials"})
+	}
+
+	// 7. Quit (always)
+	items = append(items, MenuItem{ActionQuit, "Quit", "Exit Claude2Kiro"})
+
+	m.list.SetItems(items)
 }
 
 // StatusTickMsg triggers a status refresh
@@ -429,7 +474,14 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Ignore key input while loading
+		if m.isLoading {
+			return m, nil
+		}
 		switch msg.String() {
+		case "esc":
+			// Esc does nothing in menu - use q or select Quit to exit
+			return m, nil
 		case "d":
 			// Go to dashboard if server is running
 			if m.serverRunning {
@@ -439,6 +491,24 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 		case "enter":
 			if item, ok := m.list.SelectedItem().(MenuItem); ok {
+				// Start loading state for slow operations (Configure/Unconfigure Claude)
+				if item.action == ActionConfigureClaude {
+					m.isLoading = true
+					m.loadingAction = item.action
+					m.spinnerFrame = 0
+					// Determine action based on current config state
+					if m.claudeConfig.Claude2KiroSet {
+						m.loadingText = "Removing Claude2Kiro configuration..."
+					} else {
+						m.loadingText = "Configuring Claude Code..."
+					}
+					return m, tea.Batch(
+						func() tea.Msg {
+							return MenuActionMsg{Action: item.action}
+						},
+						spinnerTickCmd(),
+					)
+				}
 				return m, func() tea.Msg {
 					return MenuActionMsg{Action: item.action}
 				}
@@ -448,15 +518,23 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+	case SpinnerTickMsg:
+		if m.isLoading {
+			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+			return m, spinnerTickCmd()
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.list.SetSize(msg.Width-8, msg.Height-12)
 
 	case StatusTickMsg:
-		// Refresh token info and schedule next tick (but not credits - those refresh on requests)
+		// Refresh token info and rebuild menu if state changed
 		m.tokenInfo = getTokenInfo()
 		m.claudeConfig = getClaudeConfigStatus()
+		m.rebuildMenuItems()
 		return m, tea.Tick(30*time.Second, func(t time.Time) tea.Msg {
 			return StatusTickMsg(t)
 		})
@@ -485,19 +563,8 @@ func (m Model) View() string {
 		Width(m.width - 4).
 		Height(m.height - 4)
 
-	// Header
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#7D56F4"))
-
-	subtitleStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#A0A0A0"))
-
-	header := lipgloss.JoinVertical(lipgloss.Left,
-		titleStyle.Render("kiro2cc"),
-		subtitleStyle.Render("Claude Code proxy for Kiro subscriptions"),
-		"",
-	)
+	// Header with ASCII art banner
+	header := renderBanner()
 
 	// Status dashboard panel
 	var statusPanel string
@@ -521,16 +588,16 @@ func (m Model) View() string {
 
 	// Token/Credentials status
 	if m.tokenInfo.Present {
-		// Session type
+		// Session type - check Provider first, then AuthMethod
 		sessionType := "Unknown"
-		if m.tokenInfo.AuthMethod == "IdC" {
-			sessionType = "Enterprise SSO"
-		} else if m.tokenInfo.Provider == "github" {
-			sessionType = "GitHub"
-		} else if m.tokenInfo.Provider == "google" {
-			sessionType = "Google"
-		} else if m.tokenInfo.Provider == "aws" || m.tokenInfo.AuthMethod == "BuilderId" {
+		if m.tokenInfo.Provider == "BuilderId" {
 			sessionType = "AWS Builder ID"
+		} else if m.tokenInfo.Provider == "github" || m.tokenInfo.Provider == "GitHub" {
+			sessionType = "GitHub"
+		} else if m.tokenInfo.Provider == "google" || m.tokenInfo.Provider == "Google" {
+			sessionType = "Google"
+		} else if m.tokenInfo.AuthMethod == "IdC" {
+			sessionType = "Enterprise SSO"
 		} else if m.tokenInfo.Provider != "" {
 			sessionType = m.tokenInfo.Provider
 		}
@@ -562,19 +629,21 @@ func (m Model) View() string {
 			labelStyle.Render("Credentials: ")+okStyle.Render("✓ ")+valueStyle.Render(sessionType)+
 				labelStyle.Render("  Expires: ")+expiryStyle.Render(expiryStr))
 
-		// Region and Start URL (for IdC)
-		if m.tokenInfo.Region != "" {
-			statusLines = append(statusLines,
-				labelStyle.Render("Region: ")+valueStyle.Render(m.tokenInfo.Region))
-		}
-		if m.tokenInfo.StartUrl != "" {
-			// Truncate long URLs
-			url := m.tokenInfo.StartUrl
-			if len(url) > 50 {
-				url = url[:47] + "..."
+		// Region and Start URL (only for Enterprise SSO, not BuilderId)
+		if m.tokenInfo.AuthMethod == "IdC" && m.tokenInfo.Provider != "BuilderId" {
+			if m.tokenInfo.Region != "" {
+				statusLines = append(statusLines,
+					labelStyle.Render("Region: ")+valueStyle.Render(m.tokenInfo.Region))
 			}
-			statusLines = append(statusLines,
-				labelStyle.Render("SSO URL: ")+valueStyle.Render(url))
+			if m.tokenInfo.StartUrl != "" {
+				// Truncate long URLs
+				url := m.tokenInfo.StartUrl
+				if len(url) > 50 {
+					url = url[:47] + "..."
+				}
+				statusLines = append(statusLines,
+					labelStyle.Render("SSO URL: ")+valueStyle.Render(url))
+			}
 		}
 	} else {
 		statusLines = append(statusLines,
@@ -583,15 +652,15 @@ func (m Model) View() string {
 
 	// Claude Code config status
 	if m.claudeConfig.FileExists {
-		if m.claudeConfig.Kiro2ccSet && m.claudeConfig.ApiKeyAuth {
+		if m.claudeConfig.Claude2KiroSet && m.claudeConfig.ApiKeyAuth {
 			statusLines = append(statusLines,
-				labelStyle.Render("Claude Code: ")+okStyle.Render("✓ Configured for kiro2cc"))
-		} else if m.claudeConfig.Kiro2ccSet {
+				labelStyle.Render("Claude Code: ")+okStyle.Render("✓ Configured for Claude2Kiro"))
+		} else if m.claudeConfig.Claude2KiroSet {
 			statusLines = append(statusLines,
-				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Partial config (run Create Launch Script)"))
+				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Partial config (run Configure Claude)"))
 		} else {
 			statusLines = append(statusLines,
-				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Not configured (run Create Launch Script)"))
+				labelStyle.Render("Claude Code: ")+warnStyle.Render("⚠ Not configured (run Configure Claude)"))
 		}
 	} else {
 		statusLines = append(statusLines,
@@ -617,25 +686,39 @@ func (m Model) View() string {
 			progressStyle = okStyle
 		}
 
-		// Format credits info
-		creditsStr := fmt.Sprintf("%.0f/%.0f", m.credits.CreditsRemaining, m.credits.CreditsLimit)
+		// Format credits info - show used/limit and remaining
+		usedStr := fmt.Sprintf("%.1f/%.0f used", m.credits.CreditsUsed, m.credits.CreditsLimit)
+		remainingStr := fmt.Sprintf("%.1f remaining", m.credits.CreditsRemaining)
 		planName := m.credits.SubscriptionName
 		if planName == "" {
 			planName = "Kiro"
 		}
 
-		// Reset text after progress bar
+		// Reset text
 		resetStr := ""
 		if m.credits.DaysUntilReset > 0 {
-			resetStr = fmt.Sprintf(" (resets in %dd)", m.credits.DaysUntilReset)
+			resetStr = fmt.Sprintf("Resets in %d days", m.credits.DaysUntilReset)
 		}
 
 		// Render progress bar (shows remaining)
 		progressBar := m.creditsProgress.ViewAs(percentRemaining)
 
+		// Line 1: Credits used [progress bar] remaining
 		statusLines = append(statusLines,
-			labelStyle.Render("Credits: ")+progressStyle.Render(creditsStr+" ")+progressBar+
-				labelStyle.Render(" "+planName)+labelStyle.Render(resetStr))
+			labelStyle.Render("Credits: ")+progressStyle.Render(usedStr+" ")+progressBar+
+				labelStyle.Render(" ")+progressStyle.Render(remainingStr))
+		// Line 2: Plan name | Resets in X days
+		if resetStr != "" {
+			statusLines = append(statusLines,
+				labelStyle.Render("         ")+valueStyle.Render(planName)+labelStyle.Render(" | ")+labelStyle.Render(resetStr))
+		} else {
+			statusLines = append(statusLines,
+				labelStyle.Render("         ")+valueStyle.Render(planName))
+		}
+	} else if m.tokenInfo.Provider == "BuilderId" && m.credits.Error == nil {
+		// BuilderId accounts don't have credits tracking - show informational message
+		statusLines = append(statusLines,
+			labelStyle.Render("Credits: ")+labelStyle.Render("Not tracked for AWS Builder ID"))
 	} else if m.credits.Error != nil && m.tokenInfo.Present {
 		// Show error if logged in
 		statusLines = append(statusLines,
@@ -648,7 +731,7 @@ func (m Model) View() string {
 
 	// Build status panel with border
 	var borderColor lipgloss.Color
-	if m.serverRunning && m.tokenInfo.Present && m.claudeConfig.Kiro2ccSet {
+	if m.serverRunning && m.tokenInfo.Present && m.claudeConfig.Claude2KiroSet {
 		borderColor = lipgloss.Color("#6BFF6B")
 	} else if m.tokenInfo.Present || m.claudeConfig.FileExists || m.serverRunning {
 		borderColor = lipgloss.Color("#FFAA00")
@@ -699,15 +782,25 @@ func (m Model) View() string {
 	}
 	menuContent := strings.Join(menuLines, "\n")
 
-	// Help text
+	// Help text (italic like Claude Code style)
 	helpStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#626262")).
+		Italic(true).
 		MarginTop(1)
 	helpText := helpStyle.Render("↑/k up • ↓/j down • q quit • ? more")
 
 	// Status bar at bottom (fixed position)
 	var statusBar string
-	if m.status != "" {
+	if m.isLoading {
+		// Show animated spinner during loading
+		spinnerStyle := lipgloss.NewStyle().
+			Background(lipgloss.Color("#1F2D3D")).
+			Foreground(lipgloss.Color("#7D56F4")).
+			Padding(0, 2).
+			Bold(true)
+		spinnerChar := spinnerFrames[m.spinnerFrame]
+		statusBar = spinnerStyle.Render(spinnerChar + " " + m.loadingText)
+	} else if m.status != "" {
 		var statusStyle lipgloss.Style
 		if m.statusErr {
 			statusStyle = lipgloss.NewStyle().
@@ -770,10 +863,13 @@ func (m *Model) SetSize(width, height int) {
 	m.list.SetSize(width-8, height-12)
 }
 
-// SetStatus sets the status message
+// SetStatus sets the status message and clears loading state
 func (m *Model) SetStatus(msg string, isError bool) {
 	m.status = msg
 	m.statusErr = isError
+	// Clear loading state when we receive a status update
+	m.isLoading = false
+	m.loadingText = ""
 }
 
 // ClearStatus clears the status message
@@ -782,35 +878,28 @@ func (m *Model) ClearStatus() {
 	m.statusErr = false
 }
 
-// RefreshTokenInfo reloads token information from disk
+// RefreshTokenInfo reloads token information from disk and rebuilds menu
 func (m *Model) RefreshTokenInfo() {
 	m.tokenInfo = getTokenInfo()
 	m.claudeConfig = getClaudeConfigStatus()
+	m.rebuildMenuItems()
 }
 
-// SetServerRunning sets the server running state and updates menu items
+// SetServerRunning sets the server running state and rebuilds menu
 func (m *Model) SetServerRunning(running bool, port string) {
 	m.serverRunning = running
 	m.serverPort = port
-
-	// Update the menu item text based on server state
-	items := m.list.Items()
-	for i, item := range items {
-		if menuItem, ok := item.(MenuItem); ok && menuItem.action == ActionServer {
-			if running {
-				items[i] = MenuItem{ActionServer, "View Dashboard", "View the running server dashboard"}
-			} else {
-				items[i] = MenuItem{ActionServer, "Start Server", "Launch the API proxy server"}
-			}
-			break
-		}
-	}
-	m.list.SetItems(items)
+	m.rebuildMenuItems()
 }
 
 // IsServerRunning returns whether the server is running
 func (m *Model) IsServerRunning() bool {
 	return m.serverRunning
+}
+
+// IsClaude2KiroConfigured returns whether Claude2Kiro is configured in Claude
+func (m *Model) IsClaude2KiroConfigured() bool {
+	return m.claudeConfig.Claude2KiroSet
 }
 
 // GetServerPort returns the server port
