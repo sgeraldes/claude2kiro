@@ -140,6 +140,7 @@ type DashboardKeyMap struct {
 	Tab        key.Binding
 	Menu       key.Binding
 	Settings   key.Binding
+	OpenClaude key.Binding
 	Quit       key.Binding
 	Help       key.Binding
 	Usage      key.Binding
@@ -164,8 +165,12 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 			key.WithHelp("m/esc", "menu"),
 		),
 		Settings: key.NewBinding(
+			key.WithKeys("p"),
+			key.WithHelp("p", "settings"),
+		),
+		OpenClaude: key.NewBinding(
 			key.WithKeys("o"),
-			key.WithHelp("o", "settings"),
+			key.WithHelp("o", "open claude"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
@@ -338,8 +343,8 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				// Allow menu key to work
 			case "q", "ctrl+c":
 				// Allow quit key to work
-			case "o":
-				// Allow settings key to work
+			case "o", "p":
+				// Allow open claude and settings keys to work
 			default:
 				// Forward other keys to filter bar
 				var cmd tea.Cmd
@@ -357,6 +362,38 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Settings):
 			// Open settings
 			return m, func() tea.Msg { return OpenSettingsMsg{} }
+
+		case key.Matches(msg, m.keys.OpenClaude):
+			// Open Claude Code with current session
+			meta := m.logViewer.GetCurrentSessionMetadata()
+			if meta == nil || meta.FullUUID == "" {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeErr,
+					Preview:   "No active session selected or session UUID not available",
+				})
+			} else {
+				// Open Claude Code with session parameters
+				err := cmd.OpenClaudeCode(meta.WorkingDir, meta.FullUUID, meta.SessionID)
+				if err != nil {
+					m.logViewer.AddEntry(logger.LogEntry{
+						Timestamp: time.Now(),
+						Type:      logger.LogTypeErr,
+						Preview:   fmt.Sprintf("Failed to open Claude Code: %v", err),
+					})
+				} else {
+					// Determine which mode was used
+					mode := "resumed"
+					if cmd.IsClaudeRunning() {
+						mode = "forked"
+					}
+					m.logViewer.AddEntry(logger.LogEntry{
+						Timestamp: time.Now(),
+						Type:      logger.LogTypeInf,
+						Preview:   fmt.Sprintf("Opened Claude Code (%s session %s in %s)", mode, meta.SessionID, meta.WorkingDir),
+					})
+				}
+			}
 
 		case key.Matches(msg, m.keys.Quit):
 			m.quitting = true
@@ -691,14 +728,14 @@ func (m Model) renderHelpText() string {
 			"↑/↓ navigate",
 			"tab switch",
 			"/ search",
-			"? settings",
+			"p settings",
 		}
 	}
 
 	// Add global keys
 	globalParts := []string{
 		accentStyle.Render("q quit"),
-		accentStyle.Render("? settings"),
+		accentStyle.Render("p settings"),
 	}
 
 	allParts := append(parts, globalParts...)

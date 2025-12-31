@@ -93,10 +93,12 @@ var (
 
 // SessionMetadata holds metadata about a session extracted from conversation
 type SessionMetadata struct {
-	SessionID  string // The session ID
-	WorkingDir string // Working directory path
-	FolderName string // Just the folder name (extracted from WorkingDir)
-	Title      string // Conversation title from Claude's response
+	SessionID     string // The session ID (short, last 8 chars)
+	FullUUID      string // Full session UUID from metadata (for --resume)
+	WorkingDir    string // Working directory path
+	FolderName    string // Just the folder name (extracted from WorkingDir)
+	Title         string // Conversation title from Claude's response
+	ClaudeActive  bool   // Whether Claude is currently active for this session
 }
 
 // LogViewerModel represents the split-pane log viewer with composable views
@@ -238,6 +240,19 @@ func (m LogViewerModel) Update(msg tea.Msg) (LogViewerModel, tea.Cmd) {
 				colorIndex := len(m.sessionColorMap) % len(sessionColors)
 				m.sessionColorMap[msg.Entry.SessionID] = colorIndex
 				m.sessions = append(m.sessions, msg.Entry.SessionID)
+			}
+
+			// Store full UUID in session metadata
+			if msg.Entry.FullUUID != "" {
+				if _, exists := m.sessionMetadataMap[msg.Entry.SessionID]; !exists {
+					m.sessionMetadataMap[msg.Entry.SessionID] = &SessionMetadata{
+						SessionID: msg.Entry.SessionID,
+						FullUUID:  msg.Entry.FullUUID,
+					}
+				} else if m.sessionMetadataMap[msg.Entry.SessionID].FullUUID == "" {
+					// Update if we didn't have it before
+					m.sessionMetadataMap[msg.Entry.SessionID].FullUUID = msg.Entry.FullUUID
+				}
 			}
 
 			// Try to extract working directory as friendly session name

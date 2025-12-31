@@ -637,32 +637,33 @@ func runTUI() {
 }
 
 
-// extractSessionID extracts a short session identifier from the request metadata
+// extractSessionID extracts session identifiers from the request metadata
 // The user_id format is like: "user_..._session_ce40736e-1347-467a-9cce-181e245edd92"
-// Returns the last 8 characters of the UUID for a compact display
-func extractSessionID(metadata map[string]any) string {
+// Returns (shortID, fullUUID) where shortID is the last 8 chars for display
+func extractSessionID(metadata map[string]any) (string, string) {
 	if metadata == nil {
-		return ""
+		return "", ""
 	}
 	userID, ok := metadata["user_id"].(string)
 	if !ok || userID == "" {
-		return ""
+		return "", ""
 	}
 	// Extract session UUID from the end of the user_id string
 	// Format: user_..._session_<uuid>
 	if idx := strings.LastIndex(userID, "_session_"); idx != -1 {
-		uuid := userID[idx+9:] // Skip "_session_"
-		// Return last 8 chars of the UUID for compact display
-		if len(uuid) >= 8 {
-			return uuid[len(uuid)-8:]
+		fullUUID := userID[idx+9:] // Skip "_session_"
+		// Return last 8 chars for display, plus full UUID
+		if len(fullUUID) >= 8 {
+			shortID := fullUUID[len(fullUUID)-8:]
+			return shortID, fullUUID
 		}
-		return uuid
+		return fullUUID, fullUUID
 	}
 	// Fallback: return last 8 chars of the whole user_id
 	if len(userID) >= 8 {
-		return userID[len(userID)-8:]
+		return userID[len(userID)-8:], ""
 	}
-	return userID
+	return userID, ""
 }
 // startServerWithLogger starts the HTTP proxy server with TUI logging
 func startServerWithLogger(port string, lg *logger.Logger) {
@@ -728,14 +729,14 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 		}
 
 		// Extract session ID from metadata for tracking
-		sessionID := extractSessionID(anthropicReq.Metadata)
+		sessionID, fullUUID := extractSessionID(anthropicReq.Metadata)
 
 		// Calculate parse duration (time from request start to now)
 		parseDuration := time.Since(startTime)
 
 		// Log the request and get request ID/seqNum for correlation
 		// Status 0 = OK (request parsed successfully)
-		reqResult := lg.LogRequest(anthropicReq.Model, r.Method, r.URL.Path, string(body), sessionID, 0, parseDuration)
+		reqResult := lg.LogRequest(anthropicReq.Model, r.Method, r.URL.Path, string(body), sessionID, fullUUID, 0, parseDuration)
 
 		// Basic validation
 		if anthropicReq.Model == "" {
@@ -757,7 +758,7 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 
 		// Log response
 		duration := time.Since(startTime)
-		lg.LogResponse(http.StatusOK, r.URL.Path, duration, responsePreview, sessionID, reqResult.RequestID, reqResult.SeqNum)
+		lg.LogResponse(http.StatusOK, r.URL.Path, duration, responsePreview, sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
 	})
 
 	// Add health check endpoint

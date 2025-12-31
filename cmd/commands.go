@@ -946,3 +946,58 @@ func OpenBrowser(url string) error {
 	}
 	return cmd.Start()
 }
+
+// IsClaudeRunning checks if Claude Code process is currently running
+func IsClaudeRunning() bool {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		// Use tasklist to check for claude.exe or node.exe running Claude
+		cmd = exec.Command("tasklist", "/FI", "IMAGENAME eq claude.exe", "/NH")
+	case "darwin":
+		// macOS: use pgrep to check for claude process
+		cmd = exec.Command("pgrep", "-x", "claude")
+	default: // Linux and others
+		cmd = exec.Command("pgrep", "-x", "claude")
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	// If output contains something, process is running
+	return len(output) > 0 && !strings.Contains(string(output), "INFO: No tasks")
+}
+
+// OpenClaudeCode opens Claude Code with the specified session parameters
+// workingDir: the directory to open Claude in
+// fullUUID: the full session UUID (not the short 8-char version)
+// sessionID: the short session ID for logging purposes
+func OpenClaudeCode(workingDir, fullUUID, sessionID string) error {
+	// Build the claude command
+	var args []string
+
+	// Always add --dangerously-skip-permissions
+	args = append(args, "--dangerously-skip-permissions")
+
+	// Check if Claude is already running to determine session flag
+	if IsClaudeRunning() && fullUUID != "" {
+		// Claude is active - use --fork-session
+		args = append(args, "--fork-session")
+	} else if fullUUID != "" {
+		// Claude is NOT active - use --resume <full-uuid>
+		args = append(args, "--resume", fullUUID)
+	}
+
+	// Add working directory if provided
+	if workingDir != "" {
+		args = append(args, workingDir)
+	}
+
+	// Execute claude command
+	cmd := exec.Command("claude", args...)
+
+	// Start the process in the background
+	return cmd.Start()
+}

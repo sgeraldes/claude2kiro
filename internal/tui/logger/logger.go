@@ -55,6 +55,7 @@ type LogEntry struct {
 	Preview   string        // Truncated body preview for list
 	Body      string        // Full body content for detail view
 	SessionID string        // Short session identifier (last 8 chars of UUID)
+	FullUUID  string        // Full session UUID from metadata (for --resume)
 	RequestID string        // Unique request ID for correlation (6 chars)
 	BodySize  int           // Original body size in bytes (for display)
 	SeqNum    int           // Sequential request number for display (#01, #02) - same for matching req/res pairs
@@ -349,7 +350,7 @@ type LogRequestResult struct {
 // Returns the generated request ID and sequential number for correlation with the response
 // status: 0 = OK (request parsed successfully), non-zero = error status code
 // parseDuration: time taken to receive/parse the request
-func (l *Logger) LogRequest(model, method, path, body, sessionID string, status int, parseDuration time.Duration) LogRequestResult {
+func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID string, status int, parseDuration time.Duration) LogRequestResult {
 	l.mu.Lock()
 	requestID := l.generateRequestID()
 	// Get or create sequential number for this session
@@ -369,6 +370,7 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID string, status 
 		Preview:   sanitizePreview(body, cfg.Logging.PreviewLength),
 		Body:      body,
 		SessionID: sessionID,
+		FullUUID:  fullUUID,
 		RequestID: requestID,
 		BodySize:  len(body),
 		SeqNum:    seqNum,
@@ -378,7 +380,7 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID string, status 
 
 // LogResponse is a convenience method for logging responses
 // sessionID, requestID, and seqNum are used for correlation with the request
-func (l *Logger) LogResponse(status int, path string, duration time.Duration, responsePreview, sessionID, requestID string, seqNum int) {
+func (l *Logger) LogResponse(status int, path string, duration time.Duration, responsePreview, sessionID, fullUUID, requestID string, seqNum int) {
 	cfg := config.Get()
 	l.Log(LogEntry{
 		Timestamp: time.Now(),
@@ -389,6 +391,7 @@ func (l *Logger) LogResponse(status int, path string, duration time.Duration, re
 		Preview:   sanitizePreview(responsePreview, cfg.Logging.PreviewLength),
 		Body:      responsePreview,
 		SessionID: sessionID,
+		FullUUID:  fullUUID,
 		RequestID: requestID,
 		BodySize:  len(responsePreview),
 		SeqNum:    seqNum,
