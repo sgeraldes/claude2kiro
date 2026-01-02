@@ -212,12 +212,28 @@ type AnthropicSystemMessage struct {
 
 // ContentBlock represents the message content block structure
 type ContentBlock struct {
-	Type      string  `json:"type"`
-	Text      *string `json:"text,omitempty"`
-	ToolUseId *string `json:"tool_use_id,omitempty"`
-	Content   *string `json:"content,omitempty"`
-	Name      *string `json:"name,omitempty"`
-	Input     *any    `json:"input,omitempty"`
+	Type      string        `json:"type"`
+	Text      *string       `json:"text,omitempty"`
+	ToolUseId *string       `json:"tool_use_id,omitempty"`
+	Content   *string       `json:"content,omitempty"`
+	Name      *string       `json:"name,omitempty"`
+	Input     *any          `json:"input,omitempty"`
+	Source    *ImageSource  `json:"source,omitempty"` // For image content blocks
+}
+
+// ImageSource represents the source of an image in Anthropic API format
+type ImageSource struct {
+	Type      string `json:"type"`       // "base64" or "url"
+	MediaType string `json:"media_type"` // e.g., "image/png", "image/jpeg"
+	Data      string `json:"data"`       // base64-encoded image data
+}
+
+// CodeWhispererImage represents an image attachment for CodeWhisperer API
+type CodeWhispererImage struct {
+	Format string `json:"format"` // "png", "jpeg", "gif", "webp"
+	Source struct {
+		Bytes string `json:"bytes"` // base64-encoded image data
+	} `json:"source"`
 }
 
 // getMessageContent extracts text content from a message
@@ -291,7 +307,8 @@ type CodeWhispererRequest struct {
 						Status    string `json:"status"`
 						ToolUseId string `json:"toolUseId"`
 					} `json:"toolResults,omitempty"`
-					Tools []CodeWhispererTool `json:"tools,omitempty"`
+					Tools  []CodeWhispererTool  `json:"tools,omitempty"`
+					Images []CodeWhispererImage `json:"images,omitempty"`
 				} `json:"userInputMessageContext"`
 			} `json:"userInputMessage"`
 		} `json:"currentMessage"`
@@ -362,6 +379,66 @@ func generateUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
+// extractImagesFromContent extracts images from Anthropic message content
+func extractImagesFromContent(content any) []CodeWhispererImage {
+	var images []CodeWhispererImage
+
+	contentBlocks, ok := content.([]interface{})
+	if !ok {
+		return images
+	}
+
+	for _, block := range contentBlocks {
+		blockMap, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		blockType, _ := blockMap["type"].(string)
+		if blockType != "image" {
+			continue
+		}
+
+		source, ok := blockMap["source"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		sourceType, _ := source["type"].(string)
+		if sourceType != "base64" {
+			continue
+		}
+
+		mediaType, _ := source["media_type"].(string)
+		data, _ := source["data"].(string)
+
+		if data == "" {
+			continue
+		}
+
+		// Convert media type to format (e.g., "image/png" -> "png")
+		format := "png" // default
+		switch mediaType {
+		case "image/png":
+			format = "png"
+		case "image/jpeg", "image/jpg":
+			format = "jpeg"
+		case "image/gif":
+			format = "gif"
+		case "image/webp":
+			format = "webp"
+		}
+
+		cwImage := CodeWhispererImage{
+			Format: format,
+		}
+		cwImage.Source.Bytes = data
+		images = append(images, cwImage)
+	}
+
+	return images
+}
+
 // buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
 	cwReq := CodeWhispererRequest{}
@@ -404,6 +481,17 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			tools = append(tools, cwTool)
 		}
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools = tools
+	}
+
+	// Extract images from the current message (last message in the array)
+	if len(anthropicReq.Messages) > 0 {
+		lastMsg := anthropicReq.Messages[len(anthropicReq.Messages)-1]
+		images := extractImagesFromContent(lastMsg.Content)
+		if len(images) > 0 {
+			cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Images = images
+			// Debug: log image extraction (remove in production)
+			// fmt.Printf("DEBUG: Extracted %d image(s) from request\n", len(images))
+		}
 	}
 
 	// Build conversation history
