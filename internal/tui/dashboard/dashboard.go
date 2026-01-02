@@ -169,8 +169,8 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 			key.WithHelp("p", "settings"),
 		),
 		OpenClaude: key.NewBinding(
-			key.WithKeys("o"),
-			key.WithHelp("o", "open claude"),
+			key.WithKeys("ctrl+o"),
+			key.WithHelp("^o", "open claude"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
@@ -343,7 +343,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				// Allow menu key to work
 			case "q", "ctrl+c":
 				// Allow quit key to work
-			case "o", "p":
+			case "ctrl+o", "p":
 				// Allow open claude and settings keys to work
 			default:
 				// Forward other keys to filter bar
@@ -366,34 +366,43 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.OpenClaude):
 			// Open Claude Code with current session
 			meta := m.logViewer.GetCurrentSessionMetadata()
-			if meta == nil || meta.FullUUID == "" {
+			if meta == nil {
 				m.logViewer.AddEntry(logger.LogEntry{
 					Timestamp: time.Now(),
 					Type:      logger.LogTypeErr,
-					Preview:   "No active session selected or session UUID not available",
+					Preview:   "No session selected - use 's' to select a specific session first",
+				})
+				return m, nil
+			}
+			if meta.FullUUID == "" {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeErr,
+					Preview:   fmt.Sprintf("Session %s has no UUID available (session may be too old)", meta.SessionID),
+				})
+				return m, nil
+			}
+			// Open Claude Code with session parameters
+			err := cmd.OpenClaudeCode(meta.WorkingDir, meta.FullUUID, meta.SessionID)
+			if err != nil {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeErr,
+					Preview:   fmt.Sprintf("Failed to open Claude Code: %v", err),
 				})
 			} else {
-				// Open Claude Code with session parameters
-				err := cmd.OpenClaudeCode(meta.WorkingDir, meta.FullUUID, meta.SessionID)
-				if err != nil {
-					m.logViewer.AddEntry(logger.LogEntry{
-						Timestamp: time.Now(),
-						Type:      logger.LogTypeErr,
-						Preview:   fmt.Sprintf("Failed to open Claude Code: %v", err),
-					})
-				} else {
-					// Determine which mode was used
-					mode := "resumed"
-					if cmd.IsClaudeRunning() {
-						mode = "forked"
-					}
-					m.logViewer.AddEntry(logger.LogEntry{
-						Timestamp: time.Now(),
-						Type:      logger.LogTypeInf,
-						Preview:   fmt.Sprintf("Opened Claude Code (%s session %s in %s)", mode, meta.SessionID, meta.WorkingDir),
-					})
+				// Determine which mode was used
+				mode := "resumed"
+				if cmd.IsClaudeRunning() {
+					mode = "forked"
 				}
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeInf,
+					Preview:   fmt.Sprintf("Opened Claude Code (%s session %s in %s)", mode, meta.SessionID, meta.WorkingDir),
+				})
 			}
+			return m, nil
 
 		case key.Matches(msg, m.keys.Quit):
 			m.quitting = true
