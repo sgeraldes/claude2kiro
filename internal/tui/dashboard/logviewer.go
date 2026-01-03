@@ -13,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/sgeraldes/claude2kiro/internal/config"
@@ -90,7 +91,66 @@ var (
 		lipgloss.Color("#FF9F43"), // Orange
 		lipgloss.Color("#78E08F"), // Green
 	}
+
+	// Markdown patterns to detect content that should be glamour-rendered
+	markdownIndicators = []string{
+		"# ",      // H1 headers
+		"## ",     // H2 headers
+		"### ",    // H3 headers
+		"**",      // Bold
+		"```",     // Code blocks
+		"- ",      // Unordered lists
+		"* ",      // Unordered lists (alt)
+		"1. ",     // Ordered lists
+		"> ",      // Blockquotes
+		"[",       // Links (partial match)
+		"| ",      // Tables
+	}
 )
+
+// getMarkdownRenderer returns a cached glamour renderer for the given width
+var markdownRendererCache = make(map[int]*glamour.TermRenderer)
+
+func getMarkdownRenderer(width int) *glamour.TermRenderer {
+	if r, ok := markdownRendererCache[width]; ok {
+		return r
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(width),
+	)
+	if err != nil {
+		return nil
+	}
+	markdownRendererCache[width] = r
+	return r
+}
+
+// isMarkdownContent detects if text looks like markdown
+func isMarkdownContent(text string) bool {
+	// Quick check for common markdown indicators
+	for _, indicator := range markdownIndicators {
+		if strings.Contains(text, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
+// renderMarkdown renders markdown text using glamour, returning the styled output
+// Falls back to plain text if rendering fails
+func renderMarkdown(text string, width int) string {
+	r := getMarkdownRenderer(width)
+	if r == nil {
+		return text
+	}
+	out, err := r.Render(text)
+	if err != nil {
+		return text
+	}
+	// Glamour adds trailing newlines, trim them
+	return strings.TrimRight(out, "\n")
+}
 
 // SessionMetadata holds metadata about a session extracted from conversation
 type SessionMetadata struct {
@@ -1116,9 +1176,17 @@ func formatUserText(text string, maxWidth int, expand bool, valueStyle, tagStyle
 			if part.isTag {
 				if expand {
 					lines = append(lines, tagStyle.Render("  ┌─ <system-reminder>"))
-					wrapped := wrapTextToLines(part.content, maxWidth-4)
-					for _, line := range wrapped {
-						lines = append(lines, dimStyle.Render("  │ "+line))
+					// Use glamour for markdown content inside system-reminder
+					if isMarkdownContent(part.content) {
+						rendered := renderMarkdown(part.content, maxWidth-6)
+						for _, line := range strings.Split(rendered, "\n") {
+							lines = append(lines, "  │ "+line)
+						}
+					} else {
+						wrapped := wrapTextToLines(part.content, maxWidth-4)
+						for _, line := range wrapped {
+							lines = append(lines, dimStyle.Render("  │ "+line))
+						}
 					}
 					lines = append(lines, tagStyle.Render("  └─ </system-reminder>"))
 				} else {
@@ -1129,14 +1197,23 @@ func formatUserText(text string, maxWidth int, expand bool, valueStyle, tagStyle
 					lines = append(lines, tagStyle.Render(fmt.Sprintf("  [system-reminder: %s]", preview)))
 				}
 			} else if strings.TrimSpace(part.content) != "" {
-				wrapped := wrapTextToLines(strings.TrimSpace(part.content), maxWidth-2)
-				for _, line := range wrapped {
-					lines = append(lines, valueStyle.Render("  "+line))
+				content := strings.TrimSpace(part.content)
+				// Use glamour for markdown content
+				if isMarkdownContent(content) {
+					rendered := renderMarkdown(content, maxWidth-4)
+					for _, line := range strings.Split(rendered, "\n") {
+						lines = append(lines, "  "+line)
+					}
+				} else {
+					wrapped := wrapTextToLines(content, maxWidth-2)
+					for _, line := range wrapped {
+						lines = append(lines, valueStyle.Render("  "+line))
+					}
 				}
 			}
 		}
 	} else {
-		// Regular text - format nicely
+		// Regular text - check for markdown
 		maxChars := maxWidth * 15
 		if expand {
 			maxChars = 1000000
@@ -1145,9 +1222,17 @@ func formatUserText(text string, maxWidth int, expand bool, valueStyle, tagStyle
 		if len(displayText) > maxChars {
 			displayText = displayText[:maxChars-3] + "..."
 		}
-		wrapped := wrapTextToLines(displayText, maxWidth-2)
-		for _, line := range wrapped {
-			lines = append(lines, valueStyle.Render("  "+line))
+		// Use glamour for markdown content
+		if isMarkdownContent(displayText) {
+			rendered := renderMarkdown(displayText, maxWidth-4)
+			for _, line := range strings.Split(rendered, "\n") {
+				lines = append(lines, "  "+line)
+			}
+		} else {
+			wrapped := wrapTextToLines(displayText, maxWidth-2)
+			for _, line := range wrapped {
+				lines = append(lines, valueStyle.Render("  "+line))
+			}
 		}
 	}
 
@@ -1402,9 +1487,17 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 							text = text[:textMaxChars-3] + "..."
 						}
 						lines = append(lines, "")
-						wrapped := wrapTextSimple(text, maxWidth)
-						for _, line := range strings.Split(wrapped, "\n") {
-							lines = append(lines, valueStyle.Render(line))
+						// Use glamour for markdown content in responses
+						if isMarkdownContent(text) {
+							rendered := renderMarkdown(text, maxWidth-2)
+							for _, line := range strings.Split(rendered, "\n") {
+								lines = append(lines, line)
+							}
+						} else {
+							wrapped := wrapTextSimple(text, maxWidth)
+							for _, line := range strings.Split(wrapped, "\n") {
+								lines = append(lines, valueStyle.Render(line))
+							}
 						}
 					}
 				case "tool_use":
