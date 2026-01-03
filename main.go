@@ -228,14 +228,6 @@ type ImageSource struct {
 	Data      string `json:"data"`       // base64-encoded image data
 }
 
-// CodeWhispererImage represents an image attachment for CodeWhisperer API
-type CodeWhispererImage struct {
-	Format string `json:"format"` // "png", "jpeg", "gif", "webp"
-	Source struct {
-		Bytes string `json:"bytes"` // base64-encoded image data
-	} `json:"source"`
-}
-
 // getMessageContent extracts text content from a message
 func getMessageContent(content any) string {
 	switch v := content.(type) {
@@ -289,6 +281,35 @@ func getMessageContent(content any) string {
 	}
 }
 
+// ToolResultContent represents content in a tool result (text or image)
+type ToolResultContent struct {
+	Text  string                  `json:"text,omitempty"`
+	Image *ToolResultImageContent `json:"image,omitempty"`
+}
+
+// ToolResultImageContent represents an image in a tool result
+type ToolResultImageContent struct {
+	Format string `json:"format"` // "png", "jpeg", "gif", "webp"
+	Source struct {
+		Bytes string `json:"bytes"` // base64-encoded image data
+	} `json:"source"`
+}
+
+// ToolResult represents a single tool result
+type ToolResult struct {
+	Content   []ToolResultContent `json:"content"`
+	Status    string              `json:"status"`
+	ToolUseId string              `json:"toolUseId"`
+}
+
+// ImageBlock represents an image attachment for CodeWhisperer API
+type ImageBlock struct {
+	Format string `json:"format"` // "png", "jpeg", "gif", "webp"
+	Source struct {
+		Bytes string `json:"bytes"` // base64-encoded image data
+	} `json:"source"`
+}
+
 // CodeWhispererRequest represents the CodeWhisperer API request structure
 type CodeWhispererRequest struct {
 	ConversationState struct {
@@ -299,16 +320,10 @@ type CodeWhispererRequest struct {
 				Content                 string `json:"content"`
 				ModelId                 string `json:"modelId"`
 				Origin                  string `json:"origin"`
+				Images                  []ImageBlock `json:"images,omitempty"`
 				UserInputMessageContext struct {
-					ToolResults []struct {
-						Content []struct {
-							Text string `json:"text"`
-						} `json:"content"`
-						Status    string `json:"status"`
-						ToolUseId string `json:"toolUseId"`
-					} `json:"toolResults,omitempty"`
-					Tools  []CodeWhispererTool  `json:"tools,omitempty"`
-					Images []CodeWhispererImage `json:"images,omitempty"`
+					ToolResults []ToolResult        `json:"toolResults,omitempty"`
+					Tools       []CodeWhispererTool `json:"tools,omitempty"`
 				} `json:"userInputMessageContext"`
 			} `json:"userInputMessage"`
 		} `json:"currentMessage"`
@@ -380,8 +395,8 @@ func generateUUID() string {
 }
 
 // extractImagesFromContent extracts images from Anthropic message content
-func extractImagesFromContent(content any) []CodeWhispererImage {
-	var images []CodeWhispererImage
+func extractImagesFromContent(content any) []ImageBlock {
+	var images []ImageBlock
 
 	contentBlocks, ok := content.([]interface{})
 	if !ok {
@@ -429,11 +444,11 @@ func extractImagesFromContent(content any) []CodeWhispererImage {
 			format = "webp"
 		}
 
-		cwImage := CodeWhispererImage{
+		imgBlock := ImageBlock{
 			Format: format,
 		}
-		cwImage.Source.Bytes = data
-		images = append(images, cwImage)
+		imgBlock.Source.Bytes = data
+		images = append(images, imgBlock)
 	}
 
 	return images
@@ -483,14 +498,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools = tools
 	}
 
-	// Extract images from the current message (last message in the array)
+	// Extract images from the current message and add directly to UserInputMessage
 	if len(anthropicReq.Messages) > 0 {
 		lastMsg := anthropicReq.Messages[len(anthropicReq.Messages)-1]
 		images := extractImagesFromContent(lastMsg.Content)
 		if len(images) > 0 {
-			cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Images = images
-			// Debug: log image extraction (remove in production)
-			// fmt.Printf("DEBUG: Extracted %d image(s) from request\n", len(images))
+			cwReq.ConversationState.CurrentMessage.UserInputMessage.Images = images
 		}
 	}
 
@@ -900,6 +913,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		sendErrorEvent(w, flusher, "Failed to serialize request", err)
 		return ""
 	}
+
+	// Debug: Write request to file to see what's being sent
+	debugDir := filepath.Join(os.TempDir(), "kiro2cc-debug")
+	os.MkdirAll(debugDir, 0755)
+	debugFile := filepath.Join(debugDir, fmt.Sprintf("cw-request-%s.json", time.Now().Format("20060102-150405")))
+	os.WriteFile(debugFile, cwReqBody, 0644)
 
 	// Create streaming request
 	cfg := config.Get()
@@ -2276,10 +2295,8 @@ func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// Call next handler
 		next(w, r)
 
-		// Calculate processing time
-		duration := time.Since(startTime)
-		fmt.Printf("Processing time: %v\n", duration)
-		fmt.Printf("=== Request completed ===\n\n")
+		// Calculate processing time (debug output removed - interferes with TUI)
+		_ = time.Since(startTime)
 	}
 }
 
@@ -2292,7 +2309,6 @@ func startServer(port string) {
 	mux.HandleFunc("/v1/messages", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only handle POST requests
 		if r.Method != http.MethodPost {
-			fmt.Printf("Error: Unsupported request method\n")
 			http.Error(w, "Only POST requests are supported", http.StatusMethodNotAllowed)
 			return
 		}
@@ -2300,7 +2316,6 @@ func startServer(port string) {
 		// Get current token
 		token, err := getToken()
 		if err != nil {
-			fmt.Printf("Error: Failed to get token: %v\n", err)
 			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -2308,18 +2323,14 @@ func startServer(port string) {
 		// Read request body
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			fmt.Printf("Error: Failed to read request body: %v\n", err)
 			http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusInternalServerError)
 			return
 		}
 		defer r.Body.Close()
 
-		fmt.Printf("\n=========================Anthropic Request Body:\n%s\n=======================================\n", string(body))
-
 		// Parse Anthropic request
 		var anthropicReq AnthropicRequest
 		if err := jsonStr.Unmarshal(body, &anthropicReq); err != nil {
-			fmt.Printf("Error: Failed to parse request body: %v\n", err)
 			http.Error(w, fmt.Sprintf("Failed to parse request body: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -2333,11 +2344,8 @@ func startServer(port string) {
 			http.Error(w, `{"message":"Missing required field: messages"}`, http.StatusBadRequest)
 			return
 		}
-		// Log model mapping (dynamic if not in static map)
-		kiroModel := getKiroModelID(anthropicReq.Model)
-		if _, ok := ModelMap[anthropicReq.Model]; !ok {
-			fmt.Printf("Using dynamic model mapping: %s -> %s\n", anthropicReq.Model, kiroModel)
-		}
+		// Get Kiro model ID (dynamic if not in static map)
+		_ = getKiroModelID(anthropicReq.Model)
 
 		// Handle streaming request
 		if anthropicReq.Stream {
@@ -2357,7 +2365,6 @@ func startServer(port string) {
 
 	// Add 404 handler
 	mux.HandleFunc("/", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("Warning: Unknown endpoint accessed\n")
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 	}))
 
@@ -2436,12 +2443,10 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 		if readErr == nil {
 			bodyStr = string(body)
 		}
-		fmt.Printf("CodeWhisperer response error, status code: %d, response: %s\n", resp.StatusCode, bodyStr)
 
 		if resp.StatusCode == 403 {
 			// Try to refresh token inline (don't exit on failure)
 			if err := tryRefreshToken(); err != nil {
-				fmt.Printf("Token refresh failed: %v\n", err)
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token expired, refresh failed: %v. Please re-login", err))
 			} else {
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
@@ -2457,12 +2462,6 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 	if err != nil {
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
 		return
-	}
-
-	// Debug: Log response info
-	fmt.Printf("Response length: %d bytes\n", len(respBody))
-	if len(respBody) < 500 {
-		fmt.Printf("Response body: %s\n", string(respBody))
 	}
 
 	// Use CodeWhisperer parser
@@ -2543,12 +2542,9 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Serialize request body
 	cwReqBody, err := jsonStr.Marshal(cwReq)
 	if err != nil {
-		fmt.Printf("Error: Failed to serialize request: %v\n", err)
 		http.Error(w, fmt.Sprintf("Failed to serialize request: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	// fmt.Printf("CodeWhisperer request body:\n%s\n", string(cwReqBody))
 
 	// Create request
 	cfg := config.Get()
@@ -2558,7 +2554,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
-		fmt.Printf("Error: Failed to create proxy request: %v\n", err)
 		http.Error(w, fmt.Sprintf("Failed to create proxy request: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -2572,7 +2567,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		fmt.Printf("Error: Failed to send request: %v\n", err)
 		http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -2581,7 +2575,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Read response
 	cwRespBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("Error: Failed to read response: %v\n", err)
 		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -2671,7 +2664,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	
 	// Check for error response
 	if strings.Contains(string(cwRespBody), "Improperly formed request.") {
-		fmt.Printf("Error: CodeWhisperer returned malformed response: %s\n", respBodyStr)
 		http.Error(w, fmt.Sprintf("Request format error: %s", respBodyStr), http.StatusBadRequest)
 		return
 	}

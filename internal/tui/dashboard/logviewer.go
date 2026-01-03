@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -427,6 +428,14 @@ func (m LogViewerModel) Update(msg tea.Msg) (LogViewerModel, tea.Cmd) {
 			}
 		}
 
+	case ClipboardResultMsg:
+		// Pass through to dashboard for user feedback
+		return m, func() tea.Msg { return msg }
+
+	case EditorResultMsg:
+		// Pass through to dashboard for user feedback
+		return m, func() tea.Msg { return msg }
+
 	case tea.WindowSizeMsg:
 		m.SetSize(msg.Width, msg.Height)
 	}
@@ -439,9 +448,10 @@ func (m *LogViewerModel) ensureVisible() {
 	// Calculate visible lines to match renderListPanel exactly:
 	// View() passes (m.height - 2) to renderListPanel
 	// renderListPanel: height = m.height - 2
-	// If sessions > 1: height -= 2 → m.height - 4
-	// entriesHeight = height - 2 → m.height - 6 (with sessions) or m.height - 4 (without)
-	visibleLines := m.height - 4 // Base: account for panel borders and pagination
+	// Header row: height -= 1
+	// If sessions > 1: height -= 2 → m.height - 5
+	// entriesHeight = height - 2 (pagination indicators)
+	visibleLines := m.height - 5 // Base: panel borders(2) + pagination(2) + header(1)
 
 	// Account for session tabs (2 lines if multiple sessions)
 	if len(m.sessions) > 1 {
@@ -668,11 +678,77 @@ func (m *LogViewerModel) updateDetailContent() {
 
 	// Body content - parse and display based on entry type and view mode
 	content := entry.Body
+	originalSize := len(content)
 	if content == "" {
 		content = entry.Preview
+		originalSize = len(content)
 	}
+
+	// Get display config
+	cfg := config.Get()
+	maxDisplaySize := cfg.Display.MaxDisplaySizeKB * 1024
+	if maxDisplaySize == 0 {
+		maxDisplaySize = 1024 * 1024 // Default 1MB if not set
+	}
+
+	// Detect pre-existing placeholders/truncation markers in loaded content
+	// These indicate the content was already modified before storage
+	preExistingTruncation := strings.Contains(content, "[... TRUNCATED")
+	preExistingPlaceholders := strings.Contains(content, "[IMAGE:") ||
+		strings.Contains(content, "[PDF:") ||
+		strings.Contains(content, "[VIDEO:") ||
+		strings.Contains(content, "[AUDIO:") ||
+		strings.Contains(content, "[ATTACHMENT:")
+
+	// Intelligent base64 truncation (replace blobs with size placeholders)
+	base64TruncatedCount := 0
+	if cfg.Display.TruncateBase64 && len(content) > 10000 {
+		content, base64TruncatedCount = truncateBase64Content(content)
+	}
+
+	// Safety limit: truncate remaining huge content
+	contentTruncated := false
+	if len(content) > maxDisplaySize {
+		content = content[:maxDisplaySize]
+		contentTruncated = true
+	}
+
 	if content != "" {
 		lines = append(lines, "")
+
+		// Show truncation/placeholder info
+		warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFAA00")).Bold(true)
+		infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Italic(true)
+		var truncInfo []string
+		var preInfo []string
+
+		// Pre-existing modifications (from log file)
+		if preExistingTruncation {
+			preInfo = append(preInfo, "truncated when logged")
+		}
+		if preExistingPlaceholders {
+			preInfo = append(preInfo, "has media placeholders")
+		}
+
+		// Current session modifications
+		if base64TruncatedCount > 0 {
+			truncInfo = append(truncInfo, fmt.Sprintf("%d base64 blob(s) collapsed", base64TruncatedCount))
+		}
+		if contentTruncated {
+			truncInfo = append(truncInfo, fmt.Sprintf("showing %s of %s", config.FormatBytes(int64(maxDisplaySize)), config.FormatBytes(int64(originalSize))))
+		}
+
+		// Show pre-existing info first (lower priority, italic)
+		if len(preInfo) > 0 {
+			lines = append(lines, infoStyle.Render("ℹ Content "+strings.Join(preInfo, ", ")))
+		}
+		// Show current truncation info (higher priority, warning)
+		if len(truncInfo) > 0 {
+			lines = append(lines, warnStyle.Render("⚠ "+strings.Join(truncInfo, ", ")))
+		}
+		if len(preInfo) > 0 || len(truncInfo) > 0 {
+			lines = append(lines, "")
+		}
 
 		switch m.viewMode {
 		case ViewModeRaw:
@@ -1397,6 +1473,50 @@ func truncateText(text string, maxChars int, width int) string {
 	return wrapTextSimple(text, width)
 }
 
+// base64Pattern matches base64 data blocks (images, documents, etc.)
+var base64Pattern = regexp.MustCompile(`"data"\s*:\s*"([A-Za-z0-9+/=]{100,})"`)
+
+// truncateBase64Content replaces large base64 data with size placeholders
+// This makes JSON content readable without the massive base64 blobs
+func truncateBase64Content(content string) (string, int) {
+	truncatedCount := 0
+
+	result := base64Pattern.ReplaceAllStringFunc(content, func(match string) string {
+		// Extract just the base64 data portion
+		// match looks like: "data": "BASE64DATA..."
+		colonPos := strings.Index(match, ":")
+		if colonPos == -1 {
+			return match
+		}
+		afterColon := match[colonPos+1:]
+		dataStart := strings.Index(afterColon, `"`)
+		if dataStart == -1 {
+			return match
+		}
+		dataEnd := strings.LastIndex(afterColon, `"`)
+		if dataEnd <= dataStart {
+			return match
+		}
+
+		base64Data := afterColon[dataStart+1 : dataEnd]
+		dataLen := len(base64Data)
+
+		// Only truncate if data is significant (> 1KB of base64)
+		if dataLen < 1024 {
+			return match
+		}
+
+		truncatedCount++
+		// Estimate actual binary size (base64 is ~4/3 of original)
+		binarySize := int64(float64(dataLen) * 0.75)
+		sizeStr := config.FormatBytes(binarySize)
+
+		return fmt.Sprintf(`"data": "[BASE64 DATA: %s]"`, sizeStr)
+	})
+
+	return result, truncatedCount
+}
+
 // wrapText wraps text to fit within a given width
 func wrapText(text string, width int) string {
 	if width <= 0 {
@@ -1801,6 +1921,26 @@ func (m LogViewerModel) renderListPanel(height int) string {
 
 	// m.entries is already filtered by session and ShowSystemMessages in applySessionFilter()
 
+	// Build sticky header row matching exact column widths from renderEntryLine
+	// Column widths: │(1) + space(1) + TIME(8) + space(1) + T(1) = 12 base
+	var headerLine string
+	headerLine = "  TIME      " // 12 chars: matches "│ HH:MM:SS T"
+	if cfg.Display.ShowRequestNumber {
+		headerLine += "  # " // 4 chars: matches " #XX"
+	}
+	if cfg.Display.ShowStatusInList {
+		headerLine += " STA" // 4 chars: matches " XXX"
+	}
+	if cfg.Display.ShowBodySize {
+		headerLine += " SIZE" // 5 chars: matches " XXXX"
+	}
+	if cfg.Display.ShowDurationInList {
+		headerLine += "   DUR" // 6 chars: matches " XXXXX"
+	}
+	headerLine += "  PREVIEW"
+	lines = append(lines, dimStyle.Render(headerLine))
+	height-- // Account for header row
+
 	// Always reserve 2 lines for pagination indicators (to match ensureVisible calculation)
 	// This prevents the mismatch where selection appears too high when at list boundaries
 	entriesHeight := height - 2
@@ -1811,15 +1951,25 @@ func (m LogViewerModel) renderListPanel(height int) string {
 	// Determine pagination state
 	hasMoreAbove := m.listOffset > 0
 	hasMoreBelow := m.listOffset+entriesHeight < len(m.entries)
+	totalEntries := len(m.entries)
 
-	if len(m.entries) == 0 {
+	if totalEntries == 0 {
 		lines = append(lines, dimStyle.Render("Waiting for requests..."))
 	} else {
-		// Add "more above" indicator or empty line (always reserve the space)
+		// Calculate visible range for position indicator
+		firstVisible := m.listOffset + 1 // 1-indexed for display
+		lastVisible := m.listOffset + entriesHeight
+		if lastVisible > totalEntries {
+			lastVisible = totalEntries
+		}
+		positionStr := fmt.Sprintf("%d-%d of %d", firstVisible, lastVisible, totalEntries)
+
+		// Add "more above" indicator with position, or empty line
 		if hasMoreAbove {
-			lines = append(lines, paginationStyle.Render("↑ more above"))
+			lines = append(lines, paginationStyle.Render(fmt.Sprintf("↑ more above  (%s)", positionStr)))
 		} else {
-			lines = append(lines, "") // Reserve space even when not showing
+			// Still show position even when at top
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("  %s", positionStr)))
 		}
 
 		// Render visible entries
@@ -2027,14 +2177,26 @@ func (m LogViewerModel) renderEntryLine(entry logger.LogEntry, contentWidth int,
 		maxPreview = 5
 	}
 	preview := entry.Preview
-	if len(preview) > maxPreview {
-		preview = preview[:maxPreview-3] + "..."
+	// Truncate by visual width (runes), not byte length
+	previewRunes := []rune(preview)
+	if len(previewRunes) > maxPreview {
+		preview = string(previewRunes[:maxPreview-3]) + "..."
 	}
 	if preview != "" {
 		columns = append(columns, normalTextStyle.Render(preview))
 	}
 
-	return strings.Join(columns, " ")
+	line := strings.Join(columns, " ")
+
+	// Final safety check: ensure line doesn't exceed contentWidth visually
+	// This catches any edge cases with ANSI codes or multi-byte chars
+	lineWidth := lipgloss.Width(line)
+	if lineWidth > contentWidth {
+		// Truncate the visual output - use lipgloss's truncation
+		line = lipgloss.NewStyle().MaxWidth(contentWidth).Render(line)
+	}
+
+	return line
 }
 
 // formatDuration formats duration into a 5-char string (XXXms or X.Xs or XXs)

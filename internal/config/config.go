@@ -35,6 +35,7 @@ type LoggingConfig struct {
 	MaxLogSizeMB       int    `yaml:"max_log_size_mb"`     // Max total log directory size in MB (0 = unlimited)
 	MaxEntries         int    `yaml:"max_entries"`         // Max entries in memory
 	FileContentLen     int    `yaml:"file_content_length"` // Max chars per entry in file (0 = unlimited)
+	MaxBodySizeKB      int    `yaml:"max_body_size_kb"`    // Max body size to store in memory per entry in KB (0 = unlimited, default 1024)
 	PreviewLength      int    `yaml:"preview_length"`      // Preview length in list view
 }
 
@@ -52,6 +53,8 @@ type DisplayConfig struct {
 	HelpPanelPosition    string `yaml:"help_panel_position"`    // "right" or "bottom"
 	DefaultViewMode      string `yaml:"default_view_mode"`      // "last", "parsed", "json", "raw"
 	DefaultExpandMode    string `yaml:"default_expand_mode"`    // "last", "compact", "expanded"
+	MaxDisplaySizeKB     int    `yaml:"max_display_size_kb"`    // Max content size to display in KB (0 = unlimited, default 1024)
+	TruncateBase64       bool   `yaml:"truncate_base64"`        // Replace base64 blobs with size placeholders (default true)
 }
 
 // NetworkConfig holds network-related settings
@@ -98,6 +101,7 @@ func Default() *Config {
 			MaxLogSizeMB:       100,
 			MaxEntries:         500,
 			FileContentLen:     0,     // 0 = unlimited
+			MaxBodySizeKB:      1024,  // 1MB default limit for in-memory body storage
 			PreviewLength:      10000, // 0 = unlimited, max 200000
 		},
 		Display: DisplayConfig{
@@ -113,6 +117,8 @@ func Default() *Config {
 			HelpPanelPosition:    "right",
 			DefaultViewMode:      "last",    // "last", "parsed", "json", "raw"
 			DefaultExpandMode:    "compact", // "last", "compact", "expanded"
+			MaxDisplaySizeKB:     1024,      // 1MB default limit for display
+			TruncateBase64:       true,      // Replace base64 blobs with placeholders
 		},
 		Network: NetworkConfig{
 			HTTPTimeout:          30 * time.Second,

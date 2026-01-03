@@ -2,7 +2,9 @@ package logger
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -294,16 +296,23 @@ func (l *Logger) DisableFileLogging() {
 func (l *Logger) Log(entry LogEntry) {
 	l.mu.Lock()
 
+	// Replace base64 content with placeholders BEFORE writing anywhere
+	// This prevents 3GB+ log files from base64-encoded images/PDFs
+	cfg := config.Get()
+	if cfg.Logging.MaxBodySizeKB > 0 {
+		entry.Body = replaceBase64WithPlaceholders(entry.Body, cfg.Logging.MaxBodySizeKB)
+	}
+
+	// Write to file with base64 replaced (preserves structure, removes binary bloat)
+	if l.fileWriter != nil {
+		l.fileWriter.WriteString(entry.FormatPlain() + "\n")
+	}
+
 	// Ring buffer: remove oldest if at capacity
 	if len(l.entries) >= l.maxEntries {
 		l.entries = l.entries[1:]
 	}
 	l.entries = append(l.entries, entry)
-
-	// Write to file if enabled
-	if l.fileWriter != nil {
-		l.fileWriter.WriteString(entry.FormatPlain() + "\n")
-	}
 
 	// Get program reference while holding lock
 	program := l.program
@@ -332,6 +341,125 @@ func sanitizePreview(text string, maxLen int) string {
 		preview = preview[:maxLen-3] + "..."
 	}
 	return preview
+}
+
+// Base64 patterns to detect in JSON content
+var (
+	// Matches base64 in JSON fields like "data": "base64...", "bytes": "base64...", "content": "base64..."
+	// Captures: field name, quote char, base64 content
+	// Requires at least 100 chars and must contain typical base64 variety (not just one repeated char)
+	base64FieldPattern = regexp.MustCompile(`("(?:data|bytes|content|image|file|attachment|b64|base64)"\s*:\s*")([A-Za-z0-9+/]{100,}={0,2})(")`)
+
+	// Common media type patterns in JSON (e.g., "type": "image/png", "media_type": "application/pdf")
+	mediaTypePattern = regexp.MustCompile(`"(?:type|media_type|content_type|mime_type)"\s*:\s*"([^"]+)"`)
+)
+
+// replaceBase64WithPlaceholders scans for base64 content in JSON and replaces ALL base64 blobs with placeholders
+// This preserves the conversation structure while removing binary data that causes memory/disk issues
+func replaceBase64WithPlaceholders(body string, maxSizeKB int) string {
+	if maxSizeKB <= 0 {
+		return body // No limit
+	}
+
+	const minBase64Size = 1024 // 1KB - replace any base64 larger than this (regex requires 100 chars minimum anyway)
+
+	// Extract media types from the JSON for context
+	mediaTypes := make(map[int]string) // position -> media type
+	for _, match := range mediaTypePattern.FindAllStringSubmatchIndex(body, -1) {
+		if len(match) >= 4 {
+			pos := match[0]
+			mediaType := body[match[2]:match[3]]
+			mediaTypes[pos] = mediaType
+		}
+	}
+
+	// Find the closest media type before a given position
+	findMediaType := func(pos int) string {
+		bestPos := -1
+		bestType := ""
+		for mPos, mType := range mediaTypes {
+			// Look for media type within 500 chars before the base64
+			if mPos < pos && pos-mPos < 500 && mPos > bestPos {
+				bestPos = mPos
+				bestType = mType
+			}
+		}
+		return bestType
+	}
+
+	// Replace base64 fields with placeholders
+	result := base64FieldPattern.ReplaceAllStringFunc(body, func(match string) string {
+		// Extract the parts
+		parts := base64FieldPattern.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match // Shouldn't happen, but be safe
+		}
+
+		fieldPrefix := parts[1] // e.g., "data": "
+		base64Content := parts[2]
+		fieldSuffix := parts[3] // closing "
+
+		// Only replace if larger than minBase64Size
+		if len(base64Content) < minBase64Size {
+			return match
+		}
+
+		// Try to determine media type and size
+		mediaType := "binary"
+
+		// Check for nearby media type declaration
+		matchPos := strings.Index(body, match)
+		if matchPos >= 0 {
+			if nearbyType := findMediaType(matchPos); nearbyType != "" {
+				mediaType = nearbyType
+			}
+		}
+
+		// Try to decode a sample to verify it's valid base64
+		// (prevents false positives on long alphanumeric strings)
+		sampleSize := 100
+		if len(base64Content) < sampleSize {
+			sampleSize = len(base64Content)
+		}
+		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
+			// Not valid base64, keep original
+			return match
+		}
+
+		// Calculate approximate decoded size (base64 is ~1.33x the original)
+		decodedSize := (len(base64Content) * 3) / 4
+
+		// Determine attachment type based on media type
+		attachmentType := "ATTACHMENT"
+		if strings.HasPrefix(mediaType, "image/") {
+			attachmentType = "IMAGE"
+		} else if strings.HasPrefix(mediaType, "application/pdf") {
+			attachmentType = "PDF"
+		} else if strings.HasPrefix(mediaType, "video/") {
+			attachmentType = "VIDEO"
+		} else if strings.HasPrefix(mediaType, "audio/") {
+			attachmentType = "AUDIO"
+		}
+
+		// Create placeholder
+		placeholder := fmt.Sprintf("[%s: %s %s]",
+			attachmentType,
+			mediaType,
+			config.FormatBytes(int64(decodedSize)),
+		)
+
+		return fieldPrefix + placeholder + fieldSuffix
+	})
+
+	// After replacing base64, check if we still need to truncate
+	maxBytes := maxSizeKB * 1024
+	if len(result) > maxBytes {
+		// Still too large, apply traditional truncation
+		truncated := result[:maxBytes]
+		return truncated + fmt.Sprintf("\n\n[... TRUNCATED - original size: %s ...]", config.FormatBytes(int64(len(result))))
+	}
+
+	return result
 }
 
 // generateRequestID generates a unique request ID (6 hex chars)
@@ -368,7 +496,7 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID strin
 		Status:    status,
 		Duration:  parseDuration,
 		Preview:   sanitizePreview(body, cfg.Logging.PreviewLength),
-		Body:      body,
+		Body:      body, // Full body - truncation happens in Log() for memory only
 		SessionID: sessionID,
 		FullUUID:  fullUUID,
 		RequestID: requestID,
@@ -389,7 +517,7 @@ func (l *Logger) LogResponse(status int, path string, duration time.Duration, re
 		Path:      path,
 		Duration:  duration,
 		Preview:   sanitizePreview(responsePreview, cfg.Logging.PreviewLength),
-		Body:      responsePreview,
+		Body:      responsePreview, // Full body - truncation happens in Log() for memory only
 		SessionID: sessionID,
 		FullUUID:  fullUUID,
 		RequestID: requestID,
@@ -476,14 +604,46 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	scanner := bufio.NewScanner(file)
-	// Increase buffer size for long lines
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
+	// Use a reader that can handle very long lines by reading in chunks
+	reader := bufio.NewReader(file)
 	count := 0
-	for scanner.Scan() {
-		line := scanner.Text()
+	skippedLarge := 0
+
+	for {
+		// ReadString reads until delimiter, can handle large lines
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				// Process last line if it doesn't end with newline
+				if len(line) > 0 {
+					line = strings.TrimSuffix(line, "\n")
+					line = strings.TrimSuffix(line, "\r")
+					// Skip extremely large lines
+					if len(line) <= 10*1024*1024 {
+						if entry, ok := parsePlainLogLine(line); ok {
+							if len(l.entries) >= l.maxEntries {
+								l.entries = l.entries[1:]
+							}
+							l.entries = append(l.entries, entry)
+							count++
+						}
+					} else {
+						skippedLarge++
+					}
+				}
+			}
+			break
+		}
+
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
+
+		// Skip extremely large lines (> 10MB) to avoid memory issues
+		if len(line) > 10*1024*1024 {
+			skippedLarge++
+			continue
+		}
+
 		if entry, ok := parsePlainLogLine(line); ok {
 			// Ring buffer: remove oldest if at capacity
 			if len(l.entries) >= l.maxEntries {
@@ -494,7 +654,15 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 		}
 	}
 
-	return count, scanner.Err()
+	// Log if we skipped large entries
+	if skippedLarge > 0 && l.program != nil {
+		// Will be logged after unlock
+		go func() {
+			l.LogInfo(fmt.Sprintf("Skipped %d oversized log entries (>10MB)", skippedLarge))
+		}()
+	}
+
+	return count, nil
 }
 
 // Regex patterns for parsing log lines
@@ -563,6 +731,11 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 	case LogTypeErr, LogTypeInf:
 		entry.Preview = mainDetails
 		entry.Body = mainDetails
+	}
+
+	// Set body size from parsed body content
+	if entry.Body != "" {
+		entry.BodySize = len(entry.Body)
 	}
 
 	return entry, true

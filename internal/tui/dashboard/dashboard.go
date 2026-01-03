@@ -576,6 +576,36 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			})
 		}
 
+	case ClipboardResultMsg:
+		if msg.Success {
+			m.logViewer.AddEntry(logger.LogEntry{
+				Timestamp: time.Now(),
+				Type:      logger.LogTypeInf,
+				Preview:   "Copied to clipboard",
+			})
+		} else {
+			m.logViewer.AddEntry(logger.LogEntry{
+				Timestamp: time.Now(),
+				Type:      logger.LogTypeErr,
+				Preview:   fmt.Sprintf("Failed to copy to clipboard: %v", msg.Error),
+			})
+		}
+
+	case EditorResultMsg:
+		if msg.Success {
+			m.logViewer.AddEntry(logger.LogEntry{
+				Timestamp: time.Now(),
+				Type:      logger.LogTypeInf,
+				Preview:   "Opened in external editor",
+			})
+		} else {
+			m.logViewer.AddEntry(logger.LogEntry{
+				Timestamp: time.Now(),
+				Type:      logger.LogTypeErr,
+				Preview:   fmt.Sprintf("Failed to open in editor: %v", msg.Error),
+			})
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
