@@ -2025,7 +2025,7 @@ func (m LogViewerModel) renderListPanel(height int) string {
 		headerLine += " STA" // 4 chars: matches " XXX"
 	}
 	if cfg.Display.ShowBodySize {
-		headerLine += " SIZE" // 5 chars: matches " XXXX"
+		headerLine += "   SIZE" // 6 chars: matches right-aligned size values
 	}
 	if cfg.Display.ShowDurationInList {
 		headerLine += "   DUR" // 6 chars: matches " XXXXX"
@@ -2240,28 +2240,28 @@ func (m LogViewerModel) renderEntryLine(entry logger.LogEntry, contentWidth int,
 		usedWidth += 4 // " XXX"
 	}
 
-	// SIZE column (4 chars: X.XK or XXXB)
+	// SIZE column (6 chars: right-aligned)
 	if cfg.Display.ShowBodySize {
 		var sizeStr string
 		if (entry.Type == logger.LogTypeReq || entry.Type == logger.LogTypeRes) && entry.BodySize > 0 {
-			sizeStr = fmt.Sprintf("%4s", formatBodySize(entry.BodySize))
+			sizeStr = fmt.Sprintf("%6s", formatBodySize(entry.BodySize))
 		} else {
-			sizeStr = " ---"
+			sizeStr = "   ---"
 		}
 		columns = append(columns, dimStyle.Render(sizeStr))
-		usedWidth += 5 // " XXXX"
+		usedWidth += 6 // 6 chars for SIZE
 	}
 
-	// DUR column - duration (5 chars: XXXms or X.Xs)
+	// DUR column - duration (6 chars: right-aligned with leading space)
 	if cfg.Display.ShowDurationInList {
 		var durStr string
 		if (entry.Type == logger.LogTypeReq || entry.Type == logger.LogTypeRes) && entry.Duration > 0 {
-			durStr = formatDuration(entry.Duration)
+			durStr = " " + formatDuration(entry.Duration) // Add leading space for alignment
 		} else {
-			durStr = "  ---"
+			durStr = "   ---"
 		}
 		columns = append(columns, dimStyle.Render(durStr))
-		usedWidth += 6 // " XXXXX"
+		usedWidth += 6 // 6 chars for DUR
 	}
 
 	// PREVIEW column (rest of line)
