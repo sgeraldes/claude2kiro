@@ -203,7 +203,13 @@ func (e LogEntry) FormatPlain() string {
 		if cfg.Logging.FileContentLen > 0 {
 			content = truncate(content, cfg.Logging.FileContentLen)
 		}
-		return fmt.Sprintf("[%s] [%s] %s | %s", timestamp, e.Type.String(), details, content)
+		// Include original body size as @size:N metadata before the body
+		// This preserves the original size even when body is truncated
+		sizeMarker := ""
+		if e.BodySize > 0 {
+			sizeMarker = fmt.Sprintf("@size:%d@", e.BodySize)
+		}
+		return fmt.Sprintf("[%s] [%s] %s | %s%s", timestamp, e.Type.String(), details, sizeMarker, content)
 	}
 
 	return fmt.Sprintf("[%s] [%s] %s", timestamp, e.Type.String(), details)
@@ -718,8 +724,22 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 	parts := strings.SplitN(details, " | ", 2)
 	mainDetails := parts[0]
 	if len(parts) > 1 {
-		entry.Preview = parts[1]
-		entry.Body = parts[1]
+		bodyContent := parts[1]
+		// Check for @size:N@ marker at the start of body content
+		// This preserves the original body size even when content was truncated
+		if strings.HasPrefix(bodyContent, "@size:") {
+			endIdx := strings.Index(bodyContent[6:], "@")
+			if endIdx > 0 {
+				sizeStr := bodyContent[6 : 6+endIdx]
+				if size, err := strconv.Atoi(sizeStr); err == nil {
+					entry.BodySize = size
+				}
+				// Remove the size marker from body content
+				bodyContent = bodyContent[6+endIdx+1:]
+			}
+		}
+		entry.Preview = bodyContent
+		entry.Body = bodyContent
 	}
 
 	// Parse based on log type
@@ -733,8 +753,8 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 		entry.Body = mainDetails
 	}
 
-	// Set body size from parsed body content
-	if entry.Body != "" {
+	// Set body size from parsed body content if not already set from @size marker
+	if entry.BodySize == 0 && entry.Body != "" {
 		entry.BodySize = len(entry.Body)
 	}
 
