@@ -302,16 +302,22 @@ func (l *Logger) DisableFileLogging() {
 func (l *Logger) Log(entry LogEntry) {
 	l.mu.Lock()
 
-	// Replace base64 content with placeholders BEFORE writing anywhere
-	// This prevents 3GB+ log files from base64-encoded images/PDFs
+	// Store original body size BEFORE any truncation
+	originalBodySize := len(entry.Body)
+	if originalBodySize > 0 {
+		entry.BodySize = originalBodySize
+	}
+
+	// Write to file FIRST with full body (preserves complete data for replay/debugging)
+	if l.fileWriter != nil {
+		l.fileWriter.WriteString(entry.FormatPlain() + "\n")
+	}
+
+	// Replace base64 content with placeholders for MEMORY ONLY
+	// This prevents unbounded memory growth while keeping full data in files
 	cfg := config.Get()
 	if cfg.Logging.MaxBodySizeKB > 0 {
 		entry.Body = replaceBase64WithPlaceholders(entry.Body, cfg.Logging.MaxBodySizeKB)
-	}
-
-	// Write to file with base64 replaced (preserves structure, removes binary bloat)
-	if l.fileWriter != nil {
-		l.fileWriter.WriteString(entry.FormatPlain() + "\n")
 	}
 
 	// Ring buffer: remove oldest if at capacity
