@@ -8,7 +8,7 @@ REM Get current datetime as YYMMDDHHMM using PowerShell
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyMMddHHmm'"') do set DATETIME=%%i
 
 REM Set version string
-set VERSION=0.2.%DATETIME%
+set VERSION=0.3.%DATETIME%
 set LDFLAGS=-ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=%VERSION%"
 
 echo Building Claude2Kiro v%VERSION% for all platforms...

@@ -2,7 +2,7 @@
 set -e
 
 # Get version from datetime
-VERSION="0.2.$(date +%y%m%d%H%M)"
+VERSION="0.3.$(date +%y%m%d%H%M)"
 
 echo "Building Claude2Kiro v${VERSION} for all platforms..."
 echo

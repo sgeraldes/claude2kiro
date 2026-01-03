@@ -43,11 +43,22 @@ The backend API still uses `codewhisperer.amazonaws.com` because:
 
 ## Screenshots
 
-### Claude Code
+### Interactive Dashboard (v0.3.0)
+The new TUI dashboard provides real-time monitoring with:
+- **Filter Bar**: Type filters (req/res/inf/err), text search, and date-based filtering
+- **Session Stats**: Request count, token expiry, server status, and Kiro credits
+- **Split View**: Log list on left, detail panel on right with markdown rendering
+- **Session Resume**: Press Ctrl+O to open Claude Code and resume the selected session
+
+### Claude Code Integration
 <img width="1920" height="1040" alt="Claude Code working with Claude2Kiro" src="https://github.com/user-attachments/assets/25f02026-f316-4a27-831c-6bc28cb03fca" />
 
-### Cherry Studio
+*Shows Claude Code connected to Claude2Kiro proxy with streaming responses*
+
+### Cherry Studio Integration
 <img width="1920" height="1040" alt="Cherry Studio working with Claude2Kiro" src="https://github.com/user-attachments/assets/9bb24690-1e96-4a85-a7fc-bf7cdee95c09" />
+
+*Shows Cherry Studio using Claude2Kiro as an Anthropic API endpoint*
 
 ## Prerequisites
 
@@ -122,6 +133,34 @@ claude
 ```
 
 ### Commands
+
+#### Interactive TUI (Recommended)
+
+```bash
+./claude2kiro
+```
+
+Launches the interactive Terminal UI with:
+- **Main Menu**: Login, Dashboard, Configure Claude, Settings, Exit
+- **Dashboard**: Real-time monitoring of API requests and responses
+  - Filter logs by type (req/res/inf/err), text search, or date
+  - View detailed request/response with markdown rendering
+  - Press `ctrl+o` to open Claude Code with current session
+  - Press `p` for Settings, `u` to open Kiro usage in browser
+- **Settings**: Configure all options with inline help and real-time stats
+
+**Dashboard Keyboard Shortcuts:**
+- `↑/↓` - Navigate log entries
+- `enter` - View log detail
+- `v` - Cycle view mode (parsed/json/raw)
+- `e` - Toggle expand/compact
+- `/` or `s` - Jump to search filter
+- `1-4` - Toggle type filters (req/res/inf/err)
+- `x` - Clear "after date" filter
+- `ctrl+o` - Open Claude Code with current session
+- `p` - Open settings panel
+- `u` - Open Kiro usage page in browser
+- `q` - Back to menu
 
 #### Login (Browser-based Authentication)
 
@@ -316,11 +355,108 @@ This project uses GitHub Actions for CI/CD:
 
 ## Features
 
+### v0.3.0 - Interactive Dashboard & Enhanced UI
+
+- **Interactive TUI Dashboard**: Real-time monitoring with Bubble Tea
+  - Session statistics (request count, token expiry, server status)
+  - Smart filter bar with type filters (req/res/inf/err), text search, and date filtering
+  - Configurable split-pane view with markdown rendering via Glamour
+  - Multiple view modes (parsed, JSON, raw) with expand/compact toggle
+- **Session Management**: Press Ctrl+O to open Claude Code with current session resume
+- **Settings Panel**: Comprehensive configuration interface with inline help
+  - Server, logging, display, network, and advanced settings
+  - Real-time stats (disk usage, memory usage, entry count)
+  - Unsaved changes tracking with exit confirmation
+- **Configurable Attachment Handling**: Control how base64 attachments are displayed
+  - `full`: Show complete base64 content
+  - `placeholder`: Replace with size placeholders
+  - `separate`: Extract and display separately
+
+### Core Features
+
 - **Streaming Support**: Full SSE streaming with natural response timing
 - **Tool Use**: Complete support for Anthropic's tool_use feature
 - **Auto Token Refresh**: Automatically refreshes expired tokens on 403 errors
 - **Cross-Platform**: Works on Windows, Linux, and macOS
-- **Minimal Dependencies**: Only uses [promptui](https://github.com/manifoldco/promptui) for interactive menus
+- **Browser-Based Login**: OAuth authentication via GitHub, Google, AWS Builder ID, or Enterprise IdC
+
+## Configuration
+
+Claude2Kiro stores its configuration in `~/.claude2kiro/config.yaml`. You can edit settings through the interactive Settings panel (press `m` in menu, then select Settings) or manually edit the YAML file.
+
+### Configuration File Example
+
+```yaml
+server:
+  port: "8080"
+  auto_start: false
+  shutdown_timeout: 5s
+
+logging:
+  enabled: true
+  directory: ~/.claude2kiro/logs/
+  dashboard_retention: "48h"      # How long sessions stay in dashboard
+  file_retention: "unlimited"     # How long log files are kept on disk
+  max_log_size_mb: 100           # Total log directory size limit
+  max_entries: 500               # Max entries kept in memory
+  file_content_length: 0         # Max chars per log entry (0 = unlimited)
+  preview_length: 10000          # Preview length in list view
+  attachment_mode: "separate"    # "full", "placeholder", or "separate"
+
+display:
+  show_status_in_list: true
+  show_duration_in_list: true
+  show_request_number: true
+  show_body_size: true
+  mouse_click_to_select: true
+  list_width_percent: 35         # Width of log list panel (15-50%)
+  theme: "default"               # "default", "light", or "dark"
+  help_panel_position: "right"   # "right" or "bottom"
+  default_view_mode: "last"      # "last", "parsed", "json", or "raw"
+  default_expand_mode: "compact" # "last", "compact", or "expanded"
+
+network:
+  http_timeout: 30s
+  token_refresh_threshold: 5m
+  streaming_delay_max: 300ms     # Random delay between SSE events
+
+advanced:
+  codewhisperer_endpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+  credits_endpoint: "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits"
+  kiro_refresh_endpoint: "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
+  kiro_usage_url: "https://kiro.dev/usage"
+  aws_region: "us-east-1"
+```
+
+### Attachment Mode Options
+
+Control how base64-encoded attachments (images, PDFs, etc.) are displayed in logs:
+
+- **`separate`** (default): Extract attachments and display them separately from text
+- **`placeholder`**: Replace base64 content with `[BASE64 IMAGE: 123.4KB]` placeholders
+- **`full`**: Show complete base64 content (may be very long)
+
+Example configuration:
+```yaml
+logging:
+  attachment_mode: "separate"  # Recommended for readability
+```
+
+### Interactive Settings Panel
+
+Access the settings panel from the main menu or press `p` in the dashboard to:
+- View and edit all configuration options
+- See real-time stats (disk usage, memory usage, entry counts)
+- Get inline help with detailed descriptions for each setting
+- Track unsaved changes with confirmation on exit
+
+Keyboard shortcuts in Settings:
+- `left/right` - Switch categories (Server, Logging, Display, Network, Advanced)
+- `up/down` - Navigate settings
+- `enter` - Edit/toggle setting
+- `s` or `ctrl+s` - Save changes
+- `r` - Reset current setting to default
+- `esc` - Exit (with unsaved changes warning if needed)
 
 ## Troubleshooting
 

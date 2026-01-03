@@ -8,7 +8,7 @@ REM Get current datetime as YYMMDDHHMM using PowerShell (more compatible)
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyMMddHHmm'"') do set DATETIME=%%i
 
 REM Set version string (major.minor.datetime)
-set VERSION=0.2.%DATETIME%
+set VERSION=0.3.%DATETIME%
 
 echo Building Claude2Kiro v%VERSION%...
 
