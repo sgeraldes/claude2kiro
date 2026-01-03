@@ -37,6 +37,7 @@ type LoggingConfig struct {
 	FileContentLen     int    `yaml:"file_content_length"` // Max chars per entry in file (0 = unlimited)
 	MaxBodySizeKB      int    `yaml:"max_body_size_kb"`    // Max body size to store in memory per entry in KB (0 = unlimited, default 1024)
 	PreviewLength      int    `yaml:"preview_length"`      // Preview length in list view
+	AttachmentMode     string `yaml:"attachment_mode"`     // "full", "placeholder", "separate" - how to handle base64 attachments
 }
 
 // DisplayConfig holds UI display settings
@@ -100,9 +101,10 @@ func Default() *Config {
 			FileRetention:      "unlimited",
 			MaxLogSizeMB:       100,
 			MaxEntries:         500,
-			FileContentLen:     0,     // 0 = unlimited
-			MaxBodySizeKB:      1024,  // 1MB default limit for in-memory body storage
-			PreviewLength:      10000, // 0 = unlimited, max 200000
+			FileContentLen:     0,         // 0 = unlimited
+			MaxBodySizeKB:      1024,      // 1MB default limit for in-memory body storage
+			PreviewLength:      10000,     // 0 = unlimited, max 200000
+			AttachmentMode:     "separate", // "full", "placeholder", "separate"
 		},
 		Display: DisplayConfig{
 			ShowStatusInList:     true,

@@ -83,6 +83,12 @@ type LogEntryMsg struct {
 	Entry LogEntry
 }
 
+// AttachmentCounter tracks attachment counts for filename generation
+type AttachmentCounter struct {
+	mu      sync.Mutex
+	counter int
+}
+
 // Color definitions for log formatting
 var (
 	colorReq     = lipgloss.Color("#7D56F4") // Purple
@@ -231,14 +237,15 @@ func truncate(s string, maxLen int) string {
 
 // Logger manages log entries with a ring buffer
 type Logger struct {
-	entries      []LogEntry
-	maxEntries   int
-	mu           sync.RWMutex
-	program      *tea.Program
-	fileWriter   *os.File
-	filePath     string
-	requestCount uint64         // Counter for generating unique request IDs
-	seqNumMap    map[string]int // Maps session ID to current sequential number
+	entries           []LogEntry
+	maxEntries        int
+	mu                sync.RWMutex
+	program           *tea.Program
+	fileWriter        *os.File
+	filePath          string
+	requestCount      uint64         // Counter for generating unique request IDs
+	seqNumMap         map[string]int // Maps session ID to current sequential number
+	attachmentCounter AttachmentCounter
 }
 
 // NewLogger creates a new logger with a maximum number of entries
@@ -308,17 +315,59 @@ func (l *Logger) Log(entry LogEntry) {
 		entry.BodySize = originalBodySize
 	}
 
-	// Write to file FIRST with full body (preserves complete data for replay/debugging)
-	if l.fileWriter != nil {
-		l.fileWriter.WriteString(entry.FormatPlain() + "\n")
+	cfg := config.Get()
+
+	// Process attachments based on mode
+	bodyForFile := entry.Body
+	bodyForMemory := entry.Body
+
+	switch cfg.Logging.AttachmentMode {
+	case "full":
+		// Mode 1: Full base64 in both file and memory (default, large files)
+		// No processing needed - use original body for everything
+		bodyForFile = entry.Body
+		bodyForMemory = entry.Body
+
+	case "placeholder":
+		// Mode 2: Replace base64 with placeholders everywhere (small files, lose data)
+		if cfg.Logging.MaxBodySizeKB > 0 {
+			processed := replaceBase64WithPlaceholders(entry.Body, cfg.Logging.MaxBodySizeKB)
+			bodyForFile = processed
+			bodyForMemory = processed
+		}
+
+	case "separate":
+		// Mode 3: Save attachments to separate files, use references in logs
+		processed, err := l.extractAndSaveAttachments(entry.Body, entry.Timestamp)
+		if err != nil {
+			// Log error but continue with original body
+			bodyForFile = entry.Body
+			bodyForMemory = entry.Body
+		} else {
+			bodyForFile = processed
+			bodyForMemory = processed
+		}
+
+	default:
+		// Unknown mode - default to placeholder behavior
+		if cfg.Logging.MaxBodySizeKB > 0 {
+			processed := replaceBase64WithPlaceholders(entry.Body, cfg.Logging.MaxBodySizeKB)
+			bodyForFile = processed
+			bodyForMemory = processed
+		}
 	}
 
-	// Replace base64 content with placeholders for MEMORY ONLY
-	// This prevents unbounded memory growth while keeping full data in files
-	cfg := config.Get()
-	if cfg.Logging.MaxBodySizeKB > 0 {
-		entry.Body = replaceBase64WithPlaceholders(entry.Body, cfg.Logging.MaxBodySizeKB)
+	// Create a copy of entry for file logging with processed body
+	fileEntry := entry
+	fileEntry.Body = bodyForFile
+
+	// Write to file with processed body
+	if l.fileWriter != nil {
+		l.fileWriter.WriteString(fileEntry.FormatPlain() + "\n")
 	}
+
+	// Update entry for memory storage
+	entry.Body = bodyForMemory
 
 	// Ring buffer: remove oldest if at capacity
 	if len(l.entries) >= l.maxEntries {
@@ -365,6 +414,176 @@ var (
 	// Common media type patterns in JSON (e.g., "type": "image/png", "media_type": "application/pdf")
 	mediaTypePattern = regexp.MustCompile(`"(?:type|media_type|content_type|mime_type)"\s*:\s*"([^"]+)"`)
 )
+
+// extractAndSaveAttachments extracts base64 attachments from body and saves them to separate files
+// Returns the body with base64 replaced by file references
+func (l *Logger) extractAndSaveAttachments(body string, timestamp time.Time) (string, error) {
+	const minBase64Size = 1024 // 1KB - only extract attachments larger than this
+
+	// Get home directory for attachment storage
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return body, err
+	}
+
+	// Create attachments directory: ~/.claude2kiro/attachments/YYYY-MM-DD/
+	dateDir := timestamp.Format("2006-01-02")
+	attachmentDir := filepath.Join(homeDir, ".claude2kiro", "attachments", dateDir)
+	if err := os.MkdirAll(attachmentDir, 0755); err != nil {
+		return body, err
+	}
+
+	// Extract media types from the JSON for context
+	mediaTypes := make(map[int]string) // position -> media type
+	for _, match := range mediaTypePattern.FindAllStringSubmatchIndex(body, -1) {
+		if len(match) >= 4 {
+			pos := match[0]
+			mediaType := body[match[2]:match[3]]
+			mediaTypes[pos] = mediaType
+		}
+	}
+
+	// Find the closest media type before a given position
+	findMediaType := func(pos int) string {
+		bestPos := -1
+		bestType := ""
+		for mPos, mType := range mediaTypes {
+			// Look for media type within 500 chars before the base64
+			if mPos < pos && pos-mPos < 500 && mPos > bestPos {
+				bestPos = mPos
+				bestType = mType
+			}
+		}
+		return bestType
+	}
+
+	// Replace base64 fields with file references
+	result := base64FieldPattern.ReplaceAllStringFunc(body, func(match string) string {
+		// Extract the parts
+		parts := base64FieldPattern.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match // Shouldn't happen, but be safe
+		}
+
+		fieldPrefix := parts[1] // e.g., "data": "
+		base64Content := parts[2]
+		fieldSuffix := parts[3] // closing "
+
+		// Only process if larger than minBase64Size
+		if len(base64Content) < minBase64Size {
+			return match
+		}
+
+		// Try to determine media type
+		mediaType := "binary"
+		matchPos := strings.Index(body, match)
+		if matchPos >= 0 {
+			if nearbyType := findMediaType(matchPos); nearbyType != "" {
+				mediaType = nearbyType
+			}
+		}
+
+		// Try to decode a sample to verify it's valid base64
+		sampleSize := 100
+		if len(base64Content) < sampleSize {
+			sampleSize = len(base64Content)
+		}
+		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
+			// Not valid base64, keep original
+			return match
+		}
+
+		// Decode the full base64 content
+		decodedData, err := base64.StdEncoding.DecodeString(base64Content)
+		if err != nil {
+			// Failed to decode, keep original
+			return match
+		}
+
+		// Determine file extension from media type
+		ext := getFileExtension(mediaType)
+
+		// Generate unique filename using counter
+		l.attachmentCounter.mu.Lock()
+		l.attachmentCounter.counter++
+		fileNum := l.attachmentCounter.counter
+		l.attachmentCounter.mu.Unlock()
+
+		// Create filename: img_001.png, doc_002.pdf, etc.
+		prefix := getFilePrefix(mediaType)
+		filename := fmt.Sprintf("%s_%03d%s", prefix, fileNum, ext)
+		filePath := filepath.Join(attachmentDir, filename)
+
+		// Save the decoded data to file
+		if err := os.WriteFile(filePath, decodedData, 0644); err != nil {
+			// Failed to save, keep original
+			return match
+		}
+
+		// Create relative path for reference: attachments/2026-01-02/img_001.png
+		relativePath := filepath.Join("attachments", dateDir, filename)
+
+		// Create file reference
+		sizeStr := config.FormatBytes(int64(len(decodedData)))
+		reference := fmt.Sprintf("[ATTACHMENT: %s %s]", relativePath, sizeStr)
+
+		return fieldPrefix + reference + fieldSuffix
+	})
+
+	return result, nil
+}
+
+// getFileExtension returns the file extension for a media type
+func getFileExtension(mediaType string) string {
+	switch {
+	case strings.HasPrefix(mediaType, "image/png"):
+		return ".png"
+	case strings.HasPrefix(mediaType, "image/jpeg"), strings.HasPrefix(mediaType, "image/jpg"):
+		return ".jpg"
+	case strings.HasPrefix(mediaType, "image/gif"):
+		return ".gif"
+	case strings.HasPrefix(mediaType, "image/webp"):
+		return ".webp"
+	case strings.HasPrefix(mediaType, "image/"):
+		return ".img"
+	case strings.HasPrefix(mediaType, "application/pdf"):
+		return ".pdf"
+	case strings.HasPrefix(mediaType, "video/mp4"):
+		return ".mp4"
+	case strings.HasPrefix(mediaType, "video/webm"):
+		return ".webm"
+	case strings.HasPrefix(mediaType, "video/"):
+		return ".vid"
+	case strings.HasPrefix(mediaType, "audio/mp3"):
+		return ".mp3"
+	case strings.HasPrefix(mediaType, "audio/wav"):
+		return ".wav"
+	case strings.HasPrefix(mediaType, "audio/"):
+		return ".aud"
+	case strings.HasPrefix(mediaType, "text/"):
+		return ".txt"
+	default:
+		return ".bin"
+	}
+}
+
+// getFilePrefix returns the filename prefix for a media type
+func getFilePrefix(mediaType string) string {
+	switch {
+	case strings.HasPrefix(mediaType, "image/"):
+		return "img"
+	case strings.HasPrefix(mediaType, "application/pdf"):
+		return "doc"
+	case strings.HasPrefix(mediaType, "video/"):
+		return "vid"
+	case strings.HasPrefix(mediaType, "audio/"):
+		return "aud"
+	case strings.HasPrefix(mediaType, "text/"):
+		return "txt"
+	default:
+		return "file"
+	}
+}
 
 // replaceBase64WithPlaceholders scans for base64 content in JSON and replaces ALL base64 blobs with placeholders
 // This preserves the conversation structure while removing binary data that causes memory/disk issues
@@ -621,6 +840,10 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 	count := 0
 	skippedLarge := 0
 
+	// Increase limit to 50MB to accommodate large requests with @size markers
+	// The @size marker preserves original size, so we keep only the marker + truncated content in memory
+	const maxLineSize = 50 * 1024 * 1024 // 50MB
+
 	for {
 		// ReadString reads until delimiter, can handle large lines
 		line, err := reader.ReadString('\n')
@@ -631,7 +854,7 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 					line = strings.TrimSuffix(line, "\n")
 					line = strings.TrimSuffix(line, "\r")
 					// Skip extremely large lines
-					if len(line) <= 10*1024*1024 {
+					if len(line) <= maxLineSize {
 						if entry, ok := parsePlainLogLine(line); ok {
 							if len(l.entries) >= l.maxEntries {
 								l.entries = l.entries[1:]
@@ -650,8 +873,8 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 		line = strings.TrimSuffix(line, "\n")
 		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
 
-		// Skip extremely large lines (> 10MB) to avoid memory issues
-		if len(line) > 10*1024*1024 {
+		// Skip extremely large lines (> 50MB) to avoid memory issues
+		if len(line) > maxLineSize {
 			skippedLarge++
 			continue
 		}
@@ -759,7 +982,8 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 		entry.Body = mainDetails
 	}
 
-	// Set body size from parsed body content if not already set from @size marker
+	// Set body size from parsed body content ONLY if not already set from @size marker
+	// The @size marker contains the ORIGINAL body size before truncation, so it takes precedence
 	if entry.BodySize == 0 && entry.Body != "" {
 		entry.BodySize = len(entry.Body)
 	}
