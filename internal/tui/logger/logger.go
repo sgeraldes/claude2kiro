@@ -835,17 +835,12 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Use a reader that can handle very long lines by reading in chunks
+	// Use a reader that can handle very long lines
 	reader := bufio.NewReader(file)
 	count := 0
-	skippedLarge := 0
-
-	// Increase limit to 50MB to accommodate large requests with @size markers
-	// The @size marker preserves original size, so we keep only the marker + truncated content in memory
-	const maxLineSize = 50 * 1024 * 1024 // 50MB
 
 	for {
-		// ReadString reads until delimiter, can handle large lines
+		// ReadString reads until delimiter, handles any line size
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -853,17 +848,12 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 				if len(line) > 0 {
 					line = strings.TrimSuffix(line, "\n")
 					line = strings.TrimSuffix(line, "\r")
-					// Skip extremely large lines
-					if len(line) <= maxLineSize {
-						if entry, ok := parsePlainLogLine(line); ok {
-							if len(l.entries) >= l.maxEntries {
-								l.entries = l.entries[1:]
-							}
-							l.entries = append(l.entries, entry)
-							count++
+					if entry, ok := parsePlainLogLine(line); ok {
+						if len(l.entries) >= l.maxEntries {
+							l.entries = l.entries[1:]
 						}
-					} else {
-						skippedLarge++
+						l.entries = append(l.entries, entry)
+						count++
 					}
 				}
 			}
@@ -873,12 +863,6 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 		line = strings.TrimSuffix(line, "\n")
 		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
 
-		// Skip extremely large lines (> 50MB) to avoid memory issues
-		if len(line) > maxLineSize {
-			skippedLarge++
-			continue
-		}
-
 		if entry, ok := parsePlainLogLine(line); ok {
 			// Ring buffer: remove oldest if at capacity
 			if len(l.entries) >= l.maxEntries {
@@ -887,14 +871,6 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 			l.entries = append(l.entries, entry)
 			count++
 		}
-	}
-
-	// Log if we skipped large entries
-	if skippedLarge > 0 && l.program != nil {
-		// Will be logged after unlock
-		go func() {
-			l.LogInfo(fmt.Sprintf("Skipped %d oversized log entries (>10MB)", skippedLarge))
-		}()
 	}
 
 	return count, nil
