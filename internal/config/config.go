@@ -73,6 +73,9 @@ type AdvancedConfig struct {
 	KiroRefreshEndpoint   string `yaml:"kiro_refresh_endpoint"`
 	KiroUsageURL          string `yaml:"kiro_usage_url"`
 	AWSRegion             string `yaml:"aws_region"`
+	ComparisonMode        bool   `yaml:"comparison_mode"`   // Debug: send to both Anthropic and Kiro
+	AnthropicDirect       bool   `yaml:"anthropic_direct"`  // Bypass: send only to Anthropic
+	AnthropicApiKey       string `yaml:"anthropic_api_key"` // API key for Anthropic (required for comparison/direct modes)
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -189,7 +192,7 @@ func (c *Config) Save() error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 // ExpandPath expands ~ to home directory

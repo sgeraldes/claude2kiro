@@ -228,57 +228,122 @@ type ImageSource struct {
 	Data      string `json:"data"`       // base64-encoded image data
 }
 
+// sanitizeHistoryContent cleans up corrupted content that was produced by
+// earlier buggy versions of the proxy (e.g., "answer for user question" placeholder)
+func sanitizeHistoryContent(content string) string {
+	// Known garbage content that was produced by earlier bugs
+	garbageContent := []string{
+		"answer for user question",
+		"(no content)",
+	}
+	for _, garbage := range garbageContent {
+		if content == garbage {
+			return "" // Replace with empty string
+		}
+	}
+	return content
+}
+
 // getMessageContent extracts text content from a message
 func getMessageContent(content any) string {
 	switch v := content.(type) {
 	case string:
 		if len(v) == 0 {
-			return "answer for user question"
+			return "" // Empty content is valid
 		}
 		return v
 	case []interface{}:
 		var texts []string
+		hasToolUse := false
+		hasToolResult := false
 		for _, block := range v {
-
 			if m, ok := block.(map[string]interface{}); ok {
-				var cb ContentBlock
-				if data, err := jsonStr.Marshal(m); err == nil {
-					if err := jsonStr.Unmarshal(data, &cb); err == nil {
-						switch cb.Type {
-						case "tool_result":
-							if cb.Content != nil {
-								texts = append(texts, *cb.Content)
-							}
-						case "text":
-							if cb.Text != nil {
-								texts = append(texts, *cb.Text)
+				// Get the block type
+				blockType, _ := m["type"].(string)
+				switch blockType {
+				case "tool_result":
+					hasToolResult = true
+					// Tool result content can be a string or an array of content blocks
+					if contentStr, ok := m["content"].(string); ok {
+						texts = append(texts, contentStr)
+					} else if contentArr, ok := m["content"].([]interface{}); ok {
+						// Content is an array of blocks - extract text from each
+						for _, innerBlock := range contentArr {
+							if innerMap, ok := innerBlock.(map[string]interface{}); ok {
+								if innerType, _ := innerMap["type"].(string); innerType == "text" {
+									if textVal, ok := innerMap["text"].(string); ok {
+										texts = append(texts, textVal)
+									}
+								}
 							}
 						}
 					}
-
+				case "text":
+					if textVal, ok := m["text"].(string); ok {
+						texts = append(texts, textVal)
+					}
+				case "tool_use":
+					// Tool use blocks are handled separately in ToolUses array
+					// Just mark that we have tool use for proper content handling
+					hasToolUse = true
 				}
 			}
-
 		}
+		_ = hasToolResult // Used for debugging if needed
 		if len(texts) == 0 {
-			_, err := jsonStr.Marshal(content)
-			if err != nil {
-				return "answer for user question"
+			if hasToolUse {
+				// Tool-only message - return empty content
+				// The tool information will be in the ToolUses array
+				return ""
 			}
-
-			// uncatch event
-			return "answer for user question"
+			// No content found - return empty instead of placeholder
+			return ""
 		}
 		return strings.Join(texts, "\n")
 	default:
-		_, err := jsonStr.Marshal(content)
-		if err != nil {
-			return "answer for user question"
-		}
-
-		// uncatch event
-		return "answer for user question"
+		// Unknown type - return empty instead of placeholder
+		return ""
 	}
+}
+
+// HistoryToolUse represents a tool use in conversation history
+type HistoryToolUse struct {
+	Name      string `json:"name"`
+	ToolUseId string `json:"toolUseId"`
+	Input     any    `json:"input"` // JSON object of the input
+}
+
+// getMessageToolUses extracts tool_use blocks from a message content
+func getMessageToolUses(content any) []HistoryToolUse {
+	var toolUses []HistoryToolUse
+
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return toolUses
+	}
+
+	for _, block := range blocks {
+		if m, ok := block.(map[string]interface{}); ok {
+			if typeVal, ok := m["type"].(string); ok && typeVal == "tool_use" {
+				toolUse := HistoryToolUse{}
+				if name, ok := m["name"].(string); ok {
+					toolUse.Name = name
+				}
+				if id, ok := m["id"].(string); ok {
+					toolUse.ToolUseId = id
+				}
+				if input, ok := m["input"]; ok {
+					// Keep input as-is (JSON object), don't convert to string
+					toolUse.Input = input
+				}
+				if toolUse.Name != "" && toolUse.ToolUseId != "" {
+					toolUses = append(toolUses, toolUse)
+				}
+			}
+		}
+	}
+
+	return toolUses
 }
 
 // ToolResultContent represents content in a tool result (text or image)
@@ -342,6 +407,9 @@ type CodeWhispererEvent struct {
 
 // tokenRefreshMutex prevents concurrent token refresh operations
 var tokenRefreshMutex sync.Mutex
+
+// kiroRequestSema limits concurrent requests to Kiro backend (some 400s may be concurrency-related)
+var kiroRequestSema = make(chan struct{}, 2) // Allow max 2 concurrent requests
 
 var ModelMap = map[string]string{
 	// Auto - lets Kiro choose the best model
@@ -532,16 +600,20 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		// Then process regular message history
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			if anthropicReq.Messages[i].Role == "user" {
+				userContent := sanitizeHistoryContent(getMessageContent(anthropicReq.Messages[i].Content))
+
 				userMsg := HistoryUserMessage{}
-				userMsg.UserInputMessage.Content = getMessageContent(anthropicReq.Messages[i].Content)
+				userMsg.UserInputMessage.Content = userContent
 				userMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
 				userMsg.UserInputMessage.Origin = "AI_EDITOR"
 				history = append(history, userMsg)
 
 				// Check if the next message is an assistant reply
 				if i+1 < len(anthropicReq.Messages)-1 && anthropicReq.Messages[i+1].Role == "assistant" {
+					content := sanitizeHistoryContent(getMessageContent(anthropicReq.Messages[i+1].Content))
+
 					assistantMsg := HistoryAssistantMessage{}
-					assistantMsg.AssistantResponseMessage.Content = getMessageContent(anthropicReq.Messages[i+1].Content)
+					assistantMsg.AssistantResponseMessage.Content = content
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 					history = append(history, assistantMsg)
 					i++ // Skip the already processed assistant message
@@ -663,6 +735,15 @@ func main() {
 			port = os.Args[2]
 		}
 		startServer(port)
+	case "migrate-logs":
+		dateFilter := ""
+		if len(os.Args) > 2 {
+			dateFilter = os.Args[2]
+		}
+		if err := cmd.MigrateLogs(dateFilter); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "logout":
 		logout()
 	case "help", "--help", "-h":
@@ -686,12 +767,14 @@ func printUsage() {
 	fmt.Println("      idc [start-url] [region]        - Login with Enterprise Identity Center")
 	fmt.Println("    Tip: Just run 'claude2kiro login' for interactive selection")
 	fmt.Println("")
-	fmt.Println("  claude2kiro read    - Read and display token")
-	fmt.Println("  claude2kiro refresh - Refresh the access token")
-	fmt.Println("  claude2kiro logout  - Clear saved credentials and token")
-	fmt.Println("  claude2kiro export  - Export environment variables")
-	fmt.Println("  claude2kiro claude  - Configure Claude Code settings")
-	fmt.Println("  claude2kiro server [port] - Start Anthropic API proxy server (headless)")
+	fmt.Println("  claude2kiro read           - Read and display token")
+	fmt.Println("  claude2kiro refresh        - Refresh the access token")
+	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
+	fmt.Println("  claude2kiro export         - Export environment variables")
+	fmt.Println("  claude2kiro claude         - Configure Claude Code settings")
+	fmt.Println("  claude2kiro server [port]  - Start Anthropic API proxy server (headless)")
+	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
+	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
 	fmt.Println("")
 	fmt.Println("  Author: https://github.com/sgeraldes/claude2kiro")
 }
@@ -766,6 +849,135 @@ func extractSessionID(metadata map[string]any) (string, string) {
 	}
 	return userID, ""
 }
+// forwardToAnthropic forwards a request directly to Anthropic API as a TRUE bypass proxy
+// Copies ALL headers from the original request unchanged
+func forwardToAnthropic(originalReq *http.Request, body []byte, lg *logger.Logger) (*http.Response, error) {
+	cfg := config.Get()
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy ALL headers from original request (true bypass proxy)
+	for key, values := range originalReq.Header {
+		// Skip hop-by-hop headers and headers that must not be forwarded
+		switch key {
+		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+			"Host", "Content-Length": // Host must be target, Content-Length set by Go
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	// Log forwarding status
+	lg.LogInfo(fmt.Sprintf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v",
+		originalReq.Header.Get("x-api-key") != "",
+		originalReq.Header.Get("Authorization") != ""))
+
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	return client.Do(req)
+}
+
+// forwardToAnthropicWithHeaders forwards a request to Anthropic API using pre-copied headers
+// Used by comparison mode goroutines to avoid race conditions with request reuse
+func forwardToAnthropicWithHeaders(headers http.Header, body []byte, lg *logger.Logger) (*http.Response, error) {
+	cfg := config.Get()
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy headers (already filtered by caller)
+	for key, values := range headers {
+		// Skip hop-by-hop headers and headers that must not be forwarded
+		switch key {
+		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+			"Host", "Content-Length":
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	lg.LogInfo(fmt.Sprintf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v",
+		headers.Get("x-api-key") != "",
+		headers.Get("Authorization") != ""))
+
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	return client.Do(req)
+}
+
+// forwardToAnthropicHeadless forwards a request to Anthropic API as a TRUE bypass proxy (headless/CLI version)
+// Copies ALL headers from the original request unchanged
+func forwardToAnthropicHeadless(originalReq *http.Request, body []byte) (*http.Response, error) {
+	cfg := config.Get()
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy ALL headers from original request (true bypass proxy)
+	for key, values := range originalReq.Header {
+		// Skip hop-by-hop headers and headers that must not be forwarded
+		switch key {
+		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+			"Host", "Content-Length": // Host must be target, Content-Length set by Go
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	fmt.Printf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v\n",
+		originalReq.Header.Get("x-api-key") != "",
+		originalReq.Header.Get("Authorization") != "")
+
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	return client.Do(req)
+}
+
+// forwardToAnthropicHeadlessWithHeaders forwards a request to Anthropic API using pre-copied headers (CLI version)
+// Used by comparison mode goroutines to avoid race conditions with request reuse
+func forwardToAnthropicHeadlessWithHeaders(headers http.Header, body []byte) (*http.Response, error) {
+	cfg := config.Get()
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy headers (already filtered by caller)
+	for key, values := range headers {
+		// Skip hop-by-hop headers and headers that must not be forwarded
+		switch key {
+		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+			"Host", "Content-Length":
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	fmt.Printf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v\n",
+		headers.Get("x-api-key") != "",
+		headers.Get("Authorization") != "")
+
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	return client.Do(req)
+}
+
 // startServerWithLogger starts the HTTP proxy server with TUI logging
 func startServerWithLogger(port string, lg *logger.Logger) {
 	// Create router
@@ -849,6 +1061,103 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 			return
 		}
 
+		// Check for Anthropic bypass/comparison modes
+		cfg := config.Get()
+
+		if cfg.Advanced.AnthropicDirect {
+			// Anthropic Direct Mode: forward request unchanged to Anthropic
+			lg.LogInfo("[ANTHROPIC DIRECT] Forwarding request to Anthropic API")
+			resp, err := forwardToAnthropic(r, body, lg)
+			if err != nil {
+				lg.LogError(fmt.Sprintf("[ANTHROPIC DIRECT] Forward failed: %v", err))
+				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", err), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Copy ALL response headers
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+
+			// Check if this is a streaming response (SSE)
+			if resp.Header.Get("Content-Type") == "text/event-stream" {
+				// Stream through - flush after each write
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					lg.LogError("[ANTHROPIC DIRECT] ResponseWriter doesn't support flushing")
+					io.Copy(w, resp.Body)
+				} else {
+					// Stream SSE events through
+					buf := make([]byte, 4096)
+					for {
+						n, err := resp.Body.Read(buf)
+						if n > 0 {
+							w.Write(buf[:n])
+							flusher.Flush()
+						}
+						if err != nil {
+							break
+						}
+					}
+				}
+				lg.LogResponse(resp.StatusCode, r.URL.Path, time.Since(startTime), "[ANTHROPIC] SSE stream completed", sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+			} else {
+				// Non-streaming: read and write entire body
+				respBody, _ := io.ReadAll(resp.Body)
+				w.Write(respBody)
+
+				// Log response
+				duration := time.Since(startTime)
+				preview := string(respBody)
+				if len(preview) > 200 {
+					preview = preview[:200] + "..."
+				}
+				lg.LogResponse(resp.StatusCode, r.URL.Path, duration, "[ANTHROPIC] "+preview, sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+			}
+			return
+		}
+
+		if cfg.Advanced.ComparisonMode {
+			// Comparison Mode: send to both Anthropic and Kiro in parallel
+			// Copy headers before goroutine to avoid race condition (request may be reused)
+			headersCopy := make(http.Header)
+			for k, v := range r.Header {
+				headersCopy[k] = v
+			}
+			// Anthropic request runs in background goroutine
+			go func(headers http.Header) {
+				lg.LogInfo("[COMPARISON] Sending parallel request to Anthropic")
+				resp, err := forwardToAnthropicWithHeaders(headers, body, lg)
+				if err != nil {
+					lg.LogInfo(fmt.Sprintf("[COMPARISON] Anthropic error: %v", err))
+					return
+				}
+				defer resp.Body.Close()
+				respBody, err := io.ReadAll(resp.Body)
+				if err != nil {
+					lg.LogInfo(fmt.Sprintf("[COMPARISON] Failed to read Anthropic response: %v", err))
+					return
+				}
+
+				// Save to debug file
+				debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
+				if err := os.MkdirAll(debugDir, 0700); err != nil {
+					lg.LogInfo(fmt.Sprintf("[COMPARISON] Failed to create debug dir: %v", err))
+					return
+				}
+				timestamp := time.Now().Format("20060102-150405")
+				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-anthropic.json", timestamp))
+				if err := os.WriteFile(debugFile, respBody, 0600); err != nil {
+					lg.LogInfo(fmt.Sprintf("[COMPARISON] Failed to save debug file: %v", err))
+					return
+				}
+				lg.LogInfo(fmt.Sprintf("[COMPARISON] Anthropic response saved: %s (%d bytes)", debugFile, len(respBody)))
+			}(headersCopy)
+			// Continue with normal Kiro flow below...
+		}
+
 		// Handle streaming request
 		var responsePreview string
 		if anthropicReq.Stream {
@@ -914,11 +1223,14 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		return ""
 	}
 
-	// Debug: Write request to file to see what's being sent
-	debugDir := filepath.Join(os.TempDir(), "kiro2cc-debug")
-	os.MkdirAll(debugDir, 0755)
-	debugFile := filepath.Join(debugDir, fmt.Sprintf("cw-request-%s.json", time.Now().Format("20060102-150405")))
-	os.WriteFile(debugFile, cwReqBody, 0644)
+	// Debug: Write request to file to see what's being sent (with milliseconds for concurrent requests)
+	debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
+	os.MkdirAll(debugDir, 0700)
+	debugFile := filepath.Join(debugDir, fmt.Sprintf("cw-request-%s.json", time.Now().Format("20060102-150405.000")))
+	os.WriteFile(debugFile, cwReqBody, 0600)
+
+	// Log the conversationId for tracing
+	lg.LogInfo(fmt.Sprintf("Request convId=%s model=%s historyLen=%d", cwReq.ConversationState.ConversationId[:8], anthropicReq.Model, len(cwReq.ConversationState.History)))
 
 	// Create streaming request
 	cfg := config.Get()
@@ -938,24 +1250,58 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	proxyReq.Header.Set("Accept", "text/event-stream")
 	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
-	// Send request
+	// Acquire semaphore to limit concurrent Kiro requests
+	kiroRequestSema <- struct{}{}
+	defer func() { <-kiroRequestSema }()
+
+	// Send request with retry logic for transient errors
 	client := &http.Client{}
+	var resp *http.Response
+	var lastErr error
 
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		lg.LogError(fmt.Sprintf("CodeWhisperer request error: %v", err))
-		sendErrorEvent(w, flusher, "CodeWhisperer request error", err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		bodyStr := "(failed to read body)"
-		if readErr == nil {
-			bodyStr = string(body)
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// Recreate request for retry (body was consumed)
+			proxyReq, err = http.NewRequest(
+				http.MethodPost,
+				cfg.Advanced.CodeWhispererEndpoint,
+				bytes.NewBuffer(cwReqBody),
+			)
+			if err != nil {
+				sendErrorEvent(w, flusher, "Failed to create retry request", err)
+				return ""
+			}
+			proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
+			proxyReq.Header.Set("Content-Type", "application/json")
+			proxyReq.Header.Set("Accept", "text/event-stream")
+			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+			time.Sleep(100 * time.Millisecond) // Brief delay before retry
 		}
-		lg.LogError(fmt.Sprintf("CodeWhisperer error (status %d): %s", resp.StatusCode, bodyStr))
+
+		resp, lastErr = client.Do(proxyReq)
+		if lastErr != nil {
+			lg.LogError(fmt.Sprintf("CodeWhisperer request error (attempt %d): %v", attempt+1, lastErr))
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			break // Success
+		}
+
+		// Read error body
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == 400 && attempt < 2 {
+			// Transient 400 error - retry
+			lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
+			continue
+		}
+
+		// Non-retryable error or final attempt - save the failing request for debugging
+		failFile := filepath.Join(debugDir, fmt.Sprintf("cw-FAILED-%s.json", time.Now().Format("20060102-150405.000")))
+		os.WriteFile(failFile, cwReqBody, 0600)
+		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 {
 			if err := tryRefreshToken(); err != nil {
@@ -966,10 +1312,16 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
 			}
 		} else {
-			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", bodyStr))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", string(body)))
 		}
 		return ""
 	}
+
+	if lastErr != nil {
+		sendErrorEvent(w, flusher, "CodeWhisperer request error after retries", lastErr)
+		return ""
+	}
+	defer resp.Body.Close()
 
 	// Read entire response body
 	respBody, err := io.ReadAll(resp.Body)
@@ -978,11 +1330,58 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		return ""
 	}
 
+	// Debug: Save raw response for analysis
+	rawRespFile := filepath.Join(debugDir, fmt.Sprintf("cw-response-%s.bin", time.Now().Format("20060102-150405")))
+	os.WriteFile(rawRespFile, respBody, 0600)
+
 	// Use CodeWhisperer parser
 	events := parser.ParseEvents(respBody)
 	var responseText strings.Builder
 
+	// Debug: Log if no events parsed
+	if len(events) == 0 {
+		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", len(respBody)))
+	}
+
 	if len(events) > 0 {
+		// Check if this is a tool-only response (no text content events)
+		hasTextContent := false
+		hasToolUse := false
+		parserSentMessageDelta := false
+		toolBlockCount := 0
+		for _, e := range events {
+			if e.Event == "content_block_delta" {
+				if dataMap, ok := e.Data.(map[string]any); ok {
+					if delta, ok := dataMap["delta"].(map[string]any); ok {
+						if _, ok := delta["text"]; ok {
+							hasTextContent = true
+						}
+						if _, ok := delta["partial_json"]; ok {
+							hasToolUse = true
+						}
+					}
+				}
+			}
+			if e.Event == "content_block_start" {
+				if dataMap, ok := e.Data.(map[string]any); ok {
+					if cb, ok := dataMap["content_block"].(map[string]any); ok {
+						if cbType, ok := cb["type"].(string); ok && cbType == "tool_use" {
+							hasToolUse = true
+							toolBlockCount++
+						}
+					}
+				}
+			}
+			if e.Event == "message_delta" {
+				// Parser already sent a message_delta (for tool_use stop)
+				parserSentMessageDelta = true
+			}
+		}
+
+		// Log event analysis results
+		lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
+			len(events), hasTextContent, hasToolUse, toolBlockCount, parserSentMessageDelta))
+
 		// Send start event
 		messageStart := map[string]any{
 			"type": "message_start",
@@ -1003,12 +1402,15 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		sendSSEEvent(w, flusher, "message_start", messageStart)
 		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"})
 
-		contentBlockStart := map[string]any{
-			"content_block": map[string]any{"text": "", "type": "text"},
-			"index":         0,
-			"type":          "content_block_start",
+		// Only send text content_block_start if there's text content (not tool-only)
+		if hasTextContent || !hasToolUse {
+			contentBlockStart := map[string]any{
+				"content_block": map[string]any{"text": "", "type": "text"},
+				"index":         0,
+				"type":          "content_block_start",
+			}
+			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart)
 		}
-		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart)
 
 		outputTokens := 0
 		for _, e := range events {
@@ -1029,20 +1431,74 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
 		}
 
-		contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
-		sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop)
-
-		contentBlockStopReason := map[string]any{
-			"type":  "message_delta",
-			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-			"usage": map[string]any{"output_tokens": outputTokens},
+		// Only send text block stop if we sent text block start
+		if hasTextContent || !hasToolUse {
+			contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
+			sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop)
 		}
-		sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason)
+
+		// Always send message_delta if parser didn't already send one
+		if !parserSentMessageDelta {
+			stopReason := "end_turn"
+			if hasToolUse && !hasTextContent {
+				stopReason = "tool_use"
+			}
+			contentBlockStopReason := map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+				"usage": map[string]any{"output_tokens": outputTokens},
+			}
+			sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason)
+		}
 
 		messageStop := map[string]any{"type": "message_stop"}
 		sendSSEEvent(w, flusher, "message_stop", messageStop)
+	} else {
+		// No events parsed - send an empty response to prevent Claude Code from hanging
+		lg.LogError("Sending empty response due to no parsed events")
+		messageStart := map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":            messageId,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []any{},
+				"model":         anthropicReq.Model,
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+			},
+		}
+		sendSSEEvent(w, flusher, "message_start", messageStart)
+		contentBlockStart := map[string]any{
+			"content_block": map[string]any{"text": "[Error: No response received from backend]", "type": "text"},
+			"index":         0,
+			"type":          "content_block_start",
+		}
+		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart)
+		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{"index": 0, "type": "content_block_stop"})
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 0},
+		})
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"})
+		responseText.WriteString("[Error: No response received from backend]")
 	}
-	return responseText.String()
+
+	result := responseText.String()
+
+	// Validate response - warn on suspiciously short/malformed responses
+	if len(result) > 0 && len(result) < 10 {
+		trimmed := strings.TrimSpace(result)
+		// Check for responses that look like truncated JSON/code
+		if trimmed == "{" || trimmed == "[" || trimmed == "```" ||
+			strings.HasPrefix(trimmed, "{") && !strings.HasSuffix(trimmed, "}") {
+			lg.LogError(fmt.Sprintf("WARNING: Suspiciously short/truncated response detected: %q", result))
+		}
+	}
+
+	return result
 }
 
 // getTokenFilePath returns the cross-platform token file path
@@ -2282,15 +2738,14 @@ func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
-		// fmt.Printf("\n=== Request received ===\n")
-		// fmt.Printf("Time: %s\n", startTime.Format("2006-01-02 15:04:05"))
-		// fmt.Printf("Method: %s\n", r.Method)
-		// fmt.Printf("Path: %s\n", r.URL.Path)
-		// fmt.Printf("Client IP: %s\n", r.RemoteAddr)
-		// fmt.Printf("Headers:\n")
-		// for name, values := range r.Header {
-		// 	fmt.Printf("  %s: %s\n", name, strings.Join(values, ", "))
-		// }
+		fmt.Printf("\n=== Request received ===\n")
+		fmt.Printf("Time: %s\n", startTime.Format("2006-01-02 15:04:05"))
+		fmt.Printf("Method: %s\n", r.Method)
+		fmt.Printf("Path: %s\n", r.URL.Path)
+		fmt.Printf("Headers:\n")
+		for name, values := range r.Header {
+			fmt.Printf("  %s: %s\n", name, strings.Join(values, ", "))
+		}
 
 		// Call next handler
 		next(w, r)
@@ -2346,6 +2801,94 @@ func startServer(port string) {
 		}
 		// Get Kiro model ID (dynamic if not in static map)
 		_ = getKiroModelID(anthropicReq.Model)
+
+		// Check for Anthropic bypass/comparison modes
+		cfg := config.Get()
+
+		if cfg.Advanced.AnthropicDirect {
+			// Anthropic Direct Mode: forward request unchanged to Anthropic
+			fmt.Println("[ANTHROPIC DIRECT] Forwarding request to Anthropic API")
+			resp, err := forwardToAnthropicHeadless(r, body)
+			if err != nil {
+				fmt.Printf("[ANTHROPIC DIRECT] Forward failed: %v\n", err)
+				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", err), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Copy ALL response headers
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+
+			// Check if this is a streaming response (SSE)
+			if resp.Header.Get("Content-Type") == "text/event-stream" {
+				// Stream through - flush after each write
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					fmt.Println("[ANTHROPIC DIRECT] ResponseWriter doesn't support flushing")
+					io.Copy(w, resp.Body)
+				} else {
+					// Stream SSE events through
+					buf := make([]byte, 4096)
+					for {
+						n, err := resp.Body.Read(buf)
+						if n > 0 {
+							w.Write(buf[:n])
+							flusher.Flush()
+						}
+						if err != nil {
+							break
+						}
+					}
+				}
+				fmt.Println("[ANTHROPIC DIRECT] SSE stream completed")
+			} else {
+				// Non-streaming: read and write entire body
+				respBody, _ := io.ReadAll(resp.Body)
+				w.Write(respBody)
+			}
+			return
+		}
+
+		if cfg.Advanced.ComparisonMode {
+			// Comparison Mode: send to both Anthropic and Kiro in parallel
+			// Copy headers before goroutine to avoid race condition (request may be reused)
+			headersCopy := make(http.Header)
+			for k, v := range r.Header {
+				headersCopy[k] = v
+			}
+			go func(headers http.Header) {
+				fmt.Println("[COMPARISON] Sending parallel request to Anthropic")
+				resp, err := forwardToAnthropicHeadlessWithHeaders(headers, body)
+				if err != nil {
+					fmt.Printf("[COMPARISON] Anthropic error: %v\n", err)
+					return
+				}
+				defer resp.Body.Close()
+				respBody, err := io.ReadAll(resp.Body)
+				if err != nil {
+					fmt.Printf("[COMPARISON] Failed to read Anthropic response: %v\n", err)
+					return
+				}
+
+				// Save to debug file
+				debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
+				if err := os.MkdirAll(debugDir, 0700); err != nil {
+					fmt.Printf("[COMPARISON] Failed to create debug dir: %v\n", err)
+					return
+				}
+				timestamp := time.Now().Format("20060102-150405")
+				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-anthropic.json", timestamp))
+				if err := os.WriteFile(debugFile, respBody, 0600); err != nil {
+					fmt.Printf("[COMPARISON] Failed to save debug file: %v\n", err)
+					return
+				}
+				fmt.Printf("[COMPARISON] Anthropic response saved: %s (%d bytes)\n", debugFile, len(respBody))
+			}(headersCopy)
+			// Continue with normal Kiro flow below...
+		}
 
 		// Handle streaming request
 		if anthropicReq.Stream {

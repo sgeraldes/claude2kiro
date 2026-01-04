@@ -426,7 +426,33 @@ advanced:
   kiro_refresh_endpoint: "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
   kiro_usage_url: "https://kiro.dev/usage"
   aws_region: "us-east-1"
+  comparison_mode: false    # Debug: send to both Anthropic and Kiro
+  anthropic_direct: false   # Bypass: send only to Anthropic
 ```
+
+### Anthropic Direct Mode
+
+Bypass Kiro entirely and forward requests directly to Anthropic's API. When enabled, Claude2Kiro acts as a transparent proxy that forwards Claude Code's OAuth credentials unchanged:
+
+```yaml
+advanced:
+  anthropic_direct: true
+```
+
+This is useful when you want to use Anthropic directly (with your Claude Code subscription) while still being able to monitor requests through the dashboard.
+
+### Comparison Mode (Debug)
+
+Send requests to both Anthropic and Kiro simultaneously for debugging:
+
+```yaml
+advanced:
+  comparison_mode: true
+```
+
+- Returns Kiro's response to Claude Code (normal behavior)
+- Saves Anthropic's response to `%TEMP%/claude2kiro-debug/comparison-*.json`
+- Useful for comparing translation accuracy between the two backends
 
 ### Attachment Mode Options
 

@@ -10,6 +10,8 @@ build_output.txt
 
 # Debug files
 *response.raw
+logs/
+*.log
 
 # OS files
 NUL

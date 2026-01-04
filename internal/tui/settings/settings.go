@@ -571,6 +571,46 @@ func (m *Model) loadSettings() {
 				ReferenceURL:     "https://docs.aws.amazon.com/general/latest/gr/rande.html",
 			},
 		},
+		{
+			Key:         "advanced.comparison_mode",
+			Label:       "Comparison Mode",
+			Description: "Send to both Anthropic and Kiro (debug)",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.ComparisonMode),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "false",
+				RecommendedValue: "false",
+				Sensitive:        false,
+				DetailedDesc:     "When enabled, sends requests to both Anthropic (using original headers) and Kiro. Returns Kiro response but logs Anthropic response for comparison debugging. Files saved to temp/claude2kiro-debug/.",
+			},
+		},
+		{
+			Key:         "advanced.anthropic_direct",
+			Label:       "Anthropic Direct",
+			Description: "Bypass Kiro, send only to Anthropic",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.AnthropicDirect),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "false",
+				RecommendedValue: "false",
+				Sensitive:        false,
+				DetailedDesc:     "When enabled, forwards requests directly to Anthropic API using the configured API key. Bypasses Kiro/CodeWhisperer entirely. Requires Anthropic API Key to be set.",
+			},
+		},
+		{
+			Key:         "advanced.anthropic_api_key",
+			Label:       "Anthropic API Key",
+			Description: "API key for Anthropic requests",
+			Type:        TypeText,
+			Value:       maskApiKey(m.config.Advanced.AnthropicApiKey),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "",
+				RecommendedValue: "",
+				Sensitive:        true,
+				DetailedDesc:     "Your Anthropic API key (sk-ant-...). Required for Comparison Mode and Anthropic Direct mode. Get one from console.anthropic.com. The proxy cannot use Claude Code's OAuth tokens directly.",
+				ReferenceURL:     "https://console.anthropic.com/settings/keys",
+			},
+		},
 	}
 }
 
@@ -684,6 +724,15 @@ func (m *Model) applySetting(s Setting) {
 		m.config.Advanced.KiroUsageURL = s.Value
 	case "advanced.aws_region":
 		m.config.Advanced.AWSRegion = s.Value
+	case "advanced.comparison_mode":
+		m.config.Advanced.ComparisonMode = stringToBool(s.Value)
+	case "advanced.anthropic_direct":
+		m.config.Advanced.AnthropicDirect = stringToBool(s.Value)
+	case "advanced.anthropic_api_key":
+		// Only update if not masked (user entered a new key) or explicitly cleared
+		if !strings.HasPrefix(s.Value, "sk-...") {
+			m.config.Advanced.AnthropicApiKey = s.Value
+		}
 	}
 }
 
@@ -1492,6 +1541,17 @@ func boolToString(b bool) string {
 
 func stringToBool(s string) bool {
 	return s == "true"
+}
+
+func maskApiKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	// Show first 7 chars (sk-ant-) and mask the rest
+	if len(key) > 10 {
+		return key[:7] + "..." + key[len(key)-4:]
+	}
+	return "sk-...****"
 }
 
 func truncate(s string, maxLen int) string {

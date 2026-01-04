@@ -15,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/internal/tui/messages"
@@ -978,16 +979,9 @@ func OpenClaudeCode(workingDir, fullUUID, sessionID string) error {
 	// Build the claude command
 	var args []string
 
-	// Always add --dangerously-skip-permissions
-	args = append(args, "--dangerously-skip-permissions")
-
-	// Check if Claude is already running to determine session flag
-	if IsClaudeRunning() && fullUUID != "" {
-		// Claude is active - use --fork-session
-		args = append(args, "--fork-session")
-	} else if fullUUID != "" {
-		// Claude is NOT active - use --resume <full-uuid>
-		args = append(args, "--resume", fullUUID)
+	// Add session ID if provided (the full UUID, not the short 8-char version)
+	if fullUUID != "" {
+		args = append(args, "--session-id", fullUUID)
 	}
 
 	// Add working directory if provided
@@ -1000,4 +994,41 @@ func OpenClaudeCode(workingDir, fullUUID, sessionID string) error {
 
 	// Start the process in the background
 	return cmd.Start()
+}
+
+// MigrateLogs migrates existing log files to use the attachment store
+func MigrateLogs(dateFilter string) error {
+	cfg := config.Get()
+	logDir := config.ExpandPath(cfg.Logging.Directory)
+	attachDir := filepath.Join(filepath.Dir(logDir), "attachments")
+
+	// Create attachment store
+	store, err := attachments.NewStore(attachDir)
+	if err != nil {
+		return fmt.Errorf("failed to create attachment store: %w", err)
+	}
+
+	if dateFilter != "" {
+		// Migrate specific date
+		logFile := filepath.Join(logDir, dateFilter+".log")
+		result, err := attachments.MigrateLogFile(logFile, store)
+		if err != nil {
+			return err
+		}
+		fmt.Println(result.FormatSummary())
+	} else {
+		// Migrate all logs
+		results, err := attachments.MigrateAllLogs(logDir, store)
+		if err != nil {
+			return err
+		}
+		var totalSaved int64
+		for _, r := range results {
+			fmt.Println(r.FormatSummary())
+			totalSaved += r.SpaceSaved
+		}
+		fmt.Printf("\nTotal space saved: %s\n", attachments.FormatBytes(totalSaved))
+	}
+
+	return nil
 }

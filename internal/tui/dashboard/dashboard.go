@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/internal/tui/menu"
@@ -137,21 +138,22 @@ func (m Model) autoRefreshTokenCmd() tea.Cmd {
 
 // DashboardKeyMap defines key bindings for the dashboard
 type DashboardKeyMap struct {
-	Tab        key.Binding
-	Menu       key.Binding
-	Settings   key.Binding
-	OpenClaude key.Binding
-	Quit       key.Binding
-	Help       key.Binding
-	Usage      key.Binding
-	ScrollUp   key.Binding
-	ScrollDown key.Binding
-	PageUp     key.Binding
-	PageDown   key.Binding
-	Top        key.Binding
-	Bottom     key.Binding
-	Clear      key.Binding
-	Search     key.Binding
+	Tab         key.Binding
+	Menu        key.Binding
+	Settings    key.Binding
+	OpenClaude  key.Binding
+	Attachments key.Binding
+	Quit        key.Binding
+	Help        key.Binding
+	Usage       key.Binding
+	ScrollUp    key.Binding
+	ScrollDown  key.Binding
+	PageUp      key.Binding
+	PageDown    key.Binding
+	Top         key.Binding
+	Bottom      key.Binding
+	Clear       key.Binding
+	Search      key.Binding
 }
 
 func DefaultDashboardKeyMap() DashboardKeyMap {
@@ -171,6 +173,10 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 		OpenClaude: key.NewBinding(
 			key.WithKeys("ctrl+o"),
 			key.WithHelp("^o", "open claude"),
+		),
+		Attachments: key.NewBinding(
+			key.WithKeys("a"),
+			key.WithHelp("a", "attachments"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
@@ -236,6 +242,7 @@ type Model struct {
 	session            SessionModel
 	logViewer          LogViewerModel
 	filterBar          FilterBarModel
+	attachmentBrowser  AttachmentBrowserModel
 	help               help.Model
 	keys               DashboardKeyMap
 	focusedPanel       FocusedPanel
@@ -244,8 +251,10 @@ type Model struct {
 	port               string
 	server             *http.Server
 	logger             *logger.Logger
+	attachmentStore    *attachments.Store
 	quitting           bool
 	showFullHelp       bool
+	showAttachments    bool
 	tokenExpiry        time.Time
 	credits            CreditsInfo
 	creditsProgress    progress.Model
@@ -257,7 +266,7 @@ type Model struct {
 
 
 // New creates a new dashboard model
-func New(port string, tokenExpiry time.Time, lg *logger.Logger, refreshFn RefreshTokenFunc, isExpiredFn IsTokenExpiredFunc) Model {
+func New(port string, tokenExpiry time.Time, lg *logger.Logger, attachStore *attachments.Store, refreshFn RefreshTokenFunc, isExpiredFn IsTokenExpiredFunc) Model {
 	h := help.New()
 	h.ShowAll = false
 
@@ -292,19 +301,27 @@ func New(port string, tokenExpiry time.Time, lg *logger.Logger, refreshFn Refres
 	session := NewSessionModel(port)
 	session.SetTokenExpiry(tokenExpiry)
 
+	// Initialize attachment browser if store is available
+	var attachmentBrowser AttachmentBrowserModel
+	if attachStore != nil {
+		attachmentBrowser = NewAttachmentBrowser(attachStore)
+	}
+
 	return Model{
-		session:          session,
-		logViewer:        logViewer,
-		filterBar:        filterBar,
-		help:             h,
-		keys:             DefaultDashboardKeyMap(),
-		focusedPanel:     PanelLogs,
-		port:             port,
-		logger:           lg,
-		tokenExpiry:      tokenExpiry,
-		creditsProgress:  prog,
-		refreshTokenFn:   refreshFn,
-		isTokenExpiredFn: isExpiredFn,
+		session:           session,
+		logViewer:         logViewer,
+		filterBar:         filterBar,
+		attachmentBrowser: attachmentBrowser,
+		help:              h,
+		keys:              DefaultDashboardKeyMap(),
+		focusedPanel:      PanelLogs,
+		port:              port,
+		logger:            lg,
+		attachmentStore:   attachStore,
+		tokenExpiry:       tokenExpiry,
+		creditsProgress:   prog,
+		refreshTokenFn:    refreshFn,
+		isTokenExpiredFn:  isExpiredFn,
 	}
 }
 
@@ -328,6 +345,28 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// If attachments browser is shown and focused, forward keys to it
+		if m.showAttachments && m.attachmentBrowser.focused {
+			switch msg.String() {
+			case "esc", "a":
+				// Close attachments view
+				m.showAttachments = false
+				m.attachmentBrowser.SetFocused(false)
+				m.logViewer.SetFocused(true)
+				return m, nil
+			case "q", "ctrl+c":
+				// Allow quit key to work
+			case "m":
+				// Allow menu key to work
+			default:
+				// Forward to attachment browser
+				var cmd tea.Cmd
+				m.attachmentBrowser, cmd = m.attachmentBrowser.Update(msg)
+				cmds = append(cmds, cmd)
+				return m, tea.Batch(cmds...)
+			}
+		}
+
 		// If filter bar search is focused (typing mode), forward all keys to it
 		if m.filterBar.IsSearchFocused() {
 			var cmd tea.Cmd
@@ -391,15 +430,34 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					Preview:   fmt.Sprintf("Failed to open Claude Code: %v", err),
 				})
 			} else {
-				// Determine which mode was used
-				mode := "resumed"
-				if cmd.IsClaudeRunning() {
-					mode = "forked"
-				}
 				m.logViewer.AddEntry(logger.LogEntry{
 					Timestamp: time.Now(),
 					Type:      logger.LogTypeInf,
-					Preview:   fmt.Sprintf("Opened Claude Code (%s session %s in %s)", mode, meta.SessionID, meta.WorkingDir),
+					Preview:   fmt.Sprintf("Opened Claude Code (session %s in %s)", meta.SessionID, meta.WorkingDir),
+				})
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Attachments):
+			// Toggle attachments browser view
+			if m.attachmentStore != nil {
+				m.showAttachments = !m.showAttachments
+				if m.showAttachments {
+					// Refresh and focus the attachment browser
+					m.attachmentBrowser.Refresh()
+					m.attachmentBrowser.SetFocused(true)
+					m.logViewer.SetFocused(false)
+					m.filterBar.SetFocused(false)
+				} else {
+					// Return focus to log viewer
+					m.attachmentBrowser.SetFocused(false)
+					m.logViewer.SetFocused(true)
+				}
+			} else {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeInf,
+					Preview:   "Attachments not available (set attachment_mode = \"separate\" in config)",
 				})
 			}
 			return m, nil
@@ -606,6 +664,26 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			})
 		}
 
+	case DeleteAttachmentMsg:
+		// Handle attachment deletion
+		if m.attachmentStore != nil {
+			if err := m.attachmentStore.Delete(msg.Hash); err != nil {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeErr,
+					Preview:   fmt.Sprintf("Failed to delete attachment: %v", err),
+				})
+			} else {
+				m.logViewer.AddEntry(logger.LogEntry{
+					Timestamp: time.Now(),
+					Type:      logger.LogTypeInf,
+					Preview:   fmt.Sprintf("Deleted attachment: %s", msg.Hash[:12]),
+				})
+				// Refresh the attachment browser
+				m.attachmentBrowser.Refresh()
+			}
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -664,11 +742,20 @@ func (m Model) View() string {
 		topSection = lipgloss.JoinHorizontal(lipgloss.Top, statusPanel, " ", statsPanel)
 	}
 
-	// Filter bar (between status and log viewer)
+	// Filter bar (between status and log viewer) - only when not in attachments view
 	filterBarView := m.filterBar.View()
 
-	// Log viewer renders its own composable panels with focus borders
-	logView := m.logViewer.View()
+	// Main content area - either log viewer or attachments browser
+	var mainContent string
+	if m.showAttachments {
+		// Render attachments browser
+		m.attachmentBrowser.SetSize(m.width-4, m.height-12)
+		mainContent = m.attachmentBrowser.View()
+		filterBarView = "" // Hide filter bar when viewing attachments
+	} else {
+		// Log viewer renders its own composable panels with focus borders
+		mainContent = m.logViewer.View()
+	}
 
 	// Help bar (italic like Claude Code style) - build custom help text
 	helpText := m.renderHelpText()
@@ -692,7 +779,7 @@ func (m Model) View() string {
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		topSection,
 		filterBarView,
-		logView,
+		mainContent,
 		footer,
 	)
 
@@ -717,7 +804,16 @@ func (m Model) renderHelpText() string {
 	var parts []string
 
 	// Determine current focus and show relevant help
-	if m.filterBar.IsFocused() {
+	if m.showAttachments {
+		// Attachments browser help
+		parts = []string{
+			"↑/↓ navigate",
+			"o open",
+			"y copy hash",
+			"d delete",
+			"esc/a close",
+		}
+	} else if m.filterBar.IsFocused() {
 		if m.filterBar.IsSearchFocused() {
 			// Search input focused
 			parts = []string{
@@ -775,6 +871,10 @@ func (m Model) renderHelpText() string {
 	globalParts := []string{
 		accentStyle.Render("q quit"),
 		accentStyle.Render("p settings"),
+	}
+	// Add attachments key if store is available
+	if m.attachmentStore != nil && !m.showAttachments {
+		globalParts = append([]string{accentStyle.Render("a attachments")}, globalParts...)
 	}
 
 	allParts := append(parts, globalParts...)

@@ -22,8 +22,13 @@ type SSEEvent struct {
 }
 
 func ParseEvents(resp []byte) []SSEEvent {
-
 	events := []SSEEvent{}
+
+	// Track tool indices by tool ID for multi-tool responses
+	toolIndices := make(map[string]int)
+	nextToolIndex := 0    // Will be adjusted to 1 if text content is present
+	hasToolUse := false
+	hasTextContent := false
 
 	r := bytes.NewReader(resp)
 	for {
@@ -65,34 +70,56 @@ func ParseEvents(resp []byte) []SSEEvent {
 
 		var evt assistantResponseEvent
 		if err := json.Unmarshal([]byte(payloadStr), &evt); err == nil {
+			// Track if we have text content - this affects tool indexing
+			if evt.Content != "" {
+				hasTextContent = true
+				// If we haven't assigned any tool indices yet, bump to 1
+				// so tools don't conflict with text at index 0
+				if len(toolIndices) == 0 && nextToolIndex == 0 {
+					nextToolIndex = 1
+				}
+			}
 
-			events = append(events, convertAssistantEventToSSE(evt))
+			sseEvent := convertAssistantEventToSSEWithIndex(evt, toolIndices, &nextToolIndex)
+			if sseEvent.Event != "" {
+				events = append(events, sseEvent)
+			}
 
 			if evt.ToolUseId != "" && evt.Name != "" {
-				if evt.Stop {
-					events = append(events, SSEEvent{
-						Event: "message_delta",
-						Data: map[string]interface{}{
-							"type": "message_delta",
-							"delta": map[string]interface{}{
-								"stop_reason":   "tool_use",
-								"stop_sequence": nil,
-							},
-							"usage": map[string]interface{}{"output_tokens": 0},
-						},
-					})
-				}
-
+				hasToolUse = true
 			}
-		} else {
-			// json unmarshal error - silently continue
 		}
+		// json unmarshal error - silently continue (for metering/context events)
+	}
+
+	// Add a single message_delta at the end for ALL responses
+	// - Tool responses get stop_reason: "tool_use"
+	// - Text-only responses get stop_reason: "end_turn"
+	// Note: hasTextContent is used above to adjust tool indices, ensuring tools start at index 1
+	// when there's text content at index 0
+	if len(events) > 0 {
+		_ = hasTextContent // Used for index adjustment above
+		stopReason := "end_turn"
+		if hasToolUse {
+			stopReason = "tool_use"
+		}
+		events = append(events, SSEEvent{
+			Event: "message_delta",
+			Data: map[string]interface{}{
+				"type": "message_delta",
+				"delta": map[string]interface{}{
+					"stop_reason":   stopReason,
+					"stop_sequence": nil,
+				},
+				"usage": map[string]interface{}{"output_tokens": 0},
+			},
+		})
 	}
 
 	return events
 }
 
-func convertAssistantEventToSSE(evt assistantResponseEvent) SSEEvent {
+func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices map[string]int, nextToolIndex *int) SSEEvent {
 	if evt.Content != "" {
 		return SSEEvent{
 			Event: "content_block_delta",
@@ -106,13 +133,21 @@ func convertAssistantEventToSSE(evt assistantResponseEvent) SSEEvent {
 			},
 		}
 	} else if evt.ToolUseId != "" && evt.Name != "" && !evt.Stop {
+		// Get or assign index for this tool
+		toolIndex, exists := toolIndices[evt.ToolUseId]
+		if !exists {
+			toolIndex = *nextToolIndex
+			toolIndices[evt.ToolUseId] = toolIndex
+			*nextToolIndex++
+		}
 
 		if evt.Input == nil {
+			// First event for this tool - content_block_start
 			return SSEEvent{
 				Event: "content_block_start",
 				Data: map[string]interface{}{
 					"type":  "content_block_start",
-					"index": 1,
+					"index": toolIndex,
 					"content_block": map[string]interface{}{
 						"type":  "tool_use",
 						"id":    evt.ToolUseId,
@@ -122,27 +157,30 @@ func convertAssistantEventToSSE(evt assistantResponseEvent) SSEEvent {
 				},
 			}
 		} else {
+			// Subsequent events - input_json_delta
 			return SSEEvent{
 				Event: "content_block_delta",
 				Data: map[string]interface{}{
 					"type":  "content_block_delta",
-					"index": 1,
+					"index": toolIndex,
 					"delta": map[string]interface{}{
 						"type":         "input_json_delta",
-						"id":           evt.ToolUseId,
-						"name":         evt.Name,
-						"partial_json": evt.Input,
+						"partial_json": *evt.Input,
 					},
 				},
 			}
 		}
-
-	} else if evt.Stop {
+	} else if evt.Stop && evt.ToolUseId != "" {
+		// Tool stop event
+		toolIndex, exists := toolIndices[evt.ToolUseId]
+		if !exists {
+			toolIndex = 0 // Fallback, shouldn't happen
+		}
 		return SSEEvent{
 			Event: "content_block_stop",
 			Data: map[string]interface{}{
 				"type":  "content_block_stop",
-				"index": 1,
+				"index": toolIndex,
 			},
 		}
 	}

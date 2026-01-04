@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 )
 
@@ -246,6 +247,7 @@ type Logger struct {
 	requestCount      uint64         // Counter for generating unique request IDs
 	seqNumMap         map[string]int // Maps session ID to current sequential number
 	attachmentCounter AttachmentCounter
+	attachmentStore   *attachments.Store // Store for deduplicating attachments
 }
 
 // NewLogger creates a new logger with a maximum number of entries
@@ -264,11 +266,37 @@ func (l *Logger) SetProgram(p *tea.Program) {
 	l.program = p
 }
 
+// SetAttachmentStore sets the attachment store for deduplication
+func (l *Logger) SetAttachmentStore(store *attachments.Store) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.attachmentStore = store
+}
+
 // GetProgram returns the Bubble Tea program reference
 func (l *Logger) GetProgram() *tea.Program {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.program
+}
+
+// DeduplicateBody processes a body string and replaces base64 attachments with references
+// This can be called from main.go to deduplicate request bodies before logging
+func (l *Logger) DeduplicateBody(body string) string {
+	l.mu.RLock()
+	store := l.attachmentStore
+	l.mu.RUnlock()
+
+	if store == nil {
+		return body // No store configured, return as-is
+	}
+
+	// Use extractAndSaveAttachments logic with current timestamp
+	processed, err := l.extractAndSaveAttachments(body, time.Now())
+	if err != nil {
+		return body // On error, return original
+	}
+	return processed
 }
 
 // EnableFileLogging enables writing logs to a file
@@ -418,6 +446,100 @@ var (
 // extractAndSaveAttachments extracts base64 attachments from body and saves them to separate files
 // Returns the body with base64 replaced by file references
 func (l *Logger) extractAndSaveAttachments(body string, timestamp time.Time) (string, error) {
+	const minBase64Size = 1024 // 1KB - only extract attachments larger than this
+
+	// If no attachment store is configured, fall back to old behavior
+	if l.attachmentStore == nil {
+		return l.extractAndSaveAttachmentsLegacy(body, timestamp)
+	}
+
+	// Extract media types from the JSON for context
+	mediaTypes := make(map[int]string) // position -> media type
+	for _, match := range mediaTypePattern.FindAllStringSubmatchIndex(body, -1) {
+		if len(match) >= 4 {
+			pos := match[0]
+			mediaType := body[match[2]:match[3]]
+			mediaTypes[pos] = mediaType
+		}
+	}
+
+	// Find the closest media type before a given position
+	findMediaType := func(pos int) string {
+		bestPos := -1
+		bestType := ""
+		for mPos, mType := range mediaTypes {
+			// Look for media type within 500 chars before the base64
+			if mPos < pos && pos-mPos < 500 && mPos > bestPos {
+				bestPos = mPos
+				bestType = mType
+			}
+		}
+		return bestType
+	}
+
+	// Replace base64 fields with attachment references
+	result := base64FieldPattern.ReplaceAllStringFunc(body, func(match string) string {
+		// Extract the parts
+		parts := base64FieldPattern.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match // Shouldn't happen, but be safe
+		}
+
+		fieldPrefix := parts[1] // e.g., "data": "
+		base64Content := parts[2]
+		fieldSuffix := parts[3] // closing "
+
+		// Only process if larger than minBase64Size
+		if len(base64Content) < minBase64Size {
+			return match
+		}
+
+		// Try to determine media type
+		mediaType := "binary"
+		matchPos := strings.Index(body, match)
+		if matchPos >= 0 {
+			if nearbyType := findMediaType(matchPos); nearbyType != "" {
+				mediaType = nearbyType
+			}
+		}
+
+		// Try to decode a sample to verify it's valid base64
+		sampleSize := 100
+		if len(base64Content) < sampleSize {
+			sampleSize = len(base64Content)
+		}
+		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
+			// Not valid base64, keep original
+			return match
+		}
+
+		// Decode the full base64 content
+		decodedData, err := base64.StdEncoding.DecodeString(base64Content)
+		if err != nil {
+			// Failed to decode, keep original
+			return match
+		}
+
+		// Save to attachment store (with automatic deduplication)
+		hash, _, err := l.attachmentStore.Save(decodedData, mediaType)
+		if err != nil {
+			// Failed to save, keep original
+			return match
+		}
+
+		// Create attachment reference: @attachment:sha256:{first12}:{size}:{mediaType}
+		sizeStr := config.FormatBytes(int64(len(decodedData)))
+		hashPrefix := hash[:12] // Use first 12 chars of hash
+		reference := fmt.Sprintf("@attachment:sha256:%s:%s:%s", hashPrefix, sizeStr, mediaType)
+
+		return fieldPrefix + reference + fieldSuffix
+	})
+
+	return result, nil
+}
+
+// extractAndSaveAttachmentsLegacy is the old implementation for backward compatibility
+func (l *Logger) extractAndSaveAttachmentsLegacy(body string, timestamp time.Time) (string, error) {
 	const minBase64Size = 1024 // 1KB - only extract attachments larger than this
 
 	// Get home directory for attachment storage
@@ -899,8 +1021,8 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 	typeStr := matches[2]
 	details := matches[3]
 
-	// Parse timestamp
-	timestamp, err := time.Parse("2006-01-02 15:04:05.000", timestampStr)
+	// Parse timestamp in local timezone (logs are written in local time)
+	timestamp, err := time.ParseInLocation("2006-01-02 15:04:05.000", timestampStr, time.Local)
 	if err != nil {
 		return LogEntry{}, false
 	}

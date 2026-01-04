@@ -2976,7 +2976,7 @@ func openInEditor(content string, viewMode ViewMode) tea.Cmd {
 
 		// Create temp file
 		tmpDir := os.TempDir()
-		tmpFile := filepath.Join(tmpDir, fmt.Sprintf("kiro2cc-export-%d%s", time.Now().UnixNano(), ext))
+		tmpFile := filepath.Join(tmpDir, fmt.Sprintf("claude2kiro-export-%d%s", time.Now().UnixNano(), ext))
 
 		if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
 			return EditorResultMsg{Success: false, Error: err}

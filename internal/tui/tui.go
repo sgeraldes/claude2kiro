@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -49,6 +50,7 @@ type Model struct {
 	height             int
 	commands           Commands
 	logger             *logger.Logger
+	attachmentStore    *attachments.Store
 	program            *tea.Program
 	serverRunning      bool
 	serverPort         string
@@ -59,6 +61,17 @@ type Model struct {
 func NewRootModel(cmds Commands) Model {
 	cfg := config.Get()
 	lg := logger.NewLogger(cfg.Logging.MaxEntries)
+
+	// Create attachment store for deduplication
+	var attachStore *attachments.Store
+	if cfg.Logging.AttachmentMode == "separate" {
+		logDir := config.ExpandPath(cfg.Logging.Directory)
+		attachDir := filepath.Join(filepath.Dir(logDir), "attachments")
+		if store, err := attachments.NewStore(attachDir); err == nil {
+			attachStore = store
+			lg.SetAttachmentStore(store)
+		}
+	}
 
 	// Enable file logging if configured
 	if cfg.Logging.Enabled {
@@ -123,12 +136,13 @@ func NewRootModel(cmds Commands) Model {
 	}
 
 	return Model{
-		state:      initialState,
-		menu:       menu.New(80, 24),
-		dashboard:  dashboard.New(port, tokenExpiry, lg, refreshFn, isExpiredFn),
-		commands:   cmds,
-		logger:     lg,
-		serverPort: port,
+		state:           initialState,
+		menu:            menu.New(80, 24),
+		dashboard:       dashboard.New(port, tokenExpiry, lg, attachStore, refreshFn, isExpiredFn),
+		commands:        cmds,
+		logger:          lg,
+		attachmentStore: attachStore,
+		serverPort:      port,
 	}
 }
 
@@ -157,7 +171,7 @@ func (m *Model) createDashboard(port string, tokenExpiry time.Time) dashboard.Mo
 		isExpiredFn = m.commands.IsTokenExpired
 	}
 
-	return dashboard.New(port, tokenExpiry, m.logger, refreshFn, isExpiredFn)
+	return dashboard.New(port, tokenExpiry, m.logger, m.attachmentStore, refreshFn, isExpiredFn)
 }
 
 // Init initializes the model
