@@ -766,6 +766,17 @@ func (m Model) View() string {
 	// Stats panel (memory/disk usage) - render as a box next to status
 	statsPanel := m.renderStatsPanel()
 
+	// Ensure both panels have the same height
+	statusHeight := lipgloss.Height(statusPanel)
+	statsHeight := lipgloss.Height(statsPanel)
+	if statusHeight > statsHeight {
+		// Pad stats panel to match status panel height
+		statsPanel = lipgloss.NewStyle().Height(statusHeight).Render(statsPanel)
+	} else if statsHeight > statusHeight {
+		// Pad status panel to match stats panel height
+		statusPanel = lipgloss.NewStyle().Height(statsHeight).Render(statusPanel)
+	}
+
 	// Calculate remaining width for session stats panel
 	statusWidth := lipgloss.Width(statusPanel)
 	statsWidth := lipgloss.Width(statsPanel)

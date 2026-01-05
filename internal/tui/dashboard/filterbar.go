@@ -62,6 +62,18 @@ func NewFilterBarModel() FilterBarModel {
 	cfg := config.Get()
 	afterDate := cfg.Filter.ClearAfter
 
+	// Clear afterDate if it's from a previous day (prevents filtering out historical logs)
+	if !afterDate.IsZero() {
+		today := time.Now().Truncate(24 * time.Hour)
+		filterDay := afterDate.Truncate(24 * time.Hour)
+		if filterDay.Before(today) {
+			// Filter is from a previous day - clear it
+			afterDate = time.Time{}
+			cfg.Filter.ClearAfter = afterDate
+			cfg.Save()
+		}
+	}
+
 	// Load type filters with defaults
 	showReq := true
 	showRes := true
