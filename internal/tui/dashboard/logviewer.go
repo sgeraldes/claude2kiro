@@ -329,9 +329,10 @@ func (m LogViewerModel) Update(msg tea.Msg) (LogViewerModel, tea.Cmd) {
 		if m.selectedSession == 0 || msg.Entry.SessionID == m.sessions[m.selectedSession] {
 			if m.selectedIndex == len(m.entries)-2 || len(m.entries) == 1 {
 				m.selectedIndex = len(m.entries) - 1
-				m.ensureVisible()
 			}
 		}
+		// Always ensure visible to prevent visual shifting when filtered
+		m.ensureVisible()
 		m.updateDetailContent()
 
 	case tea.KeyMsg:
@@ -353,8 +354,13 @@ func (m LogViewerModel) Update(msg tea.Msg) (LogViewerModel, tea.Cmd) {
 						m.selectedSession = len(m.sessions) - 1
 					}
 					m.applySessionFilter()
-					m.selectedIndex = 0
-					m.listOffset = 0
+					// Select last entry instead of first when switching sessions
+					if len(m.entries) > 0 {
+						m.selectedIndex = len(m.entries) - 1
+					} else {
+						m.selectedIndex = 0
+					}
+					m.ensureVisible()
 					m.updateDetailContent()
 				}
 
@@ -363,8 +369,13 @@ func (m LogViewerModel) Update(msg tea.Msg) (LogViewerModel, tea.Cmd) {
 				if m.panelFocus == FocusList && len(m.sessions) > 1 {
 					m.selectedSession = (m.selectedSession + 1) % len(m.sessions)
 					m.applySessionFilter()
-					m.selectedIndex = 0
-					m.listOffset = 0
+					// Select last entry instead of first when switching sessions
+					if len(m.entries) > 0 {
+						m.selectedIndex = len(m.entries) - 1
+					} else {
+						m.selectedIndex = 0
+					}
+					m.ensureVisible()
 					m.updateDetailContent()
 				}
 
