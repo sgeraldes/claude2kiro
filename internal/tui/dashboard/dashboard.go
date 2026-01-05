@@ -856,22 +856,20 @@ func (m Model) renderHelpText() string {
 		}
 	} else if m.logViewer.IsFocused() {
 		if m.logViewer.GetPanelFocus() == FocusDetail {
-			// Detail view focused
+			// Detail view focused - condensed
 			parts = []string{
 				"↑/↓ scroll",
-				"pgup/pgdn page",
 				"tab to list",
-				"v view mode",
+				"v view",
 				"e expand",
 				"y copy",
-				"o open",
 			}
 		} else {
-			// Log list focused
+			// Log list focused - condensed
 			parts = []string{
 				"↑/↓ navigate",
 				"r/R req↔res",
-				"tab to detail",
+				"tab detail",
 				"s/S session",
 				"c clear",
 				"v view",
@@ -886,19 +884,15 @@ func (m Model) renderHelpText() string {
 			"↑/↓ navigate",
 			"tab switch",
 			"/ search",
-			"p settings",
 		}
 	}
 
-	// Add global keys
+	// Add global keys - condensed
 	globalParts := []string{
+		accentStyle.Render("a attachments"),
 		accentStyle.Render("q quit"),
 		accentStyle.Render("p settings"),
-		accentStyle.Render("b bypass mode"),
-	}
-	// Add attachments key if store is available
-	if m.attachmentStore != nil && !m.showAttachments {
-		globalParts = append([]string{accentStyle.Render("a attachments")}, globalParts...)
+		accentStyle.Render("b bypass"),
 	}
 
 	allParts := append(parts, globalParts...)
@@ -914,11 +908,8 @@ func (m Model) renderStatsPanel() string {
 	var lines []string
 	cfg := config.Get()
 
-	// Header with version on same line, right-aligned
-	headerText := "System Stats"
-	versionText := "v" + Version
-	headerLine := headerStyle.Render(headerText) + strings.Repeat(" ", 20) + lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render(versionText)
-	lines = append(lines, headerLine)
+	// Header
+	lines = append(lines, headerStyle.Render("System Stats"))
 
 	// Get memory usage from logger
 	if m.logger != nil {
@@ -1177,28 +1168,20 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 	tokenInfo := getTokenInfo()
 	claudeConfig := getClaudeConfigStatus()
 
-	// Add mode indicator line at the top (centered)
-	if isBypass {
-		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true)
-		statusLines = append(statusLines, modeStyle.Render(">>> BYPASS <<<")+"\n")
-	} else if isCompare {
-		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFB86C")).Bold(true)
-		statusLines = append(statusLines, modeStyle.Render(">>> COMPARE <<<")+"\n")
-	}
-
 	// Only use model cache as fallback when file data is missing
 	// Fresh file data takes priority over potentially stale model cache
 	if tokenInfo.ExpiresAt.IsZero() && !tokenExpiry.IsZero() {
 		tokenInfo.ExpiresAt = tokenExpiry
 	}
 
-	// Server status
+	// Server status with version on same line
+	versionText := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render("v" + Version)
 	if serverRunning {
 		statusLines = append(statusLines,
-			labelStyle.Render("Server: ")+okStyle.Render("✓ Running on port ")+valueStyle.Render(serverPort))
+			labelStyle.Render("Server: ")+okStyle.Render("✓ Running on port ")+valueStyle.Render(serverPort)+"  "+versionText)
 	} else {
 		statusLines = append(statusLines,
-			labelStyle.Render("Server: ")+errStyle.Render("✗ Not running"))
+			labelStyle.Render("Server: ")+errStyle.Render("✗ Not running")+"  "+versionText)
 	}
 
 	// Token/Credentials status
@@ -1353,6 +1336,15 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 		// Show loading if logged in but credits not yet fetched
 		statusLines = append(statusLines,
 			labelStyle.Render("Credits: ")+labelStyle.Render("Loading..."))
+	}
+
+	// Add mode indicator at the bottom (no extra spacing)
+	if isBypass {
+		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true)
+		statusLines = append(statusLines, modeStyle.Render(">>> BYPASS <<<"))
+	} else if isCompare {
+		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFB86C")).Bold(true)
+		statusLines = append(statusLines, modeStyle.Render(">>> COMPARE <<<"))
 	}
 
 	// Determine border color - mode overrides normal status colors
