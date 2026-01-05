@@ -28,6 +28,7 @@ const (
 	LogTypeRes
 	LogTypeErr
 	LogTypeInf
+	LogTypeCmp
 )
 
 // String returns a short string representation of the log type
@@ -41,6 +42,8 @@ func (t LogType) String() string {
 		return "ERR"
 	case LogTypeInf:
 		return "INF"
+	case LogTypeCmp:
+		return "CMP"
 	default:
 		return "???"
 	}
@@ -96,6 +99,7 @@ var (
 	colorRes     = lipgloss.Color("#04B575") // Green
 	colorErr     = lipgloss.Color("#FF5555") // Red
 	colorInf     = lipgloss.Color("#626262") // Gray
+	colorCmp     = lipgloss.Color("#FFB86C") // Orange (for comparison mode)
 	colorTime    = lipgloss.Color("#626262") // Gray
 	colorPreview = lipgloss.Color("#A0A0A0") // Light gray
 )
@@ -113,6 +117,8 @@ func (e LogEntry) Format(maxWidth int) string {
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorRes)
 	case LogTypeErr:
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorErr)
+	case LogTypeCmp:
+		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorCmp)
 	default:
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorInf)
 	}
@@ -120,9 +126,9 @@ func (e LogEntry) Format(maxWidth int) string {
 	timeStyle := lipgloss.NewStyle().Foreground(colorTime)
 	previewStyle := lipgloss.NewStyle().Foreground(colorPreview)
 
-	// Build session/request ID prefix for requests and responses
+	// Build session/request ID prefix for requests, responses, and comparisons
 	var idPrefix string
-	if (e.Type == LogTypeReq || e.Type == LogTypeRes) && (e.SessionID != "" || e.RequestID != "") {
+	if (e.Type == LogTypeReq || e.Type == LogTypeRes || e.Type == LogTypeCmp) && (e.SessionID != "" || e.RequestID != "") {
 		idStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
 		if e.SessionID != "" && e.RequestID != "" {
 			idPrefix = idStyle.Render(fmt.Sprintf("[%s:%s] ", e.SessionID, e.RequestID))
@@ -142,6 +148,8 @@ func (e LogEntry) Format(maxWidth int) string {
 		details = fmt.Sprintf("%s%s %s %s", idPrefix, model, e.Method, e.Path)
 	case LogTypeRes:
 		details = fmt.Sprintf("%s%d %s (%v)", idPrefix, e.Status, e.Path, e.Duration.Round(time.Millisecond))
+	case LogTypeCmp:
+		details = idPrefix + e.Preview
 	case LogTypeErr:
 		details = e.Preview
 	default:
@@ -179,9 +187,9 @@ func (e LogEntry) Format(maxWidth int) string {
 func (e LogEntry) FormatPlain() string {
 	timestamp := e.Timestamp.Format("2006-01-02 15:04:05.000")
 
-	// Build ID prefix for requests and responses
+	// Build ID prefix for requests, responses, and comparisons
 	var idPrefix string
-	if (e.Type == LogTypeReq || e.Type == LogTypeRes) && (e.SessionID != "" || e.RequestID != "") {
+	if (e.Type == LogTypeReq || e.Type == LogTypeRes || e.Type == LogTypeCmp) && (e.SessionID != "" || e.RequestID != "") {
 		if e.SessionID != "" && e.RequestID != "" {
 			idPrefix = fmt.Sprintf("[%s:%s] ", e.SessionID, e.RequestID)
 		} else if e.RequestID != "" {
@@ -195,6 +203,8 @@ func (e LogEntry) FormatPlain() string {
 		details = fmt.Sprintf("%s%s %s %s", idPrefix, e.Model, e.Method, e.Path)
 	case LogTypeRes:
 		details = fmt.Sprintf("%s%d %s (%v)", idPrefix, e.Status, e.Path, e.Duration.Round(time.Millisecond))
+	case LogTypeCmp:
+		details = idPrefix + e.Preview
 	default:
 		details = e.Preview
 	}
@@ -879,6 +889,26 @@ func (l *Logger) LogResponse(status int, path string, duration time.Duration, re
 	})
 }
 
+// LogResponseWithBody is like LogResponse but with separate preview and full body
+// This allows proper parsing of responses where the preview (human-readable text) differs from the raw body (SSE/JSON)
+func (l *Logger) LogResponseWithBody(status int, path string, duration time.Duration, preview, body, sessionID, fullUUID, requestID string, seqNum int) {
+	cfg := config.Get()
+	l.Log(LogEntry{
+		Timestamp: time.Now(),
+		Type:      LogTypeRes,
+		Status:    status,
+		Path:      path,
+		Duration:  duration,
+		Preview:   sanitizePreview(preview, cfg.Logging.PreviewLength),
+		Body:      body,
+		SessionID: sessionID,
+		FullUUID:  fullUUID,
+		RequestID: requestID,
+		BodySize:  len(body),
+		SeqNum:    seqNum,
+	})
+}
+
 // LogError is a convenience method for logging errors
 func (l *Logger) LogError(message string) {
 	cfg := config.Get()
@@ -898,6 +928,20 @@ func (l *Logger) LogInfo(message string) {
 		Type:      LogTypeInf,
 		Preview:   sanitizePreview(message, cfg.Logging.PreviewLength),
 		Body:      message,
+	})
+}
+
+// LogComparison is a convenience method for logging comparison mode messages
+// sessionID and requestID are used for correlation with the request/response
+func (l *Logger) LogComparison(sessionID, requestID, message string) {
+	cfg := config.Get()
+	l.Log(LogEntry{
+		Timestamp: time.Now(),
+		Type:      LogTypeCmp,
+		Preview:   sanitizePreview(message, cfg.Logging.PreviewLength),
+		Body:      message,
+		SessionID: sessionID,
+		RequestID: requestID,
 	})
 }
 
@@ -1038,6 +1082,8 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 		logType = LogTypeErr
 	case "INF":
 		logType = LogTypeInf
+	case "CMP":
+		logType = LogTypeCmp
 	default:
 		return LogEntry{}, false
 	}
@@ -1075,6 +1121,8 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 		parseRequestDetails(&entry, mainDetails)
 	case LogTypeRes:
 		parseResponseDetails(&entry, mainDetails)
+	case LogTypeCmp:
+		parseComparisonDetails(&entry, mainDetails)
 	case LogTypeErr, LogTypeInf:
 		entry.Preview = mainDetails
 		entry.Body = mainDetails
@@ -1156,6 +1204,29 @@ func parseResponseDetails(entry *LogEntry, details string) {
 		entry.Path = matches[2]
 		entry.Duration, _ = time.ParseDuration(matches[3])
 	}
+}
+
+// parseComparisonDetails parses comparison-specific details
+func parseComparisonDetails(entry *LogEntry, details string) {
+	remaining := details
+
+	// Check for [session:reqid] or [reqid] prefix
+	if matches := sessionReqPattern.FindStringSubmatch(remaining); matches != nil {
+		entry.SessionID = matches[1]
+		entry.RequestID = matches[2]
+		// Derive SeqNum from RequestID for display
+		entry.SeqNum = deriveSeqNumFromRequestID(entry.RequestID)
+		remaining = matches[3]
+	} else if matches := reqOnlyPattern.FindStringSubmatch(remaining); matches != nil {
+		entry.RequestID = matches[1]
+		// Derive SeqNum from RequestID for display
+		entry.SeqNum = deriveSeqNumFromRequestID(entry.RequestID)
+		remaining = matches[2]
+	}
+
+	// The rest is the message
+	entry.Preview = remaining
+	entry.Body = remaining
 }
 
 // GetUniqueSessions returns a list of unique session IDs from the log entries

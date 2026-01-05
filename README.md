@@ -157,10 +157,17 @@ Launches the interactive Terminal UI with:
 - `/` or `s` - Jump to search filter
 - `1-4` - Toggle type filters (req/res/inf/err)
 - `x` - Clear "after date" filter
+- `b` - Toggle bypass mode (Anthropic Direct)
+- `d` - Toggle debug mode
 - `ctrl+o` - Open Claude Code with current session
 - `p` - Open settings panel
 - `u` - Open Kiro usage page in browser
 - `q` - Back to menu
+
+**Mode Indicators:** The left status panel shows the current mode with colored borders:
+- **GREEN** border + "NORMAL" - Standard Kiro proxy mode
+- **RED** border + ">>> BYPASS <<<" - Anthropic Direct mode (bypasses Kiro)
+- **ORANGE** border + ">>> COMPARE <<<" - Comparison mode (sends to both)
 
 #### Login (Browser-based Authentication)
 
@@ -432,27 +439,92 @@ advanced:
 
 ### Anthropic Direct Mode
 
-Bypass Kiro entirely and forward requests directly to Anthropic's API. When enabled, Claude2Kiro acts as a transparent proxy that forwards Claude Code's OAuth credentials unchanged:
+Bypass Kiro entirely and forward requests directly to Anthropic's API:
 
 ```yaml
 advanced:
   anthropic_direct: true
 ```
 
-This is useful when you want to use Anthropic directly (with your Claude Code subscription) while still being able to monitor requests through the dashboard.
+**How it works:**
+- Claude2Kiro acts as a transparent proxy that forwards requests to `api.anthropic.com`
+- **OAuth forwarding is automatic** - the proxy forwards Claude Code's `Authorization` header unchanged
+- **No API key required** - Claude Code's built-in OAuth authentication is used by default
+- All requests and responses are still logged in the dashboard for monitoring
+
+**Setting an API key (optional):**
+
+If you want to use your own Anthropic API key instead of Claude Code's OAuth:
+
+```bash
+# Export your API key
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Then run Claude Code
+claude
+```
+
+The proxy will use whichever authentication method Claude Code provides (OAuth or API key).
+
+**Use cases:**
+- Monitor Claude Code's Anthropic API usage through the dashboard
+- Debug request/response formatting issues
+- Switch between Kiro and Anthropic subscriptions without reconfiguring Claude Code
+- Use your own API key for cost tracking or quota management
 
 ### Comparison Mode (Debug)
 
-Send requests to both Anthropic and Kiro simultaneously for debugging:
+Send identical requests to both Anthropic and Kiro simultaneously for debugging and validation:
 
 ```yaml
 advanced:
   comparison_mode: true
 ```
 
-- Returns Kiro's response to Claude Code (normal behavior)
-- Saves Anthropic's response to `%TEMP%/claude2kiro-debug/comparison-*.json`
-- Useful for comparing translation accuracy between the two backends
+**How it works:**
+- Returns **Kiro's response** to Claude Code (normal behavior)
+- Sends a parallel request to Anthropic in the background
+- Saves **both** responses to debug files for comparison
+- Logs comparison progress with `[CMP]` tag and request IDs
+
+**Debug file naming:**
+
+Both responses are saved with matching request IDs for easy correlation:
+
+```
+%TEMP%/claude2kiro-debug/
+├── comparison-20260104-153045-00000e-anthropic.json
+└── comparison-20260104-153045-00000e-kiro.sse
+```
+
+Format: `comparison-{timestamp}-{requestID}-{backend}.{ext}`
+
+**File contents:**
+- `*-anthropic.json`: Raw Server-Sent Events (SSE) from Anthropic's API
+- `*-kiro.sse`: Translated SSE events sent to Claude Code (after parsing AWS binary format)
+
+**Log output:**
+
+Comparison mode adds `[CMP]` entries to the dashboard and console:
+
+```
+[CMP] [ac884c33:00000e] Sending parallel request to Anthropic
+[CMP] [ac884c33:00000e] Anthropic: preview="Hello! How can I help..." (1247 bytes) -> comparison-...-anthropic.json
+```
+
+The request ID (`00000e`) matches the filename, making it easy to correlate:
+
+1. View request details in dashboard (filter by request ID)
+2. Find matching debug files in `%TEMP%/claude2kiro-debug/`
+3. Compare Anthropic vs Kiro responses side-by-side
+
+**Use cases:**
+- Validate that Kiro's responses match Anthropic's responses
+- Debug translation accuracy between AWS binary format and Anthropic SSE format
+- Identify differences in model behavior between backends
+- Test new model mappings before updating production code
+
+**Performance note:** Comparison mode doubles your API usage (both Kiro and Anthropic credits are consumed). Use only for debugging.
 
 ### Attachment Mode Options
 

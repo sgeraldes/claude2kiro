@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -177,6 +179,12 @@ type AnthropicRequest struct {
 	Stream      bool                      `json:"stream"`
 	Temperature *float64                  `json:"temperature,omitempty"`
 	Metadata    map[string]any            `json:"metadata,omitempty"`
+}
+
+// CapturedSSEEvent represents a captured SSE event for comparison mode
+type CapturedSSEEvent struct {
+	Event string `json:"event"`
+	Data  string `json:"data"`
 }
 
 // AnthropicStreamResponse represents the Anthropic streaming response structure
@@ -849,11 +857,106 @@ func extractSessionID(metadata map[string]any) (string, string) {
 	}
 	return userID, ""
 }
+
+// decompressResponse handles gzip/deflate decompression for non-streaming responses
+func decompressResponse(resp *http.Response) ([]byte, error) {
+	encoding := resp.Header.Get("Content-Encoding")
+	var reader io.Reader = resp.Body
+
+	switch encoding {
+	case "gzip":
+		gzipReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("gzip init failed: %w", err)
+		}
+		defer gzipReader.Close()
+		reader = gzipReader
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+	case "deflate":
+		flateReader := flate.NewReader(resp.Body)
+		defer flateReader.Close()
+		reader = flateReader
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+	case "":
+		// No encoding
+	default:
+		return nil, fmt.Errorf("unsupported Content-Encoding: %s", encoding)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(reader, 100*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("read/decompress failed: %w", err)
+	}
+	return data, nil
+}
+
+// AnthropicSSEEvent represents a parsed SSE event from Anthropic API
+type AnthropicSSEEvent struct {
+	Type string
+	Data map[string]interface{}
+}
+
+// parseAnthropicSSE parses Anthropic SSE response into structured events
+func parseAnthropicSSE(body []byte) []AnthropicSSEEvent {
+	var events []AnthropicSSEEvent
+	lines := strings.Split(string(body), "\n")
+	var currentEvent, currentData string
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "event: ") {
+			currentEvent = strings.TrimPrefix(line, "event: ")
+		} else if strings.HasPrefix(line, "data: ") {
+			currentData = strings.TrimPrefix(line, "data: ")
+		} else if line == "" && currentEvent != "" && currentData != "" {
+			var data map[string]interface{}
+			if json.Unmarshal([]byte(currentData), &data) == nil {
+				events = append(events, AnthropicSSEEvent{Type: currentEvent, Data: data})
+			}
+			currentEvent, currentData = "", ""
+		}
+	}
+	return events
+}
+
 // forwardToAnthropic forwards a request directly to Anthropic API as a TRUE bypass proxy
+// extractAnthropicTextPreview extracts the first N characters of text from an Anthropic SSE response
+func extractAnthropicTextPreview(sseResponse string, maxLen int) string {
+	// Parse SSE format looking for content_block_delta events with text
+	lines := strings.Split(sseResponse, "\n")
+	var textParts []string
+
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		// Look for event: content_block_delta
+		if strings.HasPrefix(line, "event: content_block_delta") {
+			// Next line should be "data: {...}"
+			if i+1 < len(lines) && strings.HasPrefix(lines[i+1], "data: ") {
+				dataJSON := strings.TrimPrefix(lines[i+1], "data: ")
+				var data map[string]interface{}
+				if err := jsonStr.Unmarshal([]byte(dataJSON), &data); err == nil {
+					if delta, ok := data["delta"].(map[string]interface{}); ok {
+						if text, ok := delta["text"].(string); ok {
+							textParts = append(textParts, text)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fullText := strings.Join(textParts, "")
+	if len(fullText) > maxLen {
+		return fullText[:maxLen] + "..."
+	}
+	if fullText == "" {
+		return "[no text content]"
+	}
+	return fullText
+}
 // Copies ALL headers from the original request unchanged
 func forwardToAnthropic(originalReq *http.Request, body []byte, lg *logger.Logger) (*http.Response, error) {
-	cfg := config.Get()
-
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -873,20 +976,14 @@ func forwardToAnthropic(originalReq *http.Request, body []byte, lg *logger.Logge
 		}
 	}
 
-	// Log forwarding status
-	lg.LogInfo(fmt.Sprintf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v",
-		originalReq.Header.Get("x-api-key") != "",
-		originalReq.Header.Get("Authorization") != ""))
-
-	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	// No timeout for streaming requests - SSE streams can run for minutes
+	client := &http.Client{}
 	return client.Do(req)
 }
 
 // forwardToAnthropicWithHeaders forwards a request to Anthropic API using pre-copied headers
 // Used by comparison mode goroutines to avoid race conditions with request reuse
 func forwardToAnthropicWithHeaders(headers http.Header, body []byte, lg *logger.Logger) (*http.Response, error) {
-	cfg := config.Get()
-
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -906,19 +1003,14 @@ func forwardToAnthropicWithHeaders(headers http.Header, body []byte, lg *logger.
 		}
 	}
 
-	lg.LogInfo(fmt.Sprintf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v",
-		headers.Get("x-api-key") != "",
-		headers.Get("Authorization") != ""))
-
-	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	// No timeout for streaming requests - SSE streams can run for minutes
+	client := &http.Client{}
 	return client.Do(req)
 }
 
 // forwardToAnthropicHeadless forwards a request to Anthropic API as a TRUE bypass proxy (headless/CLI version)
 // Copies ALL headers from the original request unchanged
 func forwardToAnthropicHeadless(originalReq *http.Request, body []byte) (*http.Response, error) {
-	cfg := config.Get()
-
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -938,19 +1030,14 @@ func forwardToAnthropicHeadless(originalReq *http.Request, body []byte) (*http.R
 		}
 	}
 
-	fmt.Printf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v\n",
-		originalReq.Header.Get("x-api-key") != "",
-		originalReq.Header.Get("Authorization") != "")
-
-	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	// No timeout for streaming requests - SSE streams can run for minutes
+	client := &http.Client{}
 	return client.Do(req)
 }
 
 // forwardToAnthropicHeadlessWithHeaders forwards a request to Anthropic API using pre-copied headers (CLI version)
 // Used by comparison mode goroutines to avoid race conditions with request reuse
 func forwardToAnthropicHeadlessWithHeaders(headers http.Header, body []byte) (*http.Response, error) {
-	cfg := config.Get()
-
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -970,11 +1057,8 @@ func forwardToAnthropicHeadlessWithHeaders(headers http.Header, body []byte) (*h
 		}
 	}
 
-	fmt.Printf("[ANTHROPIC] Forwarding with headers: x-api-key=%v, Authorization=%v\n",
-		headers.Get("x-api-key") != "",
-		headers.Get("Authorization") != "")
-
-	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	// No timeout for streaming requests - SSE streams can run for minutes
+	client := &http.Client{}
 	return client.Do(req)
 }
 
@@ -1066,7 +1150,6 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 
 		if cfg.Advanced.AnthropicDirect {
 			// Anthropic Direct Mode: forward request unchanged to Anthropic
-			lg.LogInfo("[ANTHROPIC DIRECT] Forwarding request to Anthropic API")
 			resp, err := forwardToAnthropic(r, body, lg)
 			if err != nil {
 				lg.LogError(fmt.Sprintf("[ANTHROPIC DIRECT] Forward failed: %v", err))
@@ -1083,85 +1166,125 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 
 			// Check if this is a streaming response (SSE)
 			if resp.Header.Get("Content-Type") == "text/event-stream" {
-				// Stream through - flush after each write
-				flusher, ok := w.(http.Flusher)
-				if !ok {
-					lg.LogError("[ANTHROPIC DIRECT] ResponseWriter doesn't support flushing")
-					io.Copy(w, resp.Body)
-				} else {
-					// Stream SSE events through
-					buf := make([]byte, 4096)
-					for {
-						n, err := resp.Body.Read(buf)
-						if n > 0 {
-							w.Write(buf[:n])
-							flusher.Flush()
-						}
-						if err != nil {
-							break
+				// Read full response body to parse SSE events
+				respBody, err := io.ReadAll(resp.Body)
+				if err != nil {
+					lg.LogError(fmt.Sprintf("[ANTHROPIC DIRECT] Failed to read response: %v", err))
+					return
+				}
+
+				// Parse SSE events and extract text content for preview
+				events := parseAnthropicSSE(respBody)
+				var textParts []string
+				for _, evt := range events {
+					if evt.Type == "content_block_delta" {
+						if delta, ok := evt.Data["delta"].(map[string]interface{}); ok {
+							if text, ok := delta["text"].(string); ok {
+								textParts = append(textParts, text)
+							}
 						}
 					}
 				}
-				lg.LogResponse(resp.StatusCode, r.URL.Path, time.Since(startTime), "[ANTHROPIC] SSE stream completed", sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+
+				// Forward events to client
+				flusher, ok := w.(http.Flusher)
+				if ok {
+					w.Write(respBody)
+					flusher.Flush()
+				} else {
+					w.Write(respBody)
+				}
+
+				// Log with parsed text preview and full SSE body
+				preview := strings.Join(textParts, "")
+				if len(preview) > 80 {
+					preview = preview[:80] + "..."
+				}
+				if preview == "" {
+					preview = "[no text content]"
+				}
+				lg.LogResponseWithBody(resp.StatusCode, r.URL.Path, time.Since(startTime), preview, string(respBody), sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
 			} else {
-				// Non-streaming: read and write entire body
-				respBody, _ := io.ReadAll(resp.Body)
+				// Non-streaming: decompress and read entire body
+				respBody, err := decompressResponse(resp)
+				if err != nil {
+					lg.LogError(fmt.Sprintf("[ANTHROPIC DIRECT] Decompression failed: %v", err))
+					http.Error(w, "Failed to decompress response", http.StatusInternalServerError)
+					return
+				}
 				w.Write(respBody)
 
-				// Log response
+				// Log response with preview and full body
 				duration := time.Since(startTime)
 				preview := string(respBody)
 				if len(preview) > 200 {
 					preview = preview[:200] + "..."
 				}
-				lg.LogResponse(resp.StatusCode, r.URL.Path, duration, "[ANTHROPIC] "+preview, sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+				lg.LogResponseWithBody(resp.StatusCode, r.URL.Path, duration, preview, string(respBody), sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
 			}
 			return
 		}
 
+		// Comparison mode: shared timestamp for correlated saves
+		var comparisonTimestamp string
+
 		if cfg.Advanced.ComparisonMode {
+			// Generate shared timestamp for both Anthropic and Kiro saves
+			comparisonTimestamp = time.Now().Format("20060102-150405")
+
 			// Comparison Mode: send to both Anthropic and Kiro in parallel
 			// Copy headers before goroutine to avoid race condition (request may be reused)
 			headersCopy := make(http.Header)
 			for k, v := range r.Header {
 				headersCopy[k] = v
 			}
+			// Capture IDs for correlation
+			compSessionID := sessionID
+			compRequestID := reqResult.RequestID
 			// Anthropic request runs in background goroutine
-			go func(headers http.Header) {
-				lg.LogInfo("[COMPARISON] Sending parallel request to Anthropic")
+			go func(headers http.Header, sid, rid, ts string) {
+				lg.LogComparison(sid, rid, "Sending parallel request to Anthropic")
 				resp, err := forwardToAnthropicWithHeaders(headers, body, lg)
 				if err != nil {
-					lg.LogInfo(fmt.Sprintf("[COMPARISON] Anthropic error: %v", err))
+					lg.LogComparison(sid, rid, fmt.Sprintf("Anthropic error: %v", err))
 					return
 				}
 				defer resp.Body.Close()
 				respBody, err := io.ReadAll(resp.Body)
 				if err != nil {
-					lg.LogInfo(fmt.Sprintf("[COMPARISON] Failed to read Anthropic response: %v", err))
+					lg.LogComparison(sid, rid, fmt.Sprintf("Failed to read Anthropic response: %v", err))
 					return
 				}
 
-				// Save to debug file
+				// Extract text preview from SSE response
+				preview := extractAnthropicTextPreview(string(respBody), 80)
+
+				// Save to debug file with request ID in filename
 				debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
 				if err := os.MkdirAll(debugDir, 0700); err != nil {
-					lg.LogInfo(fmt.Sprintf("[COMPARISON] Failed to create debug dir: %v", err))
+					lg.LogComparison(sid, rid, fmt.Sprintf("Failed to create debug dir: %v", err))
 					return
 				}
-				timestamp := time.Now().Format("20060102-150405")
-				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-anthropic.json", timestamp))
+				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-%s-anthropic.json", ts, rid))
 				if err := os.WriteFile(debugFile, respBody, 0600); err != nil {
-					lg.LogInfo(fmt.Sprintf("[COMPARISON] Failed to save debug file: %v", err))
+					lg.LogComparison(sid, rid, fmt.Sprintf("Failed to save debug file: %v", err))
 					return
 				}
-				lg.LogInfo(fmt.Sprintf("[COMPARISON] Anthropic response saved: %s (%d bytes)", debugFile, len(respBody)))
-			}(headersCopy)
+				lg.LogComparison(sid, rid, fmt.Sprintf("Anthropic: preview=%q (%d bytes) -> %s", preview, len(respBody), debugFile))
+			}(headersCopy, compSessionID, compRequestID, comparisonTimestamp)
 			// Continue with normal Kiro flow below...
 		}
 
 		// Handle streaming request
 		var responsePreview string
+		var capturedKiroEvents []CapturedSSEEvent
 		if anthropicReq.Stream {
-			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, token, lg)
+			// Pass capture slice if in comparison mode
+			var capture *[]CapturedSSEEvent
+			if cfg.Advanced.ComparisonMode {
+				capture = &capturedKiroEvents
+			}
+			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, token, lg, sessionID, reqResult.RequestID, capture)
 		} else {
 			handleNonStreamRequest(w, anthropicReq, token)
 		}
@@ -1169,6 +1292,25 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 		// Log response
 		duration := time.Since(startTime)
 		lg.LogResponse(http.StatusOK, r.URL.Path, duration, responsePreview, sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+
+		// Save Kiro events if in comparison mode
+		if cfg.Advanced.ComparisonMode && len(capturedKiroEvents) > 0 {
+			debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
+			debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-%s-kiro.sse", comparisonTimestamp, reqResult.RequestID))
+
+			// Format events as SSE text
+			var sseBuffer strings.Builder
+			for _, event := range capturedKiroEvents {
+				sseBuffer.WriteString(fmt.Sprintf("event: %s\n", event.Event))
+				sseBuffer.WriteString(fmt.Sprintf("data: %s\n\n", event.Data))
+			}
+
+			if err := os.WriteFile(debugFile, []byte(sseBuffer.String()), 0600); err != nil {
+				lg.LogComparison(sessionID, reqResult.RequestID, fmt.Sprintf("Failed to save Kiro events: %v", err))
+			} else {
+				lg.LogComparison(sessionID, reqResult.RequestID, fmt.Sprintf("Kiro: %d events (%d bytes) -> %s", len(capturedKiroEvents), sseBuffer.Len(), debugFile))
+			}
+		}
 	})
 
 	// Add health check endpoint
@@ -1198,7 +1340,8 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 }
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
-func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger) string {
+// capturedEvents: optional pointer to slice for capturing SSE events (for comparison mode)
+func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1379,8 +1522,18 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		}
 
 		// Log event analysis results
-		lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
-			len(events), hasTextContent, hasToolUse, toolBlockCount, parserSentMessageDelta))
+		if cfg.Advanced.ComparisonMode {
+			// In comparison mode, show preview of actual response text
+			textPreview := responseText.String()
+			if len(textPreview) > 80 {
+				textPreview = textPreview[:80]
+			}
+			lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events, preview=%q (%d bytes), tools=%d",
+				len(events), textPreview, len(respBody), toolBlockCount))
+		} else {
+			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
+				len(events), hasTextContent, hasToolUse, toolBlockCount, parserSentMessageDelta))
+		}
 
 		// Send start event
 		messageStart := map[string]any{
@@ -1399,8 +1552,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				},
 			},
 		}
-		sendSSEEvent(w, flusher, "message_start", messageStart)
-		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"})
+		sendSSEEvent(w, flusher, "message_start", messageStart, capturedEvents)
+		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"}, capturedEvents)
 
 		// Only send text content_block_start if there's text content (not tool-only)
 		if hasTextContent || !hasToolUse {
@@ -1409,12 +1562,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"index":         0,
 				"type":          "content_block_start",
 			}
-			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart)
+			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, capturedEvents)
 		}
 
 		outputTokens := 0
 		for _, e := range events {
-			sendSSEEvent(w, flusher, e.Event, e.Data)
+			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
 
 			if e.Event == "content_block_delta" {
 				outputTokens = len(getMessageContent(e.Data))
@@ -1434,7 +1587,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// Only send text block stop if we sent text block start
 		if hasTextContent || !hasToolUse {
 			contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
-			sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop)
+			sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop, capturedEvents)
 		}
 
 		// Always send message_delta if parser didn't already send one
@@ -1448,11 +1601,11 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
 				"usage": map[string]any{"output_tokens": outputTokens},
 			}
-			sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason)
+			sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason, capturedEvents)
 		}
 
 		messageStop := map[string]any{"type": "message_stop"}
-		sendSSEEvent(w, flusher, "message_stop", messageStop)
+		sendSSEEvent(w, flusher, "message_stop", messageStop, capturedEvents)
 	} else {
 		// No events parsed - send an empty response to prevent Claude Code from hanging
 		lg.LogError("Sending empty response due to no parsed events")
@@ -1469,20 +1622,20 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 			},
 		}
-		sendSSEEvent(w, flusher, "message_start", messageStart)
+		sendSSEEvent(w, flusher, "message_start", messageStart, capturedEvents)
 		contentBlockStart := map[string]any{
 			"content_block": map[string]any{"text": "[Error: No response received from backend]", "type": "text"},
 			"index":         0,
 			"type":          "content_block_start",
 		}
-		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart)
-		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{"index": 0, "type": "content_block_stop"})
+		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{"index": 0, "type": "content_block_stop"}, capturedEvents)
 		sendSSEEvent(w, flusher, "message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
 			"usage": map[string]any{"output_tokens": 0},
-		})
-		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"})
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
 		responseText.WriteString("[Error: No response received from backend]")
 	}
 
@@ -2807,10 +2960,8 @@ func startServer(port string) {
 
 		if cfg.Advanced.AnthropicDirect {
 			// Anthropic Direct Mode: forward request unchanged to Anthropic
-			fmt.Println("[ANTHROPIC DIRECT] Forwarding request to Anthropic API")
 			resp, err := forwardToAnthropicHeadless(r, body)
 			if err != nil {
-				fmt.Printf("[ANTHROPIC DIRECT] Forward failed: %v\n", err)
 				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", err), http.StatusBadGateway)
 				return
 			}
@@ -2824,29 +2975,27 @@ func startServer(port string) {
 
 			// Check if this is a streaming response (SSE)
 			if resp.Header.Get("Content-Type") == "text/event-stream" {
-				// Stream through - flush after each write
-				flusher, ok := w.(http.Flusher)
-				if !ok {
-					fmt.Println("[ANTHROPIC DIRECT] ResponseWriter doesn't support flushing")
-					io.Copy(w, resp.Body)
-				} else {
-					// Stream SSE events through
-					buf := make([]byte, 4096)
-					for {
-						n, err := resp.Body.Read(buf)
-						if n > 0 {
-							w.Write(buf[:n])
-							flusher.Flush()
-						}
-						if err != nil {
-							break
-						}
-					}
+				// Read full response body to parse SSE events
+				respBody, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return
 				}
-				fmt.Println("[ANTHROPIC DIRECT] SSE stream completed")
+
+				// Forward events to client
+				flusher, ok := w.(http.Flusher)
+				if ok {
+					w.Write(respBody)
+					flusher.Flush()
+				} else {
+					w.Write(respBody)
+				}
 			} else {
-				// Non-streaming: read and write entire body
-				respBody, _ := io.ReadAll(resp.Body)
+				// Non-streaming: decompress and read entire body
+				respBody, err := decompressResponse(resp)
+				if err != nil {
+					http.Error(w, "Failed to decompress response", http.StatusInternalServerError)
+					return
+				}
 				w.Write(respBody)
 			}
 			return
@@ -2860,32 +3009,35 @@ func startServer(port string) {
 				headersCopy[k] = v
 			}
 			go func(headers http.Header) {
-				fmt.Println("[COMPARISON] Sending parallel request to Anthropic")
+				fmt.Println("[CMP] Sending parallel request to Anthropic")
 				resp, err := forwardToAnthropicHeadlessWithHeaders(headers, body)
 				if err != nil {
-					fmt.Printf("[COMPARISON] Anthropic error: %v\n", err)
+					fmt.Printf("[CMP] Anthropic error: %v\n", err)
 					return
 				}
 				defer resp.Body.Close()
 				respBody, err := io.ReadAll(resp.Body)
 				if err != nil {
-					fmt.Printf("[COMPARISON] Failed to read Anthropic response: %v\n", err)
+					fmt.Printf("[CMP] Failed to read Anthropic response: %v\n", err)
 					return
 				}
+
+				// Extract text preview from SSE response
+				preview := extractAnthropicTextPreview(string(respBody), 80)
 
 				// Save to debug file
 				debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
 				if err := os.MkdirAll(debugDir, 0700); err != nil {
-					fmt.Printf("[COMPARISON] Failed to create debug dir: %v\n", err)
+					fmt.Printf("[CMP] Failed to create debug dir: %v\n", err)
 					return
 				}
 				timestamp := time.Now().Format("20060102-150405")
 				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-anthropic.json", timestamp))
 				if err := os.WriteFile(debugFile, respBody, 0600); err != nil {
-					fmt.Printf("[COMPARISON] Failed to save debug file: %v\n", err)
+					fmt.Printf("[CMP] Failed to save debug file: %v\n", err)
 					return
 				}
-				fmt.Printf("[COMPARISON] Anthropic response saved: %s (%d bytes)\n", debugFile, len(respBody))
+				fmt.Printf("[CMP] Anthropic: preview=%q (%d bytes) -> %s\n", preview, len(respBody), debugFile)
 			}(headersCopy)
 			// Continue with normal Kiro flow below...
 		}
@@ -3029,10 +3181,10 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 				},
 			},
 		}
-		sendSSEEvent(w, flusher, "message_start", messageStart)
+		sendSSEEvent(w, flusher, "message_start", messageStart, nil)
 		sendSSEEvent(w, flusher, "ping", map[string]string{
 			"type": "ping",
-		})
+		}, nil)
 
 		contentBlockStart := map[string]any{
 			"content_block": map[string]any{
@@ -3041,12 +3193,12 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 			"index": 0, "type": "content_block_start",
 		}
 
-		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart)
+		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, nil)
 		// Process parsed events
 
 		outputTokens := 0
 		for _, e := range events {
-			sendSSEEvent(w, flusher, e.Event, e.Data)
+			sendSSEEvent(w, flusher, e.Event, e.Data, nil)
 
 			if e.Event == "content_block_delta" {
 				outputTokens = len(getMessageContent(e.Data))
@@ -3060,19 +3212,19 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 			"index": 0,
 			"type":  "content_block_stop",
 		}
-		sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop)
+		sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop, nil)
 
 		contentBlockStopReason := map[string]any{
 			"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{
 				"output_tokens": outputTokens,
 			},
 		}
-		sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason)
+		sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason, nil)
 
 		messageStop := map[string]any{
 			"type": "message_stop",
 		}
-		sendSSEEvent(w, flusher, "message_stop", messageStop)
+		sendSSEEvent(w, flusher, "message_stop", messageStop, nil)
 	}
 
 }
@@ -3230,14 +3382,21 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	jsonStr.NewEncoder(w).Encode(anthropicResp)
 }
 
-// sendSSEEvent sends an SSE event
-func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, data any) {
+// sendSSEEvent sends an SSE event and optionally captures it
+func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, data any, capturedEvents *[]CapturedSSEEvent) {
 
 	json, err := jsonStr.Marshal(data)
 	if err != nil {
 		return
 	}
 
+	// Capture event if capturedEvents is provided
+	if capturedEvents != nil {
+		*capturedEvents = append(*capturedEvents, CapturedSSEEvent{
+			Event: eventType,
+			Data:  string(json),
+		})
+	}
 
 	fmt.Fprintf(w, "event: %s\n", eventType)
 	fmt.Fprintf(w, "data: %s\n\n", string(json))
@@ -3261,7 +3420,7 @@ func sendErrorEvent(w http.ResponseWriter, flusher http.Flusher, message string,
 		},
 	}
 
-	sendSSEEvent(w, flusher, "error", errorResp)
+	sendSSEEvent(w, flusher, "error", errorResp, nil)
 }
 
 // FileExists checks if a file or directory exists

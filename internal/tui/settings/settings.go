@@ -600,14 +600,14 @@ func (m *Model) loadSettings() {
 		{
 			Key:         "advanced.anthropic_api_key",
 			Label:       "Anthropic API Key",
-			Description: "API key for Anthropic requests",
+			Description: "Optional - OAuth forwarding is default",
 			Type:        TypeText,
 			Value:       maskApiKey(m.config.Advanced.AnthropicApiKey),
 			ExtendedHelp: ExtendedHelp{
 				DefaultValue:     "",
 				RecommendedValue: "",
 				Sensitive:        true,
-				DetailedDesc:     "Your Anthropic API key (sk-ant-...). Required for Comparison Mode and Anthropic Direct mode. Get one from console.anthropic.com. The proxy cannot use Claude Code's OAuth tokens directly.",
+				DetailedDesc:     "OPTIONAL - Your Anthropic API key (sk-ant-...). By default (when empty), the proxy automatically forwards Claude Code's OAuth Authorization header to Anthropic. Only set this if you want to use your own API key instead of Claude Code's OAuth, or when using Comparison Mode or Anthropic Direct mode. Get one from console.anthropic.com.",
 				ReferenceURL:     "https://console.anthropic.com/settings/keys",
 			},
 		},

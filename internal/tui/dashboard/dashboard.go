@@ -138,22 +138,23 @@ func (m Model) autoRefreshTokenCmd() tea.Cmd {
 
 // DashboardKeyMap defines key bindings for the dashboard
 type DashboardKeyMap struct {
-	Tab         key.Binding
-	Menu        key.Binding
-	Settings    key.Binding
-	OpenClaude  key.Binding
-	Attachments key.Binding
-	Quit        key.Binding
-	Help        key.Binding
-	Usage       key.Binding
-	ScrollUp    key.Binding
-	ScrollDown  key.Binding
-	PageUp      key.Binding
-	PageDown    key.Binding
-	Top         key.Binding
-	Bottom      key.Binding
-	Clear       key.Binding
-	Search      key.Binding
+	Tab          key.Binding
+	Menu         key.Binding
+	Settings     key.Binding
+	OpenClaude   key.Binding
+	Attachments  key.Binding
+	ToggleBypass key.Binding
+	Quit         key.Binding
+	Help         key.Binding
+	Usage        key.Binding
+	ScrollUp     key.Binding
+	ScrollDown   key.Binding
+	PageUp       key.Binding
+	PageDown     key.Binding
+	Top          key.Binding
+	Bottom       key.Binding
+	Clear        key.Binding
+	Search       key.Binding
 }
 
 func DefaultDashboardKeyMap() DashboardKeyMap {
@@ -177,6 +178,10 @@ func DefaultDashboardKeyMap() DashboardKeyMap {
 		Attachments: key.NewBinding(
 			key.WithKeys("a"),
 			key.WithHelp("a", "attachments"),
+		),
+		ToggleBypass: key.NewBinding(
+			key.WithKeys("b"),
+			key.WithHelp("b", "toggle bypass"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
@@ -261,7 +266,8 @@ type Model struct {
 	serverRunning      bool
 	refreshTokenFn     RefreshTokenFunc
 	isTokenExpiredFn   IsTokenExpiredFunc
-	creditsFetchFailed bool // Stop retrying after persistent 403/access denied errors
+	creditsFetchFailed bool  // Stop retrying after persistent 403/access denied errors
+	bypassOverride     *bool // Session-only bypass mode override (nil = use config)
 }
 
 
@@ -460,6 +466,38 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					Preview:   "Attachments not available (set attachment_mode = \"separate\" in config)",
 				})
 			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.ToggleBypass):
+			// Toggle bypass mode (session-only, doesn't save to config)
+			cfg := config.Get()
+
+			// Determine current bypass state
+			currentBypass := cfg.Advanced.AnthropicDirect
+			if m.bypassOverride != nil {
+				currentBypass = *m.bypassOverride
+			}
+
+			// Toggle the bypass state
+			newBypass := !currentBypass
+			m.bypassOverride = &newBypass
+
+			// If enabling bypass, disable comparison mode (mutually exclusive)
+			if newBypass && cfg.Advanced.ComparisonMode {
+				cfg.Advanced.ComparisonMode = false
+				config.Set(cfg) // Update in-memory config
+			}
+
+			// Log the mode change
+			modeStr := "Normal"
+			if newBypass {
+				modeStr = "Bypass (Anthropic Direct)"
+			}
+			m.logViewer.AddEntry(logger.LogEntry{
+				Timestamp: time.Now(),
+				Type:      logger.LogTypeInf,
+				Preview:   fmt.Sprintf("Mode changed to: %s (session-only, not saved)", modeStr),
+			})
 			return m, nil
 
 		case key.Matches(msg, m.keys.Quit):
@@ -723,7 +761,7 @@ func (m Model) View() string {
 	}
 
 	// Status panel (always visible at top)
-	statusPanel := renderStatusPanel(m.serverRunning, m.port, m.credits, m.creditsProgress, m.tokenExpiry)
+	statusPanel := renderStatusPanel(m.serverRunning, m.port, m.credits, m.creditsProgress, m.tokenExpiry, m.bypassOverride)
 
 	// Stats panel (memory/disk usage) - render as a box next to status
 	statsPanel := m.renderStatsPanel()
@@ -760,27 +798,12 @@ func (m Model) View() string {
 	// Help bar (italic like Claude Code style) - build custom help text
 	helpText := m.renderHelpText()
 
-	// Version in bottom right
-	versionStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#626262"))
-	versionText := versionStyle.Render("v" + Version)
-
-	// Build footer with help and version
-	footerWidth := m.width - 4
-	helpWidth := lipgloss.Width(helpText)
-	versionWidth := lipgloss.Width(versionText)
-	padding := footerWidth - helpWidth - versionWidth
-	if padding < 1 {
-		padding = 1
-	}
-	footer := helpText + strings.Repeat(" ", padding) + versionText
-
 	// Combine all panels
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		topSection,
 		filterBarView,
 		mainContent,
-		footer,
+		helpText,
 	)
 
 	// Wrap in container that fills the terminal
@@ -871,6 +894,7 @@ func (m Model) renderHelpText() string {
 	globalParts := []string{
 		accentStyle.Render("q quit"),
 		accentStyle.Render("p settings"),
+		accentStyle.Render("b bypass mode"),
 	}
 	// Add attachments key if store is available
 	if m.attachmentStore != nil && !m.showAttachments {
@@ -888,9 +912,13 @@ func (m Model) renderStatsPanel() string {
 	headerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Bold(true)
 
 	var lines []string
+	cfg := config.Get()
 
-	// Header
-	lines = append(lines, headerStyle.Render("System Stats"))
+	// Header with version on same line, right-aligned
+	headerText := "System Stats"
+	versionText := "v" + Version
+	headerLine := headerStyle.Render(headerText) + strings.Repeat(" ", 20) + lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render(versionText)
+	lines = append(lines, headerLine)
 
 	// Get memory usage from logger
 	if m.logger != nil {
@@ -906,7 +934,6 @@ func (m Model) renderStatsPanel() string {
 	// Get disk usage
 	diskBytes, err := config.GetLogDirSize()
 	if err == nil {
-		cfg := config.Get()
 		if cfg.Logging.MaxLogSizeMB > 0 {
 			pct := float64(diskBytes) / float64(cfg.Logging.MaxLogSizeMB*1024*1024) * 100
 			lines = append(lines,
@@ -951,7 +978,7 @@ func (m Model) renderStatsPanel() string {
 	// Empty line for spacing (to match status panel height)
 	lines = append(lines, "")
 
-	// Box style similar to status panel
+	// Box style with static border color
 	boxStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#626262")).
@@ -1131,16 +1158,33 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 }
 
 // renderStatusPanel renders the status panel
-func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInfo, creditsProgress progress.Model, tokenExpiry time.Time) string {
+func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInfo, creditsProgress progress.Model, tokenExpiry time.Time, bypassOverride *bool) string {
 	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
 	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Bold(true)
 	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6BFF6B")).Bold(true)
 	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFAA00")).Bold(true)
 	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B")).Bold(true)
 
+	// Determine current mode
+	cfg := config.Get()
+	isBypass := cfg.Advanced.AnthropicDirect
+	if bypassOverride != nil {
+		isBypass = *bypassOverride
+	}
+	isCompare := cfg.Advanced.ComparisonMode
+
 	var statusLines []string
 	tokenInfo := getTokenInfo()
 	claudeConfig := getClaudeConfigStatus()
+
+	// Add mode indicator line at the top (centered)
+	if isBypass {
+		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true)
+		statusLines = append(statusLines, modeStyle.Render(">>> BYPASS <<<")+"\n")
+	} else if isCompare {
+		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFB86C")).Bold(true)
+		statusLines = append(statusLines, modeStyle.Render(">>> COMPARE <<<")+"\n")
+	}
 
 	// Only use model cache as fallback when file data is missing
 	// Fresh file data takes priority over potentially stale model cache
@@ -1311,10 +1355,14 @@ func renderStatusPanel(serverRunning bool, serverPort string, credits CreditsInf
 			labelStyle.Render("Credits: ")+labelStyle.Render("Loading..."))
 	}
 
-	// Determine border color
+	// Determine border color - mode overrides normal status colors
 	var borderColor lipgloss.Color
-	if serverRunning && tokenInfo.Present && claudeConfig.Claude2KiroSet {
-		borderColor = lipgloss.Color("#6BFF6B")
+	if isBypass {
+		borderColor = lipgloss.Color("#FF5555") // Red for bypass
+	} else if isCompare {
+		borderColor = lipgloss.Color("#FFB86C") // Orange for compare
+	} else if serverRunning && tokenInfo.Present && claudeConfig.Claude2KiroSet {
+		borderColor = lipgloss.Color("#6BFF6B") // Green for normal ready state
 	} else if tokenInfo.Present || claudeConfig.FileExists {
 		borderColor = lipgloss.Color("#FFAA00")
 	} else {
