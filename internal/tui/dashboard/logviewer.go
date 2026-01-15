@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -190,6 +191,12 @@ type LogViewerModel struct {
 	viewMode ViewMode
 	// Expand content - show full text without truncation
 	expandContent bool
+	// Session sequence number tracking - maps session ID to request ID to sequence number
+	sessionSeqMap map[string]map[string]int
+	// Session sequence counter - maps session ID to next sequence number
+	sessionSeqCounter map[string]int
+	// Mutex protecting sessionSeqMap and sessionSeqCounter
+	sessionSeqMutex sync.Mutex
 }
 
 // NewLogViewerModel creates a new split-pane log viewer
@@ -262,6 +269,8 @@ func NewLogViewerModel(width, height int) LogViewerModel {
 		sessionColorMap:    make(map[string]int),
 		sessionNameMap:     make(map[string]string),
 		sessionMetadataMap: make(map[string]*SessionMetadata),
+		sessionSeqMap:      make(map[string]map[string]int),
+		sessionSeqCounter:  make(map[string]int),
 		viewMode:           initialViewMode,
 		expandContent:      initialExpand,
 		filterState: FilterState{
@@ -2488,6 +2497,9 @@ func (m *LogViewerModel) AddEntry(entry logger.LogEntry) {
 
 // Clear removes all entries
 func (m *LogViewerModel) Clear() {
+	m.sessionSeqMutex.Lock()
+	defer m.sessionSeqMutex.Unlock()
+
 	m.allEntries = m.allEntries[:0]
 	m.entries = m.entries[:0]
 	m.sessions = []string{""}
@@ -2497,7 +2509,88 @@ func (m *LogViewerModel) Clear() {
 	m.sessionColorMap = make(map[string]int)
 	m.sessionNameMap = make(map[string]string)
 	m.sessionMetadataMap = make(map[string]*SessionMetadata)
+	// CRITICAL FIX: Also reset session sequence tracking maps
+	m.sessionSeqMap = make(map[string]map[string]int)
+	m.sessionSeqCounter = make(map[string]int)
 	m.updateDetailContent()
+}
+
+// assignPerSessionSeqNum assigns a per-session sequence number to an entry.
+// This function is thread-safe and protected by sessionSeqMutex.
+func (m *LogViewerModel) assignPerSessionSeqNum(idx int) {
+	m.sessionSeqMutex.Lock()
+	defer m.sessionSeqMutex.Unlock()
+
+	if idx < 0 || idx >= len(m.allEntries) {
+		return
+	}
+	entry := &m.allEntries[idx]
+	sessionID := entry.SessionID
+	requestID := entry.RequestID
+
+	// Initialize maps if needed
+	if m.sessionSeqMap == nil {
+		m.sessionSeqMap = make(map[string]map[string]int)
+	}
+	if m.sessionSeqCounter == nil {
+		m.sessionSeqCounter = make(map[string]int)
+	}
+
+	if requestID == "" {
+		return // Skip entries without RequestID
+	}
+
+	if _, exists := m.sessionSeqMap[sessionID]; !exists {
+		m.sessionSeqMap[sessionID] = make(map[string]int)
+	}
+
+	if _, assigned := m.sessionSeqMap[sessionID][requestID]; !assigned {
+		counter := m.sessionSeqCounter[sessionID]
+		counter++
+		m.sessionSeqCounter[sessionID] = counter
+		m.sessionSeqMap[sessionID][requestID] = counter
+		entry.SeqNum = counter
+	} else {
+		entry.SeqNum = m.sessionSeqMap[sessionID][requestID]
+	}
+}
+
+// reassignPerSessionSeqNums rebuilds all per-session sequence numbers.
+// This is called after entry trimming or when loading entries from file.
+// This function is thread-safe and protected by sessionSeqMutex.
+// NOTE: Uses inline logic instead of calling assignPerSessionSeqNum to avoid deadlock.
+func (m *LogViewerModel) reassignPerSessionSeqNums() {
+	m.sessionSeqMutex.Lock()
+	defer m.sessionSeqMutex.Unlock()
+
+	// Clear existing maps
+	m.sessionSeqMap = make(map[string]map[string]int)
+	m.sessionSeqCounter = make(map[string]int)
+
+	// Rebuild maps inline (do NOT call assignPerSessionSeqNum to avoid deadlock)
+	for i := range m.allEntries {
+		entry := &m.allEntries[i]
+		sessionID := entry.SessionID
+		requestID := entry.RequestID
+
+		if requestID == "" {
+			continue // Skip entries without RequestID
+		}
+
+		if _, exists := m.sessionSeqMap[sessionID]; !exists {
+			m.sessionSeqMap[sessionID] = make(map[string]int)
+		}
+
+		if _, assigned := m.sessionSeqMap[sessionID][requestID]; !assigned {
+			counter := m.sessionSeqCounter[sessionID]
+			counter++
+			m.sessionSeqCounter[sessionID] = counter
+			m.sessionSeqMap[sessionID][requestID] = counter
+			entry.SeqNum = counter
+		} else {
+			entry.SeqNum = m.sessionSeqMap[sessionID][requestID]
+		}
+	}
 }
 
 // ScrollInfo returns scroll position info
