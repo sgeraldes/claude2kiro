@@ -301,6 +301,8 @@ func (m LogViewerModel) Update(msg tea.Msg) (LogViewerModel, tea.Cmd) {
 		if len(m.allEntries) > cfg.Logging.MaxEntries {
 			excess := len(m.allEntries) - cfg.Logging.MaxEntries
 			m.allEntries = m.allEntries[excess:]
+			// Rebuild session maps to prevent memory leak from stale entries
+			m.reassignPerSessionSeqNums()
 		}
 
 		// Update sessions list if this is a new session
@@ -2465,6 +2467,8 @@ func (m *LogViewerModel) AddEntry(entry logger.LogEntry) {
 	if len(m.allEntries) > cfg.Logging.MaxEntries {
 		excess := len(m.allEntries) - cfg.Logging.MaxEntries
 		m.allEntries = m.allEntries[excess:]
+		// Rebuild session maps to prevent memory leak from stale entries
+		m.reassignPerSessionSeqNums()
 	}
 
 	// Update sessions list if this is a new session
