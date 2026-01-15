@@ -29,6 +29,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -1259,14 +1260,9 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 				// Extract text preview from SSE response
 				preview := extractAnthropicTextPreview(string(respBody), 80)
 
-				// Save to debug file with request ID in filename
-				debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
-				if err := os.MkdirAll(debugDir, 0700); err != nil {
-					lg.LogComparison(sid, rid, fmt.Sprintf("Failed to create debug dir: %v", err))
-					return
-				}
-				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-%s-anthropic.json", ts, rid))
-				if err := os.WriteFile(debugFile, respBody, 0600); err != nil {
+				// Save to secure debug file with request ID in filename
+				debugFile, err := debug.WriteDebugFileWithScrub(fmt.Sprintf("comparison-%s-anthropic", rid), respBody)
+				if err != nil {
 					lg.LogComparison(sid, rid, fmt.Sprintf("Failed to save debug file: %v", err))
 					return
 				}
@@ -1295,9 +1291,6 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 
 		// Save Kiro events if in comparison mode
 		if cfg.Advanced.ComparisonMode && len(capturedKiroEvents) > 0 {
-			debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
-			debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-%s-kiro.sse", comparisonTimestamp, reqResult.RequestID))
-
 			// Format events as SSE text
 			var sseBuffer strings.Builder
 			for _, event := range capturedKiroEvents {
@@ -1305,7 +1298,8 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 				sseBuffer.WriteString(fmt.Sprintf("data: %s\n\n", event.Data))
 			}
 
-			if err := os.WriteFile(debugFile, []byte(sseBuffer.String()), 0600); err != nil {
+			debugFile, err := debug.WriteDebugFile(fmt.Sprintf("comparison-%s-kiro", reqResult.RequestID), []byte(sseBuffer.String()))
+			if err != nil {
 				lg.LogComparison(sessionID, reqResult.RequestID, fmt.Sprintf("Failed to save Kiro events: %v", err))
 			} else {
 				lg.LogComparison(sessionID, reqResult.RequestID, fmt.Sprintf("Kiro: %d events (%d bytes) -> %s", len(capturedKiroEvents), sseBuffer.Len(), debugFile))
@@ -1366,11 +1360,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		return ""
 	}
 
-	// Debug: Write request to file to see what's being sent (with milliseconds for concurrent requests)
-	debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
-	os.MkdirAll(debugDir, 0700)
-	debugFile := filepath.Join(debugDir, fmt.Sprintf("cw-request-%s.json", time.Now().Format("20060102-150405.000")))
-	os.WriteFile(debugFile, cwReqBody, 0600)
+	// Debug: Write request to secure debug directory (with sensitive data scrubbed)
+	debug.WriteDebugFileWithScrub("cw-request", cwReqBody)
 
 	// Log the conversationId for tracing
 	lg.LogInfo(fmt.Sprintf("Request convId=%s model=%s historyLen=%d", cwReq.ConversationState.ConversationId[:8], anthropicReq.Model, len(cwReq.ConversationState.History)))
@@ -1442,8 +1433,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		}
 
 		// Non-retryable error or final attempt - save the failing request for debugging
-		failFile := filepath.Join(debugDir, fmt.Sprintf("cw-FAILED-%s.json", time.Now().Format("20060102-150405.000")))
-		os.WriteFile(failFile, cwReqBody, 0600)
+		debug.WriteDebugFileWithScrub("cw-FAILED", cwReqBody)
 		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 {
@@ -1474,8 +1464,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	}
 
 	// Debug: Save raw response for analysis
-	rawRespFile := filepath.Join(debugDir, fmt.Sprintf("cw-response-%s.bin", time.Now().Format("20060102-150405")))
-	os.WriteFile(rawRespFile, respBody, 0600)
+	debug.WriteDebugFile("cw-response", respBody)
 
 	// Use CodeWhisperer parser
 	events := parser.ParseEvents(respBody)
@@ -3025,15 +3014,9 @@ func startServer(port string) {
 				// Extract text preview from SSE response
 				preview := extractAnthropicTextPreview(string(respBody), 80)
 
-				// Save to debug file
-				debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
-				if err := os.MkdirAll(debugDir, 0700); err != nil {
-					fmt.Printf("[CMP] Failed to create debug dir: %v\n", err)
-					return
-				}
-				timestamp := time.Now().Format("20060102-150405")
-				debugFile := filepath.Join(debugDir, fmt.Sprintf("comparison-%s-anthropic.json", timestamp))
-				if err := os.WriteFile(debugFile, respBody, 0600); err != nil {
+				// Save to secure debug file
+				debugFile, err := debug.WriteDebugFileWithScrub("comparison-anthropic", respBody)
+				if err != nil {
 					fmt.Printf("[CMP] Failed to save debug file: %v\n", err)
 					return
 				}

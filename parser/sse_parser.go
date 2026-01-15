@@ -5,12 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sgeraldes/claude2kiro/internal/debug"
 )
 
 // DebugInfo holds debug information for a single binary frame
@@ -41,19 +40,14 @@ type ParseDebugInfo struct {
 // Global debug flag - can be set externally
 var DebugMode = false
 
-// writeDebugFile writes debug info to a file in the debug directory
+// writeDebugFile writes debug info to the secure debug directory
 func writeDebugFile(info *ParseDebugInfo) {
-	debugDir := filepath.Join(os.TempDir(), "claude2kiro-debug")
-	os.MkdirAll(debugDir, 0700)
-
-	filename := fmt.Sprintf("parser-debug-%s.json", time.Now().Format("20060102-150405.000"))
-	filePath := filepath.Join(debugDir, filename)
-
 	data, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
 		return
 	}
-	os.WriteFile(filePath, data, 0600)
+	// Use secure debug directory (~/.claude2kiro/debug/) with random filename
+	debug.WriteDebugFile("parser-debug", data)
 }
 
 type assistantResponseEvent struct {

@@ -581,7 +581,7 @@ func (m *Model) loadSettings() {
 				DefaultValue:     "false",
 				RecommendedValue: "false",
 				Sensitive:        false,
-				DetailedDesc:     "When enabled, sends requests to both Anthropic (using original headers) and Kiro. Returns Kiro response but logs Anthropic response for comparison debugging. Files saved to temp/claude2kiro-debug/.",
+				DetailedDesc:     "When enabled, sends requests to both Anthropic (using original headers) and Kiro. Returns Kiro response but logs Anthropic response for comparison debugging. Files saved to ~/.claude2kiro/debug/.",
 			},
 		},
 		{
