@@ -127,6 +127,29 @@ Converts to Anthropic SSE events:
 - `message_delta`
 - `message_stop`
 
+#### SSE Parsing Architecture
+
+The project has two separate SSE-related parsers serving different purposes:
+
+**1. Protocol Parser (`parser/sse_parser.go`)**
+- Converts CodeWhisperer binary events → Anthropic SSE format
+- Used by proxy server for real-time streaming
+- Input: Binary event stream from AWS
+- Output: Text-based SSE events
+
+**2. Log Preview Generator (`internal/tui/logger/logger.go`)**
+- Extracts preview text from saved SSE strings for TUI display
+- Used by logger for generating request/response previews
+- Input: SSE string (from stored responses)
+- Output: Preview text for UI
+
+**Rationale for Separation:**
+While both process SSE-like content, they are intentionally separate:
+- Different input/output types (binary vs string, streaming vs preview)
+- Different package boundaries (parser vs logger)
+- Coupling would create unnecessary dependencies
+- The overlap is minimal (~15 lines of event detection)
+
 ### Key Data Structures
 
 | Structure | Purpose |
