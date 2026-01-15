@@ -36,8 +36,8 @@ const (
 const (
 	// PreviewFastModeThreshold is the body size (bytes) above which we use
 	// fast string matching instead of full JSON parsing to generate previews.
-	// Chosen to balance accuracy (JSON parsing) vs. performance (string matching).
-	PreviewFastModeThreshold = 50000 // 50KB
+	// Lowered from 50KB to 10KB to reduce CPU overhead on high-traffic scenarios.
+	PreviewFastModeThreshold = 10000 // 10KB
 
 	// PreviewVeryLargeThreshold is the body size (bytes) above which we skip
 	// all preview processing and just truncate. Prevents excessive CPU usage.
