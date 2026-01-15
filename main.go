@@ -3280,7 +3280,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 
 	events := parser.ParseEvents(cwRespBody)
 
-	context := ""
+	textContent := ""
 	toolName := ""
 	toolUseId := ""
 
@@ -3292,7 +3292,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			if dataMap, ok := event.Data.(map[string]any); ok {
 				switch dataMap["type"] {
 				case "content_block_start":
-					context = ""
+					textContent = ""
 				case "content_block_delta":
 					if delta, ok := dataMap["delta"]; ok {
 
@@ -3300,7 +3300,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 							switch deltaMap["type"] {
 							case "text_delta":
 								if text, ok := deltaMap["text"]; ok {
-									context += text.(string)
+									textContent += text.(string)
 								}
 							case "input_json_delta":
 								toolUseId = deltaMap["id"].(string)
@@ -3338,7 +3338,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 							})
 						case 0:
 							contexts = append(contexts, map[string]interface{}{
-								"text": context,
+								"text": textContent,
 								"type": "text",
 							})
 						}
@@ -3350,10 +3350,10 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	}
 
 	// Fallback: if text accumulated but no content_block_stop(index=0) received, still return text
-	if len(contexts) == 0 && strings.TrimSpace(context) != "" {
+	if len(contexts) == 0 && strings.TrimSpace(textContent) != "" {
 		contexts = append(contexts, map[string]any{
 			"type": "text",
-			"text": context,
+			"text": textContent,
 		})
 	}
 	
@@ -3373,7 +3373,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		"type":          "message",
 		"usage": map[string]any{
 			"input_tokens":  len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
-			"output_tokens": len(context),
+			"output_tokens": len(textContent),
 		},
 	}
 
