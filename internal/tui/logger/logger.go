@@ -3,6 +3,7 @@ package logger
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +30,33 @@ const (
 	LogTypeErr
 	LogTypeInf
 	LogTypeCmp
+)
+
+// Preview generation thresholds
+const (
+	// PreviewFastModeThreshold is the body size (bytes) above which we use
+	// fast string matching instead of full JSON parsing to generate previews.
+	// Chosen to balance accuracy (JSON parsing) vs. performance (string matching).
+	PreviewFastModeThreshold = 50000 // 50KB
+
+	// PreviewVeryLargeThreshold is the body size (bytes) above which we skip
+	// all preview processing and just truncate. Prevents excessive CPU usage.
+	PreviewVeryLargeThreshold = 100000 // 100KB
+
+	// PreviewSearchBufferSize is the max bytes searched for user message text
+	// in large request bodies. Balances finding relevant content vs. performance.
+	PreviewSearchBufferSize = 20000 // 20KB
+
+	// PreviewMetadataReserve is chars reserved for metadata (tool count, etc)
+	// when building preview text. Ensures room for "[5 tools, 10 msgs]" suffix.
+	PreviewMetadataReserve = 30
+
+	// SSEPreviewSearchLimit is the max bytes searched in SSE content for text
+	// extraction. Prevents slow scanning of very large streaming responses.
+	SSEPreviewSearchLimit = 10240 // 10KB
+
+	// ToolsSectionLimit is the max bytes searched for tool names in request body.
+	ToolsSectionLimit = 51200 // ~50KB
 )
 
 // String returns a short string representation of the log type
@@ -440,6 +468,236 @@ func sanitizePreview(text string, maxLen int) string {
 		preview = preview[:maxLen-3] + "..."
 	}
 	return preview
+}
+
+// generateRequestPreview creates a meaningful preview for API request bodies
+// Instead of showing raw JSON, it extracts key info: model, tools count, messages
+func generateRequestPreview(body string, maxLen int) string {
+	// For very large bodies, use fast string extraction instead of JSON parsing
+	if len(body) > PreviewFastModeThreshold {
+		return generateRequestPreviewFast(body, maxLen)
+	}
+
+	// Try to parse as JSON
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		// Not valid JSON, fall back to sanitizePreview
+		return sanitizePreview(body, maxLen)
+	}
+
+	var parts []string
+
+	// Extract last user message text (most relevant info)
+	if messages, ok := req["messages"].([]interface{}); ok && len(messages) > 0 {
+		// Find last user message
+		for i := len(messages) - 1; i >= 0; i-- {
+			if msg, ok := messages[i].(map[string]interface{}); ok {
+				if role, _ := msg["role"].(string); role == "user" {
+					content := extractUserMessageText(msg["content"])
+					if content != "" {
+						// Truncate but leave room for metadata
+						maxText := maxLen - PreviewMetadataReserve // Reserve space for tool/msg count
+						if len(content) > maxText {
+							content = content[:maxText-3] + "..."
+						}
+						parts = append(parts, content)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Add metadata summary
+	var meta []string
+	if tools, ok := req["tools"].([]interface{}); ok && len(tools) > 0 {
+		meta = append(meta, fmt.Sprintf("%d tools", len(tools)))
+	}
+	if messages, ok := req["messages"].([]interface{}); ok {
+		meta = append(meta, fmt.Sprintf("%d msgs", len(messages)))
+	}
+
+	if len(meta) > 0 {
+		parts = append(parts, "["+strings.Join(meta, ", ")+"]")
+	}
+
+	if len(parts) == 0 {
+		return sanitizePreview(body, maxLen)
+	}
+
+	preview := strings.Join(parts, " ")
+	if len(preview) > maxLen {
+		preview = preview[:maxLen-3] + "..."
+	}
+	return preview
+}
+
+// generateRequestPreviewFast creates a preview using fast string matching (no JSON parsing)
+// Used for large request bodies to avoid slow JSON parsing
+func generateRequestPreviewFast(body string, maxLen int) string {
+	// Count tools by looking for "name": patterns in tools array section
+	toolCount := 0
+	if toolsIdx := strings.Index(body, `"tools":`); toolsIdx != -1 {
+		// Count occurrences of "name": in the next 50KB (tools section)
+		toolsSection := body[toolsIdx:]
+		if len(toolsSection) > ToolsSectionLimit {
+			toolsSection = toolsSection[:ToolsSectionLimit]
+		}
+		toolCount = strings.Count(toolsSection, `"name":`)
+	}
+
+	// Count messages
+	msgCount := strings.Count(body, `"role":`)
+
+	// Try to find last user message text (search from end, limited)
+	var userText string
+	searchEnd := len(body)
+	if searchEnd > PreviewSearchBufferSize {
+		// Search last 20KB for user message
+		searchStart := searchEnd - PreviewSearchBufferSize
+		lastSection := body[searchStart:]
+		// Find last "role":"user"
+		lastUserIdx := strings.LastIndex(lastSection, `"role":"user"`)
+		if lastUserIdx != -1 {
+			// Look for "text":" after it
+			afterUser := lastSection[lastUserIdx:]
+			if textIdx := strings.Index(afterUser, `"text":"`); textIdx != -1 {
+				startPos := textIdx + 8
+				endPos := startPos
+				for endPos < len(afterUser) && endPos < startPos+500 {
+					if afterUser[endPos] == '"' && afterUser[endPos-1] != '\\' {
+						break
+					}
+					endPos++
+				}
+				if endPos > startPos {
+					userText = afterUser[startPos:endPos]
+					userText = strings.ReplaceAll(userText, `\n`, " ")
+					userText = strings.ReplaceAll(userText, `\"`, `"`)
+				}
+			}
+		}
+	}
+
+	var parts []string
+	if userText != "" {
+		maxText := maxLen - PreviewMetadataReserve
+		if len(userText) > maxText {
+			userText = userText[:maxText-3] + "..."
+		}
+		parts = append(parts, userText)
+	}
+
+	var meta []string
+	if toolCount > 0 {
+		meta = append(meta, fmt.Sprintf("%d tools", toolCount))
+	}
+	if msgCount > 0 {
+		meta = append(meta, fmt.Sprintf("%d msgs", msgCount/2)) // Divide by 2 since we count both user and assistant
+	}
+	if len(meta) > 0 {
+		parts = append(parts, "["+strings.Join(meta, ", ")+"]")
+	}
+
+	if len(parts) == 0 {
+		return sanitizePreview(body[:min(len(body), maxLen*2)], maxLen)
+	}
+
+	preview := strings.Join(parts, " ")
+	if len(preview) > maxLen {
+		preview = preview[:maxLen-3] + "..."
+	}
+	return preview
+}
+
+// extractSSETextPreview extracts text content from SSE using fast string matching (no JSON parsing)
+func extractSSETextPreview(content string, maxLen int) string {
+	// Limit search to first 10KB for performance
+	searchContent := content
+	if len(searchContent) > SSEPreviewSearchLimit {
+		searchContent = searchContent[:SSEPreviewSearchLimit]
+	}
+
+	var result strings.Builder
+	// Look for "text":" patterns which indicate text deltas in SSE
+	searchIdx := 0
+	for result.Len() < maxLen*2 { // Gather enough for truncation
+		idx := strings.Index(searchContent[searchIdx:], `"text":"`)
+		if idx == -1 {
+			break
+		}
+		startPos := searchIdx + idx + 8 // Skip past "text":"
+		// Find the closing quote (handle escaped quotes)
+		endPos := startPos
+		for endPos < len(searchContent) {
+			if searchContent[endPos] == '"' && (endPos == startPos || searchContent[endPos-1] != '\\') {
+				break
+			}
+			endPos++
+		}
+		if endPos > startPos && endPos <= len(searchContent) {
+			text := searchContent[startPos:endPos]
+			// Unescape common JSON escapes
+			text = strings.ReplaceAll(text, `\\n`, " ")
+			text = strings.ReplaceAll(text, `\n`, " ")
+			text = strings.ReplaceAll(text, `\"`, `"`)
+			text = strings.ReplaceAll(text, `\\`, `\`)
+			result.WriteString(text)
+		}
+		searchIdx = endPos + 1
+		if searchIdx >= len(searchContent) {
+			break
+		}
+	}
+
+	if result.Len() == 0 {
+		return "[no text content]"
+	}
+
+	preview := result.String()
+	// Clean up whitespace
+	preview = strings.ReplaceAll(preview, "\n", " ")
+	preview = strings.ReplaceAll(preview, "\r", " ")
+	for strings.Contains(preview, "  ") {
+		preview = strings.ReplaceAll(preview, "  ", " ")
+	}
+	preview = strings.TrimSpace(preview)
+
+	if len(preview) > maxLen {
+		preview = preview[:maxLen-3] + "..."
+	}
+	return preview
+}
+
+// extractUserMessageText extracts text from a message content field
+func extractUserMessageText(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		// Simple string content - clean up newlines
+		text := strings.ReplaceAll(c, "\n", " ")
+		text = strings.ReplaceAll(text, "\r", " ")
+		for strings.Contains(text, "  ") {
+			text = strings.ReplaceAll(text, "  ", " ")
+		}
+		return strings.TrimSpace(text)
+	case []interface{}:
+		// Array of content blocks - find first text block
+		for _, block := range c {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				if blockType, _ := blockMap["type"].(string); blockType == "text" {
+					if text, ok := blockMap["text"].(string); ok {
+						text = strings.ReplaceAll(text, "\n", " ")
+						text = strings.ReplaceAll(text, "\r", " ")
+						for strings.Contains(text, "  ") {
+							text = strings.ReplaceAll(text, "  ", " ")
+						}
+						return strings.TrimSpace(text)
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // Base64 patterns to detect in JSON content
@@ -858,7 +1116,7 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID strin
 		Path:      path,
 		Status:    status,
 		Duration:  parseDuration,
-		Preview:   sanitizePreview(body, cfg.Logging.PreviewLength),
+		Preview:   generateRequestPreview(body, cfg.Logging.PreviewLength),
 		Body:      body, // Full body - truncation happens in Log() for memory only
 		SessionID: sessionID,
 		FullUUID:  fullUUID,
@@ -1111,8 +1369,21 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 				bodyContent = bodyContent[6+endIdx+1:]
 			}
 		}
-		entry.Preview = bodyContent
 		entry.Body = bodyContent
+		// Generate appropriate preview based on log type
+		// For very large bodies, use fast truncation to avoid slow parsing
+		if len(bodyContent) > PreviewVeryLargeThreshold {
+			// Just truncate for huge entries - parsing is too slow
+			entry.Preview = sanitizePreview(bodyContent[:min(len(bodyContent), 500)], 200)
+		} else if logType == LogTypeRes && strings.HasPrefix(bodyContent, "event:") {
+			// RES with SSE format - extract text content for preview
+			entry.Preview = extractSSETextPreview(bodyContent, 200)
+		} else if logType == LogTypeReq && strings.HasPrefix(bodyContent, "{") {
+			// REQ with JSON - generate meaningful preview
+			entry.Preview = generateRequestPreview(bodyContent, 200)
+		} else {
+			entry.Preview = bodyContent
+		}
 	}
 
 	// Parse based on log type
