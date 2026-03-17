@@ -69,7 +69,7 @@ type SSOCreateTokenResponse struct {
 	TokenType    string `json:"tokenType"`
 }
 
-const kiroVersion = "0.6.0"
+const kiroVersion = "0.11.28"
 
 // GetTokenFilePath returns the cross-platform token file path
 func GetTokenFilePath() string {

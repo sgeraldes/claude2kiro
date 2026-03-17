@@ -30,6 +30,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
+	"github.com/sgeraldes/claude2kiro/internal/sse"
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -426,30 +427,49 @@ var ModelMap = map[string]string{
 	// Sonnet 4
 	"claude-sonnet-4-20250514": "CLAUDE_SONNET_4_20250514_V1_0",
 	// Sonnet 4.5
-	"claude-sonnet-4-5-20250929":  "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4.5":           "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4-5":           "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4-5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4.5":          "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4-5":          "CLAUDE_SONNET_4_5_20250929_V1_0",
+	// Sonnet 4.6 (mapped to Sonnet 4.5 until Kiro backend adds native support)
+	"claude-sonnet-4-6-20260301": "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4-6":          "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4.6":          "CLAUDE_SONNET_4_5_20250929_V1_0",
 	// Haiku 4.5
-	"claude-haiku-4-5-20251001":   "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	"claude-3-5-haiku-20241022":   "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	"claude-haiku-4.5":            "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	"claude-haiku-4-5":            "CLAUDE_HAIKU_4_5_20251001_V1_0",
+	"claude-haiku-4-5-20251001": "CLAUDE_HAIKU_4_5_20251001_V1_0",
+	"claude-3-5-haiku-20241022": "CLAUDE_HAIKU_4_5_20251001_V1_0",
+	"claude-haiku-4.5":          "CLAUDE_HAIKU_4_5_20251001_V1_0",
+	"claude-haiku-4-5":          "CLAUDE_HAIKU_4_5_20251001_V1_0",
 	// Opus 4.5
-	"claude-opus-4-5-20251101":    "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4.5":             "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4-5":             "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4-5-20251101": "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4.5":          "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4-5":          "CLAUDE_OPUS_4_5_20251101_V1_0",
+	// Opus 4.6 (mapped to Opus 4.5 until Kiro backend adds native support)
+	"claude-opus-4-6-20260301": "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4-6":          "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4.6":          "CLAUDE_OPUS_4_5_20251101_V1_0",
 }
 
 // getKiroModelID converts an Anthropic model name to Kiro model ID
-// First checks the static map, then tries dynamic conversion
+// First checks the static map, then falls back to family-based mapping
 func getKiroModelID(anthropicModel string) string {
 	// Check static map first
 	if kiroModel, ok := ModelMap[anthropicModel]; ok {
 		return kiroModel
 	}
 
-	// Dynamic conversion: claude-sonnet-4-5-20250929 -> CLAUDE_SONNET_4_5_20250929_V1_0
-	// Remove "claude-" prefix and convert to uppercase
+	// Family-based fallback: map unknown versions to the latest known Kiro model
+	// This handles future model releases (e.g., claude-sonnet-4-7) gracefully
+	lower := strings.ToLower(anthropicModel)
+	switch {
+	case strings.Contains(lower, "opus"):
+		return "CLAUDE_OPUS_4_5_20251101_V1_0"
+	case strings.Contains(lower, "haiku"):
+		return "CLAUDE_HAIKU_4_5_20251001_V1_0"
+	case strings.Contains(lower, "sonnet"):
+		return "CLAUDE_SONNET_4_5_20250929_V1_0"
+	}
+
+	// Last resort: dynamic conversion (may not be valid on Kiro backend)
 	model := strings.TrimPrefix(anthropicModel, "claude-")
 	model = strings.ToUpper(model)
 	model = strings.ReplaceAll(model, "-", "_")
@@ -1475,6 +1495,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", len(respBody)))
 	}
 
+	// Use new SSE builder if feature flag is enabled
+	if cfg.Advanced.UseNewSSEBuilder {
+		return handleStreamRequestWithLoggerNewBuilder(w, flusher, events, anthropicReq, messageId, cfg, lg, sessionID, requestID, capturedEvents, len(respBody))
+	}
+
+	// --- Old code path (fallback) ---
 	if len(events) > 0 {
 		// Check if this is a tool-only response (no text content events)
 		hasTextContent := false
@@ -1634,6 +1660,69 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	if len(result) > 0 && len(result) < 10 {
 		trimmed := strings.TrimSpace(result)
 		// Check for responses that look like truncated JSON/code
+		if trimmed == "{" || trimmed == "[" || trimmed == "```" ||
+			strings.HasPrefix(trimmed, "{") && !strings.HasSuffix(trimmed, "}") {
+			lg.LogError(fmt.Sprintf("WARNING: Suspiciously short/truncated response detected: %q", result))
+		}
+	}
+
+	return result
+}
+
+// capturedSSEEventCapture wraps CapturedSSEEvent slice to implement sse.EventCapture interface
+type capturedSSEEventCapture struct {
+	events *[]CapturedSSEEvent
+}
+
+func (c *capturedSSEEventCapture) Append(event, data string) {
+	if c.events != nil {
+		*c.events = append(*c.events, CapturedSSEEvent{Event: event, Data: data})
+	}
+}
+
+// handleStreamRequestWithLoggerNewBuilder handles SSE streaming using the new sse.StreamWriter.
+// This is used when config.Advanced.UseNewSSEBuilder is true.
+func handleStreamRequestWithLoggerNewBuilder(w http.ResponseWriter, flusher http.Flusher, events []parser.SSEEvent, anthropicReq AnthropicRequest, messageId string, cfg *config.Config, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent, respBodyLen int) string {
+	streamCfg := sse.StreamConfig{
+		MessageID:         messageId,
+		Model:             anthropicReq.Model,
+		InputTokens:       len(getMessageContent(anthropicReq.Messages[0].Content)),
+		StreamingDelayMax: cfg.Network.StreamingDelayMax,
+	}
+
+	delayFn := func() {
+		time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
+	}
+
+	// Analyze events for logging
+	analysis := sse.AnalyzeEvents(events)
+
+	// Log event analysis results
+	if cfg.Advanced.ComparisonMode {
+		lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events (%d bytes), tools=%d",
+			len(events), respBodyLen, analysis.ToolBlockCount))
+	} else {
+		lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
+			len(events), analysis.HasTextContent, analysis.HasToolUse, analysis.ToolBlockCount, analysis.ParserSentMessageDelta))
+	}
+
+	// Create capture wrapper if needed
+	var capture sse.EventCapture
+	if capturedEvents != nil {
+		capture = &capturedSSEEventCapture{events: capturedEvents}
+	}
+
+	var result string
+	if len(events) > 0 {
+		result = sse.StreamEventsWithCapture(w, flusher, events, streamCfg, capture, delayFn)
+	} else {
+		lg.LogError("Sending empty response due to no parsed events")
+		result = sse.StreamEmptyResponseWithCapture(w, flusher, streamCfg, capture, "[Error: No response received from backend]")
+	}
+
+	// Validate response - warn on suspiciously short/malformed responses
+	if len(result) > 0 && len(result) < 10 {
+		trimmed := strings.TrimSpace(result)
 		if trimmed == "{" || trimmed == "[" || trimmed == "```" ||
 			strings.HasPrefix(trimmed, "{") && !strings.HasSuffix(trimmed, "}") {
 			lg.LogError(fmt.Sprintf("WARNING: Suspiciously short/truncated response detected: %q", result))
@@ -1888,7 +1977,7 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "0.6.0" // Kiro IDE version to impersonate
+	kiroVersion      = "0.11.28" // Kiro IDE version to impersonate
 )
 
 // generatePKCE generates PKCE code verifier and challenge
@@ -3145,6 +3234,13 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 	// Use CodeWhisperer parser
 	events := parser.ParseEvents(respBody)
 
+	// Use new SSE builder if feature flag is enabled
+	if cfg.Advanced.UseNewSSEBuilder {
+		handleStreamRequestWithNewBuilder(w, flusher, events, anthropicReq, messageId, cfg)
+		return
+	}
+
+	// --- Old code path (fallback) ---
 	if len(events) > 0 {
 
 		// Send start event
@@ -3210,6 +3306,25 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 		sendSSEEvent(w, flusher, "message_stop", messageStop, nil)
 	}
 
+}
+
+// handleStreamRequestWithNewBuilder handles SSE streaming using the new sse.StreamWriter.
+// This is used when config.Advanced.UseNewSSEBuilder is true.
+func handleStreamRequestWithNewBuilder(w http.ResponseWriter, flusher http.Flusher, events []parser.SSEEvent, anthropicReq AnthropicRequest, messageId string, cfg *config.Config) {
+	streamCfg := sse.StreamConfig{
+		MessageID:         messageId,
+		Model:             anthropicReq.Model,
+		InputTokens:       len(getMessageContent(anthropicReq.Messages[0].Content)),
+		StreamingDelayMax: cfg.Network.StreamingDelayMax,
+	}
+
+	delayFn := func() {
+		time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
+	}
+
+	if len(events) > 0 {
+		sse.StreamEvents(w, flusher, events, streamCfg, nil, delayFn)
+	}
 }
 
 // handleNonStreamRequest handles non-streaming requests
