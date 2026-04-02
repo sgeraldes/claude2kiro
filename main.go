@@ -952,9 +952,11 @@ func runClaudeWithProxy() {
 	// Use ANTHROPIC_AUTH_TOKEN (not ANTHROPIC_API_KEY) to avoid the
 	// "Auth conflict: Both a token (claude.ai) and an API key" warning
 	// that appears when the user is also logged into claude.ai.
+	// CLAUDE2KIRO env var signals to statusline scripts that this session uses Kiro proxy.
 	claudeCmd.Env = append(os.Environ(),
 		"ANTHROPIC_BASE_URL="+baseURL,
 		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
+		"CLAUDE2KIRO=1",
 	)
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
