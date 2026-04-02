@@ -1024,6 +1024,63 @@ func ensureApiKeyApproved() {
 	os.WriteFile(claudePath, data, 0600)
 }
 
+// injectKiroChangelog writes Kiro proxy info to Claude Code's changelog cache.
+// Claude Code reads ~/.claude/cache/changelog.md and shows entries for versions
+// newer than lastReleaseNotesSeen. We prepend a section with the CURRENT Claude
+// Code version so it displays once on first Kiro session, then Claude Code
+// updates lastReleaseNotesSeen and it won't show again until next CC update.
+func injectKiroChangelog() {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	cacheDir := filepath.Join(homeDir, ".claude", "cache")
+	os.MkdirAll(cacheDir, 0755)
+	cachePath := filepath.Join(cacheDir, "changelog.md")
+
+	// Detect Claude Code version from the binary
+	ccVersion := ""
+	if out, err := exec.Command("claude", "--version").Output(); err == nil {
+		ccVersion = strings.TrimSpace(string(out))
+	}
+	if ccVersion == "" {
+		return // can't determine version
+	}
+
+	kiroHeader := fmt.Sprintf("## %s", ccVersion)
+	kiroEntry := fmt.Sprintf(`%s
+- This session is powered by Kiro via claude2kiro proxy
+- Credits from your Kiro subscription (not Anthropic API billing)
+- Proxy source: github.com/sgeraldes/claude2kiro
+`, kiroHeader)
+
+	// Read existing changelog if any
+	existing, _ := os.ReadFile(cachePath)
+
+	// Don't inject if our entry is already there
+	if strings.Contains(string(existing), "claude2kiro proxy") {
+		return
+	}
+
+	// Prepend our entry to the changelog
+	combined := kiroEntry + "\n" + string(existing)
+	os.WriteFile(cachePath, []byte(combined), 0644)
+
+	// Clear lastReleaseNotesSeen so Claude Code shows the notes
+	claudePath := filepath.Join(homeDir, ".claude.json")
+	var cfg map[string]any
+	if data, err := os.ReadFile(claudePath); err == nil {
+		json.Unmarshal(data, &cfg)
+	}
+	if cfg != nil {
+		cfg["lastReleaseNotesSeen"] = ""
+		if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+			os.WriteFile(claudePath, data, 0600)
+		}
+	}
+}
+
 // runClaudeWithProxy starts the proxy in-process, launches claude with env vars, and shuts down when claude exits.
 // Usage: claude2kiro run [claude args...]
 // Only minimal change to ~/.claude.json: pre-approves the proxy API key to skip the confirmation prompt.
@@ -1057,6 +1114,9 @@ func runClaudeWithProxy() {
 
 	// 1b. Pre-approve the proxy API key so Claude doesn't show the confirmation prompt
 	ensureApiKeyApproved()
+
+	// 1c. Inject Kiro release notes into Claude Code's changelog cache
+	injectKiroChangelog()
 
 	// 2. Create logger with file logging (same as TUI mode)
 	cfg := config.Get()
