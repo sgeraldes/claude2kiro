@@ -924,7 +924,18 @@ func main() {
 		if len(os.Args) > 2 {
 			port = os.Args[2]
 		}
-		startServer(port)
+		// Use logged server (same handlers as TUI) for observability
+		cfg := config.Get()
+		srvLg := logger.NewLogger(cfg.Logging.MaxEntries)
+		if cfg.Logging.Enabled {
+			logDir := config.ExpandPath(cfg.Logging.Directory)
+			if err := srvLg.EnableFileLogging(logDir); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to enable file logging: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Logging to %s\n", logDir)
+			}
+		}
+		startServerWithLogger(port, srvLg)
 	case "migrate-logs":
 		dateFilter := ""
 		if len(os.Args) > 2 {
@@ -1008,99 +1019,34 @@ func runClaudeWithProxy() {
 	// 1b. Pre-approve the proxy API key so Claude doesn't show the confirmation prompt
 	ensureApiKeyApproved()
 
-	// 2. Listen on a random available port
+	// 2. Create logger with file logging (same as TUI mode)
+	cfg := config.Get()
+	lg := logger.NewLogger(cfg.Logging.MaxEntries)
+
+	if cfg.Logging.Enabled {
+		logDir := config.ExpandPath(cfg.Logging.Directory)
+		if err := lg.EnableFileLogging(logDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to enable file logging: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Logging to %s\n", logDir)
+		}
+	}
+	defer lg.DisableFileLogging()
+
+	// 3. Listen on a random available port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start proxy listener: %v\n", err)
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
+	portStr := fmt.Sprintf("%d", port)
 
-	// 3. Build the proxy HTTP server (reuses the headless startServer logic)
-	mux := http.NewServeMux()
-	cfg := config.Get()
-
-	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Only POST requests are supported", http.StatusMethodNotAllowed)
-			return
-		}
-
-		tok, err := getToken()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Failed to read request body", http.StatusBadRequest)
-			return
-		}
-
-		var anthropicReq AnthropicRequest
-		if err := json.Unmarshal(body, &anthropicReq); err != nil {
-			http.Error(w, "Invalid JSON in request body", http.StatusBadRequest)
-			return
-		}
-
-		if anthropicReq.Model == "" || len(anthropicReq.Messages) == 0 {
-			http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Missing required field: model or messages"}}`, http.StatusBadRequest)
-			return
-		}
-
-		// Check for Anthropic direct bypass
-		if cfg.Advanced.AnthropicDirect {
-			if cfg.Advanced.AnthropicApiKey == "" {
-				http.Error(w, "anthropic_direct mode requires anthropic_api_key in config", http.StatusInternalServerError)
-				return
-			}
-			resp, fwdErr := forwardToAnthropicHeadless(r, body)
-			if fwdErr != nil {
-				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", fwdErr), http.StatusBadGateway)
-				return
-			}
-			defer resp.Body.Close()
-			for k, v := range resp.Header {
-				for _, val := range v {
-					w.Header().Add(k, val)
-				}
-			}
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-			return
-		}
-
-		if anthropicReq.Stream {
-			handleStreamRequest(w, anthropicReq, tok)
-		} else {
-			handleNonStreamRequest(w, anthropicReq, tok)
-		}
-	})
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"ok"}`)
-	})
-
-	mux.HandleFunc("/credits", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		info := cmd.GetCreditsInfo()
-		if info.Error != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			errMsg, _ := json.Marshal(info.Error.Error())
-			fmt.Fprintf(w, `{"error":%s}`, errMsg)
-			return
-		}
-		fmt.Fprintf(w, `{"used":%.1f,"limit":%.0f,"remaining":%.1f,"days_until_reset":%d,"plan":"%s"}`,
-			info.CreditsUsed, info.CreditsLimit, info.CreditsRemaining, info.DaysUntilReset, info.SubscriptionName)
-	})
-
+	// 4. Build the proxy HTTP server using the logged handler (same as TUI)
+	mux := buildServerMux(lg, portStr)
 	server := &http.Server{Handler: mux}
 
-	// 4. Start proxy in background goroutine
+	// 5. Start proxy in background goroutine
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "Proxy server error: %v\n", err)
@@ -1110,7 +1056,7 @@ func runClaudeWithProxy() {
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	fmt.Printf("Proxy listening on %s\n", baseURL)
 
-	// 5. Build claude command with remaining args
+	// 6. Build claude command with remaining args
 	claudeArgs := os.Args[2:] // everything after "run"
 	claudeCmd := exec.Command("claude", claudeArgs...)
 
@@ -1131,11 +1077,11 @@ func runClaudeWithProxy() {
 	claudeCmd.Stdout = os.Stdout
 	claudeCmd.Stderr = os.Stderr
 
-	// 6. Run claude (blocks until it exits)
+	// 7. Run claude (blocks until it exits)
 	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
 	runErr := claudeCmd.Run()
 
-	// 7. Shutdown proxy gracefully
+	// 8. Shutdown proxy gracefully
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	server.Shutdown(shutdownCtx)
@@ -1539,66 +1485,11 @@ func forwardToAnthropicWithHeaders(headers http.Header, body []byte, lg *logger.
 	return client.Do(req)
 }
 
-// forwardToAnthropicHeadless forwards a request to Anthropic API as a TRUE bypass proxy (headless/CLI version)
-// Copies ALL headers from the original request unchanged
-func forwardToAnthropicHeadless(originalReq *http.Request, body []byte) (*http.Response, error) {
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	// Copy ALL headers from original request (true bypass proxy)
-	for key, values := range originalReq.Header {
-		// Skip hop-by-hop headers and headers that must not be forwarded
-		switch key {
-		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
-			"Host", "Content-Length": // Host must be target, Content-Length set by Go
-			continue
-		}
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
-
-	// No timeout for streaming requests - SSE streams can run for minutes
-	client := &http.Client{}
-	return client.Do(req)
-}
-
-// forwardToAnthropicHeadlessWithHeaders forwards a request to Anthropic API using pre-copied headers (CLI version)
-// Used by comparison mode goroutines to avoid race conditions with request reuse
-func forwardToAnthropicHeadlessWithHeaders(headers http.Header, body []byte) (*http.Response, error) {
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	// Copy headers (already filtered by caller)
-	for key, values := range headers {
-		// Skip hop-by-hop headers and headers that must not be forwarded
-		switch key {
-		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
-			"Host", "Content-Length":
-			continue
-		}
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
-
-	// No timeout for streaming requests - SSE streams can run for minutes
-	client := &http.Client{}
-	return client.Do(req)
-}
-
-// startServerWithLogger starts the HTTP proxy server with TUI logging
-func startServerWithLogger(port string, lg *logger.Logger) {
-	// Create router
+// buildServerMux creates the HTTP mux with all endpoints using the logger.
+// Shared by TUI mode (startServerWithLogger) and run mode (runClaudeWithProxy).
+func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Register all endpoints
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
@@ -1849,7 +1740,13 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 	})
 
-	// Log server start
+	return mux
+}
+
+// startServerWithLogger starts the HTTP server with logging (used by TUI mode).
+func startServerWithLogger(port string, lg *logger.Logger) {
+	mux := buildServerMux(lg, port)
+
 	lg.LogInfo(fmt.Sprintf("Server started on port %s", port))
 
 	// Notify TUI that server started
@@ -1857,7 +1754,6 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 		p.Send(dashboard.ServerStartedMsg{Port: port})
 	}
 
-	// Start server
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		lg.LogError(fmt.Sprintf("Server error: %v", err))
 	}
@@ -3474,388 +3370,6 @@ func getToken() (TokenData, error) {
 	}
 
 	return token, nil
-}
-
-// logMiddleware logs all HTTP requests
-func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		fmt.Printf("\n=== Request received ===\n")
-		fmt.Printf("Time: %s\n", startTime.Format("2006-01-02 15:04:05"))
-		fmt.Printf("Method: %s\n", r.Method)
-		fmt.Printf("Path: %s\n", r.URL.Path)
-		fmt.Printf("Headers:\n")
-		for name, values := range r.Header {
-			fmt.Printf("  %s: %s\n", name, strings.Join(values, ", "))
-		}
-
-		// Call next handler
-		next(w, r)
-
-		// Calculate processing time (debug output removed - interferes with TUI)
-		_ = time.Since(startTime)
-	}
-}
-
-// startServer starts the HTTP proxy server
-func startServer(port string) {
-	// Create router
-	mux := http.NewServeMux()
-
-	// Register all endpoints
-	mux.HandleFunc("/v1/messages", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Only handle POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Only POST requests are supported", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Get current token
-		token, err := getToken()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Read request body
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusInternalServerError)
-			return
-		}
-		defer r.Body.Close()
-
-		// Parse Anthropic request
-		var anthropicReq AnthropicRequest
-		if err := jsonStr.Unmarshal(body, &anthropicReq); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to parse request body: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		// Basic validation with clear error messages
-		if anthropicReq.Model == "" {
-			http.Error(w, `{"message":"Missing required field: model"}`, http.StatusBadRequest)
-			return
-		}
-		if len(anthropicReq.Messages) == 0 {
-			http.Error(w, `{"message":"Missing required field: messages"}`, http.StatusBadRequest)
-			return
-		}
-		// Get Kiro model ID (dynamic if not in static map)
-		_ = getKiroModelID(anthropicReq.Model)
-
-		// Check for Anthropic bypass/comparison modes
-		cfg := config.Get()
-
-		if cfg.Advanced.AnthropicDirect {
-			// Anthropic Direct Mode: forward request unchanged to Anthropic
-			resp, err := forwardToAnthropicHeadless(r, body)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", err), http.StatusBadGateway)
-				return
-			}
-			defer resp.Body.Close()
-
-			// Copy ALL response headers
-			for k, v := range resp.Header {
-				w.Header()[k] = v
-			}
-			w.WriteHeader(resp.StatusCode)
-
-			// Check if this is a streaming response (SSE)
-			if resp.Header.Get("Content-Type") == "text/event-stream" {
-				// Read full response body to parse SSE events
-				respBody, err := io.ReadAll(resp.Body)
-				if err != nil {
-					return
-				}
-
-				// Forward events to client
-				flusher, ok := w.(http.Flusher)
-				if ok {
-					w.Write(respBody)
-					flusher.Flush()
-				} else {
-					w.Write(respBody)
-				}
-			} else {
-				// Non-streaming: decompress and read entire body
-				respBody, err := decompressResponse(resp)
-				if err != nil {
-					http.Error(w, "Failed to decompress response", http.StatusInternalServerError)
-					return
-				}
-				w.Write(respBody)
-			}
-			return
-		}
-
-		if cfg.Advanced.ComparisonMode {
-			// Comparison Mode: send to both Anthropic and Kiro in parallel
-			// Copy headers before goroutine to avoid race condition (request may be reused)
-			headersCopy := make(http.Header)
-			for k, v := range r.Header {
-				headersCopy[k] = v
-			}
-			go func(headers http.Header) {
-				fmt.Println("[CMP] Sending parallel request to Anthropic")
-				resp, err := forwardToAnthropicHeadlessWithHeaders(headers, body)
-				if err != nil {
-					fmt.Printf("[CMP] Anthropic error: %v\n", err)
-					return
-				}
-				defer resp.Body.Close()
-				respBody, err := io.ReadAll(resp.Body)
-				if err != nil {
-					fmt.Printf("[CMP] Failed to read Anthropic response: %v\n", err)
-					return
-				}
-
-				// Extract text preview from SSE response
-				preview := extractAnthropicTextPreview(string(respBody), 80)
-
-				// Save to secure debug file
-				debugFile, err := debug.WriteDebugFileWithScrub("comparison-anthropic", respBody)
-				if err != nil {
-					fmt.Printf("[CMP] Failed to save debug file: %v\n", err)
-					return
-				}
-				fmt.Printf("[CMP] Anthropic: preview=%q (%d bytes) -> %s\n", preview, len(respBody), debugFile)
-			}(headersCopy)
-			// Continue with normal Kiro flow below...
-		}
-
-		// Handle streaming request
-		if anthropicReq.Stream {
-			handleStreamRequest(w, anthropicReq, token)
-			return
-		}
-
-		// Handle non-streaming request
-		handleNonStreamRequest(w, anthropicReq, token)
-	}))
-
-	// Add health check endpoint
-	mux.HandleFunc("/health", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	}))
-
-	// Add 404 handler
-	mux.HandleFunc("/", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "404 Not Found", http.StatusNotFound)
-	}))
-
-	// Start server
-	fmt.Printf("Starting Anthropic API proxy server on port: %s\n", port)
-	fmt.Printf("Available endpoints:\n")
-	fmt.Printf("  POST /v1/messages - Anthropic API proxy\n")
-	fmt.Printf("  GET  /health      - Health check\n")
-	fmt.Printf("Press Ctrl+C to stop the server\n")
-
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		fmt.Printf("Failed to start server: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-// handleStreamRequest handles streaming requests
-func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData) {
-	// Set SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
-		return
-	}
-
-	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
-
-	// Build CodeWhisperer request
-	cwReq := buildCodeWhispererRequest(anthropicReq, token)
-
-	// Serialize request body
-	cwReqBody, err := jsonStr.Marshal(cwReq)
-	if err != nil {
-		sendErrorEvent(w, flusher, "Failed to serialize request", err)
-		return
-	}
-
-	// fmt.Printf("CodeWhisperer streaming request body:\n%s\n", string(cwReqBody))
-
-	// Create streaming request
-	cfg := config.Get()
-	proxyReq, err := http.NewRequest(
-		http.MethodPost,
-		cfg.Advanced.CodeWhispererEndpoint,
-		bytes.NewBuffer(cwReqBody),
-	)
-	if err != nil {
-		sendErrorEvent(w, flusher, "Failed to create proxy request", err)
-		return
-	}
-
-	// Set request headers
-	proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("Accept", "text/event-stream")
-	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
-
-	// Send request
-	client := &http.Client{}
-
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		sendErrorEvent(w, flusher, "CodeWhisperer request error", fmt.Errorf("request error: %s", err.Error()))
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		bodyStr := "(failed to read body)"
-		if readErr == nil {
-			bodyStr = string(body)
-		}
-
-		if resp.StatusCode == 403 {
-			// Try to refresh token inline (don't exit on failure)
-			if err := tryRefreshToken(); err != nil {
-				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token expired, refresh failed: %v. Please re-login", err))
-			} else {
-				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
-			}
-		} else {
-			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", bodyStr))
-		}
-		return
-	}
-
-	// Read entire response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
-		return
-	}
-
-	// Use CodeWhisperer parser
-	events := parser.ParseEvents(respBody)
-
-	// Use new SSE builder if feature flag is enabled
-	if cfg.Advanced.UseNewSSEBuilder {
-		handleStreamRequestWithNewBuilder(w, flusher, events, anthropicReq, messageId, cfg)
-		return
-	}
-
-	// --- Old code path (fallback) ---
-	if len(events) > 0 {
-
-		// Send start event
-		messageStart := map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            messageId,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []any{},
-				"model":         anthropicReq.Model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage": map[string]any{
-					"input_tokens":  len(getMessageContent(anthropicReq.Messages[0].Content)),
-					"output_tokens": 1,
-				},
-			},
-		}
-		sendSSEEvent(w, flusher, "message_start", messageStart, nil)
-		sendSSEEvent(w, flusher, "ping", map[string]string{
-			"type": "ping",
-		}, nil)
-
-		contentBlockStart := map[string]any{
-			"content_block": map[string]any{
-				"text": "",
-				"type": "text"},
-			"index": 0, "type": "content_block_start",
-		}
-
-		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, nil)
-		// Process parsed events
-
-		// Send parsed events, skipping message_delta (parser generates it prematurely)
-		// and content_block_stop (we send it ourselves to ensure correct ordering).
-		// Correct Anthropic SSE order: content_block_delta* -> content_block_stop -> message_delta -> message_stop
-		outputChars := 0
-		for _, e := range events {
-			if e.Event == "message_delta" || e.Event == "content_block_stop" || e.Event == "message_stop" {
-				continue // Skip - we'll send these in the correct order below
-			}
-			sendSSEEvent(w, flusher, e.Event, e.Data, nil)
-
-			// Accumulate output text length for approximate token count
-			if e.Event == "content_block_delta" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if delta, ok := dataMap["delta"].(map[string]any); ok {
-						if text, ok := delta["text"].(string); ok {
-							outputChars += len(text)
-						}
-					}
-				}
-			}
-
-			// Random delay for natural streaming (guard against Intn(0) panic)
-			if delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds()); delayMs > 0 {
-				time.Sleep(time.Duration(mathrand.Intn(delayMs)) * time.Millisecond)
-			}
-		}
-
-		// Approximate output tokens (~4 chars per token for English)
-		approxOutputTokens := outputChars / 4
-		if approxOutputTokens < 1 && outputChars > 0 {
-			approxOutputTokens = 1
-		}
-
-		// Send closing events in correct order
-		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{
-			"index": 0,
-			"type":  "content_block_stop",
-		}, nil)
-
-		sendSSEEvent(w, flusher, "message_delta", map[string]any{
-			"type":  "message_delta",
-			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-			"usage": map[string]any{"output_tokens": approxOutputTokens},
-		}, nil)
-
-		sendSSEEvent(w, flusher, "message_stop", map[string]any{
-			"type": "message_stop",
-		}, nil)
-	}
-
-}
-
-// handleStreamRequestWithNewBuilder handles SSE streaming using the new sse.StreamWriter.
-// This is used when config.Advanced.UseNewSSEBuilder is true.
-func handleStreamRequestWithNewBuilder(w http.ResponseWriter, flusher http.Flusher, events []parser.SSEEvent, anthropicReq AnthropicRequest, messageId string, cfg *config.Config) {
-	streamCfg := sse.StreamConfig{
-		MessageID:         messageId,
-		Model:             anthropicReq.Model,
-		InputTokens:       len(getMessageContent(anthropicReq.Messages[0].Content)),
-		StreamingDelayMax: cfg.Network.StreamingDelayMax,
-	}
-
-	delayFn := func() {
-		time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
-	}
-
-	if len(events) > 0 {
-		sse.StreamEvents(w, flusher, events, streamCfg, nil, delayFn)
-	}
 }
 
 // handleNonStreamRequest handles non-streaming requests
