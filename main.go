@@ -948,10 +948,13 @@ func runClaudeWithProxy() {
 	claudeArgs := os.Args[2:] // everything after "run"
 	claudeCmd := exec.Command("claude", claudeArgs...)
 
-	// Inherit current env + override API vars for this session only
+	// Inherit current env + override API vars for this session only.
+	// Use ANTHROPIC_AUTH_TOKEN (not ANTHROPIC_API_KEY) to avoid the
+	// "Auth conflict: Both a token (claude.ai) and an API key" warning
+	// that appears when the user is also logged into claude.ai.
 	claudeCmd.Env = append(os.Environ(),
 		"ANTHROPIC_BASE_URL="+baseURL,
-		"ANTHROPIC_API_KEY=claude2kiro",
+		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
 	)
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
