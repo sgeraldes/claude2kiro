@@ -421,41 +421,59 @@ var tokenRefreshMutex sync.Mutex
 // kiroRequestSema limits concurrent requests to Kiro backend (some 400s may be concurrency-related)
 var kiroRequestSema = make(chan struct{}, 2) // Allow max 2 concurrent requests
 
+// ModelMap translates Anthropic model IDs (sent by Claude Code) to Kiro model IDs.
+// Kiro model IDs discovered via GET /ListAvailableModels?origin=AI_EDITOR
 var ModelMap = map[string]string{
-	// Auto - lets Kiro choose the best model
-	"auto": "AUTO",
-	// Sonnet 3.5 v2
-	"claude-3-5-sonnet-20241022": "CLAUDE_SONNET_4_5_20250929_V1_0",
-	// Sonnet 3.7
-	"claude-3-7-sonnet-20250219": "CLAUDE_SONNET_4_5_20250929_V1_0",
-	// Sonnet 4
-	"claude-sonnet-4-20250514": "CLAUDE_SONNET_4_20250514_V1_0",
-	// Sonnet 4.5
-	"claude-sonnet-4-5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4.5":          "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4-5":          "CLAUDE_SONNET_4_5_20250929_V1_0",
-	// Sonnet 4.6 (mapped to Sonnet 4.5 until Kiro backend adds native support)
-	"claude-sonnet-4-6": "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4.6": "CLAUDE_SONNET_4_5_20250929_V1_0",
-	// Haiku 3.5
-	"claude-3-5-haiku-20241022": "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	// Haiku 4.5
-	"claude-haiku-4-5-20251001": "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	"claude-haiku-4.5":          "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	"claude-haiku-4-5":          "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	// Opus 4
-	"claude-opus-4-20250514": "CLAUDE_OPUS_4_5_20251101_V1_0",
-	// Opus 4.1
-	"claude-opus-4-1-20250805": "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4-1":          "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4.1":          "CLAUDE_OPUS_4_5_20251101_V1_0",
-	// Opus 4.5
-	"claude-opus-4-5-20251101": "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4.5":          "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4-5":          "CLAUDE_OPUS_4_5_20251101_V1_0",
-	// Opus 4.6 (mapped to Opus 4.5 until Kiro backend adds native support)
-	"claude-opus-4-6": "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4.6": "CLAUDE_OPUS_4_5_20251101_V1_0",
+	// Auto - lets Kiro choose the best model (1.0x credits)
+	"auto": "auto",
+	// Claude Opus 4.6 (2.2x credits, 1M context)
+	"claude-opus-4-6": "claude-opus-4.6",
+	"claude-opus-4.6": "claude-opus-4.6",
+	// Claude Opus 4.5 (2.2x credits, 200K context)
+	"claude-opus-4-5-20251101": "claude-opus-4.5",
+	"claude-opus-4-5":          "claude-opus-4.5",
+	"claude-opus-4.5":          "claude-opus-4.5",
+	// Claude Opus 4.1 -> mapped to Opus 4.5 (closest available)
+	"claude-opus-4-1-20250805": "claude-opus-4.5",
+	"claude-opus-4-1":          "claude-opus-4.5",
+	"claude-opus-4.1":          "claude-opus-4.5",
+	// Claude Opus 4.0 -> mapped to Opus 4.5
+	"claude-opus-4-20250514": "claude-opus-4.5",
+	// Claude Sonnet 4.6 (1.3x credits, 1M context)
+	"claude-sonnet-4-6": "claude-sonnet-4.6",
+	"claude-sonnet-4.6": "claude-sonnet-4.6",
+	// Claude Sonnet 4.5 (1.3x credits, 200K context)
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+	"claude-sonnet-4-5":          "claude-sonnet-4.5",
+	"claude-sonnet-4.5":          "claude-sonnet-4.5",
+	// Claude Sonnet 4.0 (1.3x credits, 200K context)
+	"claude-sonnet-4-20250514": "claude-sonnet-4",
+	// Claude Sonnet 3.7 -> mapped to Sonnet 4.5
+	"claude-3-7-sonnet-20250219": "claude-sonnet-4.5",
+	// Claude Sonnet 3.5 v2 -> mapped to Sonnet 4.5
+	"claude-3-5-sonnet-20241022": "claude-sonnet-4.5",
+	// Claude Haiku 4.5 (0.4x credits, 200K context)
+	"claude-haiku-4-5-20251001": "claude-haiku-4.5",
+	"claude-haiku-4-5":          "claude-haiku-4.5",
+	"claude-haiku-4.5":          "claude-haiku-4.5",
+	"claude-3-5-haiku-20241022": "claude-haiku-4.5",
+	// Non-Claude models (accessible via --model flag or ANTHROPIC_CUSTOM_MODEL_OPTION)
+	// DeepSeek 3.2 (0.25x credits, 164K context)
+	"deepseek-3.2":    "deepseek-3.2",
+	"deepseek-3-2":    "deepseek-3.2",
+	"deepseek-v3.2":   "deepseek-3.2",
+	"deepseek":        "deepseek-3.2",
+	// MiniMax M2.5 (0.25x credits, 196K context, text only)
+	"minimax-m2.5":    "minimax-m2.5",
+	"minimax-m2-5":    "minimax-m2.5",
+	"minimax":         "minimax-m2.5",
+	// MiniMax M2.1 (0.15x credits, 196K context)
+	"minimax-m2.1":    "minimax-m2.1",
+	"minimax-m2-1":    "minimax-m2.1",
+	// Qwen3 Coder Next (0.05x credits, 256K context)
+	"qwen3-coder-next": "qwen3-coder-next",
+	"qwen3":            "qwen3-coder-next",
+	"qwen":             "qwen3-coder-next",
 }
 
 // getKiroModelID converts an Anthropic model name to Kiro model ID
@@ -467,23 +485,24 @@ func getKiroModelID(anthropicModel string) string {
 	}
 
 	// Family-based fallback: map unknown versions to the latest known Kiro model
-	// This handles future model releases (e.g., claude-sonnet-4-7) gracefully
 	lower := strings.ToLower(anthropicModel)
 	switch {
 	case strings.Contains(lower, "opus"):
-		return "CLAUDE_OPUS_4_5_20251101_V1_0"
+		return "claude-opus-4.6"
 	case strings.Contains(lower, "haiku"):
-		return "CLAUDE_HAIKU_4_5_20251001_V1_0"
+		return "claude-haiku-4.5"
 	case strings.Contains(lower, "sonnet"):
-		return "CLAUDE_SONNET_4_5_20250929_V1_0"
+		return "claude-sonnet-4.6"
+	case strings.Contains(lower, "deepseek"):
+		return "deepseek-3.2"
+	case strings.Contains(lower, "minimax"):
+		return "minimax-m2.5"
+	case strings.Contains(lower, "qwen"):
+		return "qwen3-coder-next"
 	}
 
-	// Last resort: dynamic conversion (may not be valid on Kiro backend)
-	model := strings.TrimPrefix(anthropicModel, "claude-")
-	model = strings.ToUpper(model)
-	model = strings.ReplaceAll(model, "-", "_")
-	model = model + "_V1_0"
-	return model
+	// Last resort: pass through as-is (Kiro may accept it)
+	return anthropicModel
 }
 
 // generateUUID generates a simple UUID v4
