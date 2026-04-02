@@ -924,6 +924,17 @@ func main() {
 		if len(os.Args) > 2 {
 			port = os.Args[2]
 		}
+		// Refresh token on startup if expired
+		if tok, err := getToken(); err == nil && tok.ExpiresAt != "" {
+			if expiresAt, err := time.Parse(time.RFC3339, tok.ExpiresAt); err == nil && time.Until(expiresAt) < 5*time.Minute {
+				fmt.Fprintf(os.Stderr, "Token expired or expiring soon, refreshing...\n")
+				if err := tryRefreshToken(); err != nil {
+					fmt.Fprintf(os.Stderr, "Token refresh failed: %v\nRun 'claude2kiro login' to re-authenticate.\n", err)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Token refreshed successfully.\n")
+			}
+		}
 		// Use logged server (same handlers as TUI) for observability
 		cfg := config.Get()
 		srvLg := logger.NewLogger(cfg.Logging.MaxEntries)
@@ -1008,13 +1019,32 @@ func ensureApiKeyApproved() {
 // Usage: claude2kiro run [claude args...]
 // Only minimal change to ~/.claude.json: pre-approves the proxy API key to skip the confirmation prompt.
 func runClaudeWithProxy() {
-	// 1. Verify we have a valid token (refresh if needed)
+	// 1. Verify we have a valid token, refresh if expired
 	token, err := getToken()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "No token found. Run 'claude2kiro login' first.\n")
 		os.Exit(1)
 	}
-	_ = token // token validity is checked by getToken's proactive refresh
+
+	// Check if token is expired or expiring within 5 minutes, refresh before starting
+	if token.ExpiresAt != "" {
+		if expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt); err == nil {
+			if time.Until(expiresAt) < 5*time.Minute {
+				fmt.Fprintf(os.Stderr, "Token expired or expiring soon, refreshing...\n")
+				if err := tryRefreshToken(); err != nil {
+					fmt.Fprintf(os.Stderr, "Token refresh failed: %v\nRun 'claude2kiro login' to re-authenticate.\n", err)
+					os.Exit(1)
+				}
+				// Re-read the refreshed token
+				token, err = getToken()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to read refreshed token: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Token refreshed successfully (expires: %s)\n", token.ExpiresAt)
+			}
+		}
+	}
 
 	// 1b. Pre-approve the proxy API key so Claude doesn't show the confirmation prompt
 	ensureApiKeyApproved()
