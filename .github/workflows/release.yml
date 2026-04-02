@@ -1,71 +1,62 @@
 name: Build and Release
 
 on:
-    release:
-        types: [created]
+  release:
+    types: [created]
+
+permissions:
+  contents: write
 
 jobs:
-    build:
-        name: Build and Upload Release Assets
-        runs-on: ${{ matrix.os }}
-        strategy:
-            matrix:
-                os: [ubuntu-latest, windows-latest, macos-latest]
-                include:
-                    - os: ubuntu-latest
-                      artifact_name: claude2kiro
-                      asset_prefix: claude2kiro-linux-amd64
-                    - os: windows-latest
-                      artifact_name: claude2kiro.exe
-                      asset_prefix: claude2kiro-windows-amd64
-                    - os: macos-latest
-                      artifact_name: claude2kiro
-                      asset_prefix: claude2kiro-macos-amd64
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-            - name: Set up Go
-              uses: actions/setup-go@v4
-              with:
-                  go-version: '1.23.3'
-                  check-latest: true
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
-            - name: Build
-              run: go build -v -o ${{ matrix.artifact_name }} .
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-            - name: Install UPX
-              shell: bash
-              run: |
-                  if [ "${{ runner.os }}" == "Linux" ]; then
-                    sudo apt-get update && sudo apt-get install -y upx
-                  elif [ "${{ runner.os }}" == "macOS" ]; then
-                    brew install upx
-                  elif [ "${{ runner.os }}" == "Windows" ]; then
-                    choco install upx -y
-                  fi
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath \
+            -ldflags="-s -w -X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${{ steps.version.outputs.VERSION }}" \
+            -o claude2kiro-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
 
-            - name: Compress binary with UPX
-              shell: bash
-              run: |
-                  if [ "${{ runner.os }}" != "macOS" ]; then
-                    upx --best --lzma ${{ matrix.artifact_name }}
-                  else
-                    echo "Skipping UPX compression for macOS as it's not supported"
-                  fi
-
-            - name: Extract version from tag
-              id: get_version
-              shell: bash
-              run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-            - name: Upload Release Asset
-              uses: actions/upload-release-asset@v1
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              with:
-                  upload_url: ${{ github.event.release.upload_url }}
-                  asset_path: ./${{ matrix.artifact_name }}
-                  asset_name: ${{ matrix.asset_prefix }}-${{ steps.get_version.outputs.VERSION }}${{ endsWith(matrix.artifact_name, '.exe') && '.exe' || '' }}
-                  asset_content_type: application/octet-stream
+      - name: Upload Release Asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "claude2kiro-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" \
+            --clobber

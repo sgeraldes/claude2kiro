@@ -34,6 +34,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
+	"github.com/sgeraldes/claude2kiro/internal/tui/menu"
 	"github.com/sgeraldes/claude2kiro/parser"
 )
 
@@ -967,6 +968,8 @@ func main() {
 		}
 	case "test":
 		testProxy()
+	case "update":
+		selfUpdate()
 	case "logout":
 		logout()
 	case "help", "--help", "-h":
@@ -1079,6 +1082,138 @@ func injectKiroChangelog() {
 			os.WriteFile(claudePath, data, 0600)
 		}
 	}
+}
+
+// selfUpdate downloads the latest release from GitHub and replaces the current binary.
+func selfUpdate() {
+	currentVersion := menu.Version
+	fmt.Printf("Current version: %s\n", currentVersion)
+	fmt.Println("Checking for updates...")
+
+	// Get latest release info from GitHub API
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/sgeraldes/claude2kiro/releases/latest", nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to check for updates: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		fmt.Println("No releases found. Visit https://github.com/sgeraldes/claude2kiro/releases")
+		return
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var release struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(body, &release); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to parse release info: %v\n", err)
+		os.Exit(1)
+	}
+
+	latestVersion := strings.TrimPrefix(release.TagName, "v")
+	if latestVersion == currentVersion {
+		fmt.Printf("Already up to date (v%s)\n", currentVersion)
+		return
+	}
+
+	fmt.Printf("New version available: v%s -> v%s\n", currentVersion, latestVersion)
+
+	// Determine platform asset name
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+	ext := ""
+	if goos == "windows" {
+		ext = ".exe"
+	}
+	assetName := fmt.Sprintf("claude2kiro-%s-%s%s", goos, goarch, ext)
+
+	// Find matching asset
+	var downloadURL string
+	for _, asset := range release.Assets {
+		if asset.Name == assetName {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		fmt.Fprintf(os.Stderr, "No binary found for %s/%s in release %s\n", goos, goarch, release.TagName)
+		fmt.Fprintf(os.Stderr, "Available assets:\n")
+		for _, a := range release.Assets {
+			fmt.Fprintf(os.Stderr, "  - %s\n", a.Name)
+		}
+		os.Exit(1)
+	}
+
+	fmt.Printf("Downloading %s...\n", assetName)
+
+	// Download new binary
+	dlResp, err := http.Get(downloadURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "Download failed: HTTP %d\n", dlResp.StatusCode)
+		os.Exit(1)
+	}
+
+	newBinary, err := io.ReadAll(dlResp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read download: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Get current executable path
+	execPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to determine executable path: %v\n", err)
+		os.Exit(1)
+	}
+	execPath, _ = filepath.EvalSymlinks(execPath)
+
+	// On Windows, rename current exe first (can't overwrite running binary)
+	oldPath := execPath + ".old"
+	if goos == "windows" {
+		os.Remove(oldPath) // Remove any previous .old file
+		if err := os.Rename(execPath, oldPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to rename current binary: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Try closing all claude2kiro processes first.\n")
+			os.Exit(1)
+		}
+	}
+
+	// Write new binary
+	if err := os.WriteFile(execPath, newBinary, 0755); err != nil {
+		// On Windows, restore the old binary if write fails
+		if goos == "windows" {
+			os.Rename(oldPath, execPath)
+		}
+		fmt.Fprintf(os.Stderr, "Failed to write new binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Clean up old binary (best effort)
+	if goos == "windows" {
+		os.Remove(oldPath)
+	}
+
+	fmt.Printf("Updated to v%s\n", latestVersion)
 }
 
 // runClaudeWithProxy starts the proxy in-process, launches claude with env vars, and shuts down when claude exits.
@@ -1370,6 +1505,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
 	fmt.Println("  claude2kiro export         - Export environment variables")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
+	fmt.Println("  claude2kiro update              - Self-update to latest GitHub release")
 	fmt.Println("  claude2kiro test [msg] [model]  - Send test request to Kiro backend (debug tool)")
 	fmt.Println("  claude2kiro claude              - Configure Claude Code settings (global)")
 	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
