@@ -476,7 +476,7 @@ type CodeWhispererEvent struct {
 var tokenRefreshMutex sync.Mutex
 
 // kiroRequestSema limits concurrent requests to Kiro backend (some 400s may be concurrency-related)
-var kiroRequestSema = make(chan struct{}, 2) // Allow max 2 concurrent requests
+var kiroRequestSema = make(chan struct{}, 4) // Allow max 4 concurrent requests
 
 // ModelMap translates Anthropic model IDs (sent by Claude Code) to Kiro model IDs.
 // Kiro model IDs discovered via GET /ListAvailableModels?origin=AI_EDITOR
