@@ -825,29 +825,27 @@ func GetCreditsInfo() CreditsInfo {
 		return CreditsInfo{Error: fmt.Errorf("no token: %v", err)}
 	}
 
-	// Build URL with query params
+	// Build POST request with JSON body (CodeWhisperer endpoints use POST, not GET)
 	cfg := config.Get()
 	baseURL := cfg.Advanced.CreditsEndpoint
-	req, err := http.NewRequest("GET", baseURL, nil)
+
+	// Build request body
+	reqBody := map[string]string{
+		"origin":       "AI_EDITOR",
+		"resourceType": "AGENTIC_REQUEST",
+	}
+	if token.AuthMethod != "IdC" && token.ProfileArn != "" {
+		reqBody["profileArn"] = token.ProfileArn
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return CreditsInfo{Error: fmt.Errorf("failed to marshal request: %v", err)}
+	}
+
+	req, err := http.NewRequest("POST", baseURL, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return CreditsInfo{Error: fmt.Errorf("failed to create request: %v", err)}
 	}
-
-	// Add query parameters - different for IdC vs social auth
-	q := req.URL.Query()
-	if token.AuthMethod == "IdC" {
-		// Enterprise SSO - use AI_EDITOR origin
-		q.Add("origin", "AI_EDITOR")
-		q.Add("resourceType", "AGENTIC_REQUEST")
-	} else {
-		// Social auth - include profileArn
-		if token.ProfileArn != "" {
-			q.Add("profileArn", token.ProfileArn)
-		}
-		q.Add("origin", "AI_EDITOR")
-		q.Add("resourceType", "AGENTIC_REQUEST")
-	}
-	req.URL.RawQuery = q.Encode()
 
 	// Add headers
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
