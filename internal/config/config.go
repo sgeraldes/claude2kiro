@@ -129,7 +129,7 @@ func Default() *Config {
 		Network: NetworkConfig{
 			HTTPTimeout:          30 * time.Second,
 			TokenRefreshThreshold: 5 * time.Minute,
-			StreamingDelayMax:    300 * time.Millisecond,
+			StreamingDelayMax:    0, // No artificial delay - Claude Code handles rendering pacing
 		},
 		Advanced: AdvancedConfig{
 			CodeWhispererEndpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
