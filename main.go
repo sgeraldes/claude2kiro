@@ -987,10 +987,13 @@ func runClaudeWithProxy() {
 	// "Auth conflict: Both a token (claude.ai) and an API key" warning
 	// that appears when the user is also logged into claude.ai.
 	// CLAUDE2KIRO env var signals to statusline scripts that this session uses Kiro proxy.
+	// Disable thinking/adaptive thinking because Kiro doesn't return thinking blocks,
+	// which causes the Anthropic SDK to silently fail when it expects them.
 	claudeCmd.Env = append(os.Environ(),
 		"ANTHROPIC_BASE_URL="+baseURL,
 		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
 		"CLAUDE2KIRO=1",
+		"CLAUDE_CODE_DISABLE_THINKING=1",
 	)
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
@@ -3725,9 +3728,11 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		return
 	}
 
-	// Set request headers
+	// Set request headers (same as streaming - Kiro always returns binary event stream)
 	proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyReq.Header.Set("Accept", "text/event-stream")
+	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
 	// Send request
 	client := &http.Client{}
@@ -3755,77 +3760,70 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	textContent := ""
 	toolName := ""
 	toolUseId := ""
+	partialJsonStr := ""
 
 	contexts := []map[string]any{}
 
-	partialJsonStr := ""
+	// Extract content from parsed events.
+	// Parser generates: content_block_delta (text_delta/input_json_delta) and message_delta.
+	// Note: parser does NOT generate content_block_start or content_block_stop events.
 	for _, event := range events {
-		if event.Data != nil {
-			if dataMap, ok := event.Data.(map[string]any); ok {
-				switch dataMap["type"] {
-				case "content_block_start":
-					textContent = ""
-				case "content_block_delta":
-					if delta, ok := dataMap["delta"]; ok {
+		if event.Data == nil {
+			continue
+		}
+		dataMap, ok := event.Data.(map[string]any)
+		if !ok {
+			continue
+		}
 
-						if deltaMap, ok := delta.(map[string]any); ok {
-							switch deltaMap["type"] {
-							case "text_delta":
-								if text, ok := deltaMap["text"]; ok {
-									textContent += text.(string)
-								}
-							case "input_json_delta":
-								toolUseId = deltaMap["id"].(string)
-								toolName = deltaMap["name"].(string)
-								if partial_json, ok := deltaMap["partial_json"]; ok {
-									if strPtr, ok := partial_json.(*string); ok && strPtr != nil {
-										partialJsonStr = partialJsonStr + *strPtr
-									} else if str, ok := partial_json.(string); ok {
-										partialJsonStr = partialJsonStr + str
-									} else {
-										// partial_json error
-									}
-								} else {
-									// partial_json not found
-								}
-
-							}
-						}
+		switch event.Event {
+		case "content_block_delta":
+			if delta, ok := dataMap["delta"].(map[string]any); ok {
+				switch delta["type"] {
+				case "text_delta":
+					if text, ok := delta["text"].(string); ok {
+						textContent += text
 					}
-
-				case "content_block_stop":
-					if index, ok := dataMap["index"]; ok {
-						switch index {
-						case 1:
-							toolInput := map[string]interface{}{}
-							if err := jsonStr.Unmarshal([]byte(partialJsonStr), &toolInput); err != nil {
-								// json unmarshal error
-							}
-
-							contexts = append(contexts, map[string]interface{}{
-								"type":  "tool_use",
-								"id":    toolUseId,
-								"name":  toolName,
-								"input": toolInput,
-							})
-						case 0:
-							contexts = append(contexts, map[string]interface{}{
-								"text": textContent,
-								"type": "text",
-							})
-						}
+				case "input_json_delta":
+					if pj, ok := delta["partial_json"].(string); ok {
+						partialJsonStr += pj
 					}
 				}
+			}
+			// Also check direct content field (Kiro raw format)
+			if content, ok := dataMap["content"].(string); ok && content != "" {
+				textContent += content
+			}
 
+		case "content_block_start":
+			if cb, ok := dataMap["content_block"].(map[string]any); ok {
+				if cb["type"] == "tool_use" {
+					if name, ok := cb["name"].(string); ok {
+						toolName = name
+					}
+					if id, ok := cb["id"].(string); ok {
+						toolUseId = id
+					}
+				}
 			}
 		}
 	}
 
-	// Fallback: if text accumulated but no content_block_stop(index=0) received, still return text
-	if len(contexts) == 0 && strings.TrimSpace(textContent) != "" {
+	// Build content blocks
+	if strings.TrimSpace(textContent) != "" {
 		contexts = append(contexts, map[string]any{
 			"type": "text",
 			"text": textContent,
+		})
+	}
+	if toolName != "" && partialJsonStr != "" {
+		toolInput := map[string]any{}
+		jsonStr.Unmarshal([]byte(partialJsonStr), &toolInput)
+		contexts = append(contexts, map[string]any{
+			"type":  "tool_use",
+			"id":    toolUseId,
+			"name":  toolName,
+			"input": toolInput,
 		})
 	}
 	
