@@ -579,6 +579,40 @@ func extractImagesFromContent(content any) []ImageBlock {
 	return images
 }
 
+// cleanToolSchema removes JSON Schema meta-fields that Kiro/CodeWhisperer rejects.
+// Fields like $schema, title, $defs are valid JSON Schema but not supported by the CW API.
+func cleanToolSchema(schema map[string]any) map[string]any {
+	if schema == nil {
+		return schema
+	}
+	cleaned := make(map[string]any, len(schema))
+	for k, v := range schema {
+		// Skip unsupported JSON Schema meta-fields
+		switch k {
+		case "$schema", "title", "$defs", "$id", "$comment":
+			continue
+		}
+		// Recursively clean nested objects (e.g., properties contain schemas)
+		if nested, ok := v.(map[string]any); ok {
+			cleaned[k] = cleanToolSchema(nested)
+		} else if arr, ok := v.([]any); ok {
+			// Clean arrays (e.g., anyOf, allOf, oneOf contain schema objects)
+			cleanedArr := make([]any, len(arr))
+			for i, item := range arr {
+				if itemMap, ok := item.(map[string]any); ok {
+					cleanedArr[i] = cleanToolSchema(itemMap)
+				} else {
+					cleanedArr[i] = item
+				}
+			}
+			cleaned[k] = cleanedArr
+		} else {
+			cleaned[k] = v
+		}
+	}
+	return cleaned
+}
+
 // buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
 	cwReq := CodeWhispererRequest{}
@@ -602,11 +636,16 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "AI_EDITOR"
 	// Process tools information
-	// CodeWhisperer has a ~10KB limit on tool descriptions
+	// CodeWhisperer has limits: ~10KB per tool description, ~90 tools max (~260KB body limit)
 	const maxToolDescLength = 10000
+	const maxTools = 85 // Kiro rejects requests with ~95+ tools
 	if len(anthropicReq.Tools) > 0 {
 		var tools []CodeWhispererTool
-		for _, tool := range anthropicReq.Tools {
+		toolsToProcess := anthropicReq.Tools
+		if len(toolsToProcess) > maxTools {
+			toolsToProcess = toolsToProcess[:maxTools]
+		}
+		for _, tool := range toolsToProcess {
 			cwTool := CodeWhispererTool{}
 			cwTool.ToolSpecification.Name = tool.Name
 			// Truncate long descriptions to avoid 400 errors
@@ -615,8 +654,11 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				desc = desc[:maxToolDescLength] + "...(truncated)"
 			}
 			cwTool.ToolSpecification.Description = desc
+			// Clean the input schema: remove fields that Kiro/CodeWhisperer rejects
+			// ($schema, title, $defs are JSON Schema meta-fields not supported by CW)
+			cleanedSchema := cleanToolSchema(tool.InputSchema)
 			cwTool.ToolSpecification.InputSchema = InputSchema{
-				Json: tool.InputSchema,
+				Json: cleanedSchema,
 			}
 			tools = append(tools, cwTool)
 		}
@@ -3751,7 +3793,10 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		return
 	}
 
-	// fmt.Printf("CodeWhisperer response body:\n%s\n", string(cwRespBody))
+	// Debug: save CW request body for analysis
+	os.MkdirAll(filepath.Join(os.TempDir(), "kiro-debug"), 0755)
+	os.WriteFile(filepath.Join(os.TempDir(), "kiro-debug", "last-cw-request.json"), cwReqBody, 0600)
+	os.WriteFile(filepath.Join(os.TempDir(), "kiro-debug", "last-cw-response.bin"), cwRespBody, 0600)
 
 	respBodyStr := string(cwRespBody)
 
