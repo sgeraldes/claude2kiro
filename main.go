@@ -710,7 +710,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		var tools []CodeWhispererTool
 		toolsToProcess := anthropicReq.Tools
 		if len(toolsToProcess) > maxTools {
-			fmt.Fprintf(os.Stderr, "WARN: truncating tools from %d to %d (Kiro limit)\n", len(toolsToProcess), maxTools)
+			// Silently truncate - logged by caller if logger is available
 			toolsToProcess = toolsToProcess[:maxTools]
 		}
 		for _, tool := range toolsToProcess {
@@ -2070,7 +2070,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"stop_sequence": nil,
 				"usage": map[string]any{
 					"input_tokens":  len(cwReqBody) / 4, // Approximate from CW request body size
-					"output_tokens": 1,
+					"output_tokens": 0,
 				},
 			},
 		}
