@@ -587,9 +587,10 @@ func cleanToolSchema(schema map[string]any) map[string]any {
 	}
 	cleaned := make(map[string]any, len(schema))
 	for k, v := range schema {
-		// Skip unsupported JSON Schema meta-fields
+		// Skip unsupported JSON Schema meta-fields.
+		// $ref is also stripped because we remove $defs (dangling refs would be invalid).
 		switch k {
-		case "$schema", "title", "$defs", "$id", "$comment":
+		case "$schema", "title", "$defs", "$id", "$comment", "$ref":
 			continue
 		}
 		// Recursively clean nested objects (e.g., properties contain schemas)
@@ -643,6 +644,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		var tools []CodeWhispererTool
 		toolsToProcess := anthropicReq.Tools
 		if len(toolsToProcess) > maxTools {
+			fmt.Fprintf(os.Stderr, "WARN: truncating tools from %d to %d (Kiro limit)\n", len(toolsToProcess), maxTools)
 			toolsToProcess = toolsToProcess[:maxTools]
 		}
 		for _, tool := range toolsToProcess {
@@ -1001,7 +1003,8 @@ func runClaudeWithProxy() {
 		info := cmd.GetCreditsInfo()
 		if info.Error != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, `{"error":"%s"}`, info.Error.Error())
+			errMsg, _ := json.Marshal(info.Error.Error())
+			fmt.Fprintf(w, `{"error":%s}`, errMsg)
 			return
 		}
 		fmt.Fprintf(w, `{"used":%.1f,"limit":%.0f,"remaining":%.1f,"days_until_reset":%d,"plan":"%s"}`,
@@ -2015,8 +2018,10 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				}
 			}
 
-			// Random delay for natural streaming
-			time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
+			// Random delay for natural streaming (guard against Intn(0) panic)
+			if delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds()); delayMs > 0 {
+				time.Sleep(time.Duration(mathrand.Intn(delayMs)) * time.Millisecond)
+			}
 		}
 
 		// Only send text block stop if we sent text block start
@@ -3704,8 +3709,10 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 			}
 			sendSSEEvent(w, flusher, e.Event, e.Data, nil)
 
-			// Random delay for natural streaming
-			time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
+			// Random delay for natural streaming (guard against Intn(0) panic)
+			if delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds()); delayMs > 0 {
+				time.Sleep(time.Duration(mathrand.Intn(delayMs)) * time.Millisecond)
+			}
 		}
 
 		// Send closing events in correct order
@@ -3793,10 +3800,13 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		return
 	}
 
-	// Debug: save CW request body for analysis
-	os.MkdirAll(filepath.Join(os.TempDir(), "kiro-debug"), 0755)
-	os.WriteFile(filepath.Join(os.TempDir(), "kiro-debug", "last-cw-request.json"), cwReqBody, 0600)
-	os.WriteFile(filepath.Join(os.TempDir(), "kiro-debug", "last-cw-response.bin"), cwRespBody, 0600)
+	// Debug: save CW request/response only when KIRO_DEBUG is set
+	if os.Getenv("KIRO_DEBUG") != "" {
+		debugDir := filepath.Join(os.TempDir(), "kiro-debug")
+		os.MkdirAll(debugDir, 0700)
+		os.WriteFile(filepath.Join(debugDir, "last-cw-request.json"), cwReqBody, 0600)
+		os.WriteFile(filepath.Join(debugDir, "last-cw-response.bin"), cwRespBody, 0600)
+	}
 
 	respBodyStr := string(cwRespBody)
 
