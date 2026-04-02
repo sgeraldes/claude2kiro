@@ -2009,7 +2009,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"stop_reason":   nil,
 				"stop_sequence": nil,
 				"usage": map[string]any{
-					"input_tokens":  len(getMessageContent(anthropicReq.Messages[0].Content)),
+					"input_tokens":  len(cwReqBody) / 4, // Approximate from CW request body size
 					"output_tokens": 1,
 				},
 			},
@@ -2032,11 +2032,15 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
 
 			if e.Event == "content_block_delta" {
-				outputChars += len(getMessageContent(e.Data))
+				// Count all content: text deltas AND tool input JSON
 				if dataMap, ok := e.Data.(map[string]any); ok {
 					if delta, ok := dataMap["delta"].(map[string]any); ok {
 						if text, ok := delta["text"].(string); ok {
+							outputChars += len(text)
 							responseText.WriteString(text)
+						}
+						if pj, ok := delta["partial_json"].(string); ok {
+							outputChars += len(pj)
 						}
 					}
 				}
@@ -2135,7 +2139,7 @@ func handleStreamRequestWithLoggerNewBuilder(w http.ResponseWriter, flusher http
 	streamCfg := sse.StreamConfig{
 		MessageID:         messageId,
 		Model:             anthropicReq.Model,
-		InputTokens:       len(getMessageContent(anthropicReq.Messages[0].Content)),
+		InputTokens:       respBodyLen / 4, // Approximate from response body size
 		StreamingDelayMax: cfg.Network.StreamingDelayMax,
 	}
 
