@@ -3650,35 +3650,34 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 		sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, nil)
 		// Process parsed events
 
-		outputTokens := 0
+		// Send parsed events, skipping message_delta (parser generates it prematurely)
+		// and content_block_stop (we send it ourselves to ensure correct ordering).
+		// Correct Anthropic SSE order: content_block_delta* -> content_block_stop -> message_delta -> message_stop
 		for _, e := range events {
-			sendSSEEvent(w, flusher, e.Event, e.Data, nil)
-
-			if e.Event == "content_block_delta" {
-				outputTokens = len(getMessageContent(e.Data))
+			if e.Event == "message_delta" || e.Event == "content_block_stop" || e.Event == "message_stop" {
+				continue // Skip - we'll send these in the correct order below
 			}
+			sendSSEEvent(w, flusher, e.Event, e.Data, nil)
 
 			// Random delay for natural streaming
 			time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
 		}
 
-		contentBlockStop := map[string]any{
+		// Send closing events in correct order
+		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{
 			"index": 0,
 			"type":  "content_block_stop",
-		}
-		sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop, nil)
+		}, nil)
 
-		contentBlockStopReason := map[string]any{
-			"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{
-				"output_tokens": outputTokens,
-			},
-		}
-		sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason, nil)
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 0},
+		}, nil)
 
-		messageStop := map[string]any{
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{
 			"type": "message_stop",
-		}
-		sendSSEEvent(w, flusher, "message_stop", messageStop, nil)
+		}, nil)
 	}
 
 }
