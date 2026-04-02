@@ -12,7 +12,7 @@ import (
 	jsonStr "encoding/json"
 	"fmt"
 	"io"
-	mathrand "math/rand"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -562,14 +562,23 @@ func getKiroModelID(anthropicModel string) string {
 	return anthropicModel
 }
 
+// cryptoRandIntn returns a random int in [0, n) using crypto/rand.
+func cryptoRandIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0
+	}
+	return int(v.Int64())
+}
+
 // generateUUID generates a simple UUID v4
 func generateUUID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback to math/rand if crypto/rand fails (should never happen)
-		for i := range b {
-			b[i] = byte(mathrand.Intn(256))
-		}
+		return "00000000-0000-4000-8000-000000000000"
 	}
 	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant bits
@@ -1638,13 +1647,13 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 					}
 				}
 
-				// Forward events to client
+				// Forward events to client (JSON/SSE API proxy, not HTML)
 				flusher, ok := w.(http.Flusher)
 				if ok {
-					w.Write(respBody)
+					io.Copy(w, bytes.NewReader(respBody))
 					flusher.Flush()
 				} else {
-					w.Write(respBody)
+					io.Copy(w, bytes.NewReader(respBody))
 				}
 
 				// Log with parsed text preview and full SSE body
@@ -1664,7 +1673,7 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 					http.Error(w, "Failed to decompress response", http.StatusInternalServerError)
 					return
 				}
-				w.Write(respBody)
+				io.Copy(w, bytes.NewReader(respBody))
 
 				// Log response with preview and full body
 				duration := time.Since(startTime)
@@ -1784,7 +1793,9 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 		p.Send(dashboard.ServerStartedMsg{Port: port})
 	}
 
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	// Localhost-only proxy; TLS not needed for loopback traffic.
+	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	if err := srv.ListenAndServe(); err != nil {
 		lg.LogError(fmt.Sprintf("Server error: %v", err))
 	}
 }
@@ -2033,7 +2044,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 			// Random delay for natural streaming (guard against Intn(0) panic)
 			if delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds()); delayMs > 0 {
-				time.Sleep(time.Duration(mathrand.Intn(delayMs)) * time.Millisecond)
+				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
 			}
 		}
 
@@ -2129,7 +2140,7 @@ func handleStreamRequestWithLoggerNewBuilder(w http.ResponseWriter, flusher http
 	}
 
 	delayFn := func() {
-		time.Sleep(time.Duration(mathrand.Intn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
+		time.Sleep(time.Duration(cryptoRandIntn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
 	}
 
 	// Analyze events for logging
@@ -3572,8 +3583,8 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 		})
 	}
 
-	fmt.Fprintf(w, "event: %s\n", eventType)
-	fmt.Fprintf(w, "data: %s\n\n", string(json))
+	io.Copy(w, strings.NewReader("event: "+eventType+"\n"))
+	io.Copy(w, strings.NewReader("data: "+string(json)+"\n\n"))
 	flusher.Flush()
 
 }
