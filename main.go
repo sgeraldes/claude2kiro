@@ -767,6 +767,8 @@ func main() {
 		exportEnvVars()
 	case "claude":
 		setClaude()
+	case "run":
+		runClaudeWithProxy()
 	case "server":
 		port := "8080" // Default port
 		if len(os.Args) > 2 {
@@ -793,6 +795,138 @@ func main() {
 	}
 }
 
+// runClaudeWithProxy starts the proxy in-process, launches claude with env vars, and shuts down when claude exits.
+// Usage: claude2kiro run [claude args...]
+// This does NOT modify ~/.claude.json - it uses per-session env vars only.
+func runClaudeWithProxy() {
+	// 1. Verify we have a valid token (refresh if needed)
+	token, err := getToken()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "No token found. Run 'claude2kiro login' first.\n")
+		os.Exit(1)
+	}
+	_ = token // token validity is checked by getToken's proactive refresh
+
+	// 2. Listen on a random available port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start proxy listener: %v\n", err)
+		os.Exit(1)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	// 3. Build the proxy HTTP server (reuses the headless startServer logic)
+	mux := http.NewServeMux()
+	cfg := config.Get()
+
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST requests are supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		tok, err := getToken()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+
+		var anthropicReq AnthropicRequest
+		if err := json.Unmarshal(body, &anthropicReq); err != nil {
+			http.Error(w, "Invalid JSON in request body", http.StatusBadRequest)
+			return
+		}
+
+		if anthropicReq.Model == "" || len(anthropicReq.Messages) == 0 {
+			http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Missing required field: model or messages"}}`, http.StatusBadRequest)
+			return
+		}
+
+		// Check for Anthropic direct bypass
+		if cfg.Advanced.AnthropicDirect {
+			if cfg.Advanced.AnthropicApiKey == "" {
+				http.Error(w, "anthropic_direct mode requires anthropic_api_key in config", http.StatusInternalServerError)
+				return
+			}
+			resp, fwdErr := forwardToAnthropicHeadless(r, body)
+			if fwdErr != nil {
+				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", fwdErr), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			for k, v := range resp.Header {
+				for _, val := range v {
+					w.Header().Add(k, val)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			return
+		}
+
+		if anthropicReq.Stream {
+			handleStreamRequest(w, anthropicReq, tok)
+		} else {
+			handleNonStreamRequest(w, anthropicReq, tok)
+		}
+	})
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+	})
+
+	server := &http.Server{Handler: mux}
+
+	// 4. Start proxy in background goroutine
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "Proxy server error: %v\n", err)
+		}
+	}()
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	fmt.Printf("Proxy listening on %s\n", baseURL)
+
+	// 5. Build claude command with remaining args
+	claudeArgs := os.Args[2:] // everything after "run"
+	claudeCmd := exec.Command("claude", claudeArgs...)
+
+	// Inherit current env + override API vars for this session only
+	claudeCmd.Env = append(os.Environ(),
+		"ANTHROPIC_BASE_URL="+baseURL,
+		"ANTHROPIC_API_KEY=claude2kiro",
+	)
+	claudeCmd.Stdin = os.Stdin
+	claudeCmd.Stdout = os.Stdout
+	claudeCmd.Stderr = os.Stderr
+
+	// 6. Run claude (blocks until it exits)
+	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
+	runErr := claudeCmd.Run()
+
+	// 7. Shutdown proxy gracefully
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	server.Shutdown(shutdownCtx)
+
+	fmt.Println("Proxy stopped.")
+
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		os.Exit(1)
+	}
+}
+
 // printUsage displays CLI usage information
 func printUsage() {
 	fmt.Println("Usage:")
@@ -809,7 +943,8 @@ func printUsage() {
 	fmt.Println("  claude2kiro refresh        - Refresh the access token")
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
 	fmt.Println("  claude2kiro export         - Export environment variables")
-	fmt.Println("  claude2kiro claude         - Configure Claude Code settings")
+	fmt.Println("  claude2kiro run [args...]   - Start proxy + launch claude (per-session, no global config)")
+	fmt.Println("  claude2kiro claude         - Configure Claude Code settings (global)")
 	fmt.Println("  claude2kiro server [port]  - Start Anthropic API proxy server (headless)")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
