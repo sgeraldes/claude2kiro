@@ -784,6 +784,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "test":
+		testProxy()
 	case "logout":
 		logout()
 	case "help", "--help", "-h":
@@ -994,6 +996,148 @@ func runClaudeWithProxy() {
 	}
 }
 
+// testProxy sends a test request to the Kiro backend and dumps the raw SSE response.
+// Usage: claude2kiro test [message] [model]
+// This is a debug tool to verify the proxy/backend is working correctly.
+func testProxy() {
+	message := "Say hello in one sentence."
+	model := "claude-sonnet-4-6"
+	if len(os.Args) > 2 {
+		message = os.Args[2]
+	}
+	if len(os.Args) > 3 {
+		model = os.Args[3]
+	}
+
+	fmt.Printf("=== claude2kiro test ===\n")
+	fmt.Printf("Message: %s\n", message)
+	fmt.Printf("Model:   %s -> %s\n", model, getKiroModelID(model))
+
+	// Get token
+	token, err := getToken()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: No token found: %v\nRun 'claude2kiro login' first.\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Token:   %s...%s (expires: %s)\n", token.AccessToken[:8], token.AccessToken[len(token.AccessToken)-4:], token.ExpiresAt)
+
+	// Build request
+	anthropicReq := AnthropicRequest{
+		Model:     model,
+		MaxTokens: 256,
+		Stream:    true,
+		Messages: []AnthropicRequestMessage{
+			{Role: "user", Content: message},
+		},
+	}
+
+	cwReq := buildCodeWhispererRequest(anthropicReq, token)
+	reqBody, err := json.Marshal(cwReq)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal request: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n--- CodeWhisperer Request ---\n")
+	// Pretty print (truncate if too long)
+	prettyReq, _ := json.MarshalIndent(cwReq, "", "  ")
+	reqStr := string(prettyReq)
+	if len(reqStr) > 2000 {
+		reqStr = reqStr[:2000] + "\n...(truncated)"
+	}
+	fmt.Println(reqStr)
+
+	// Send to CodeWhisperer
+	cfg := config.Get()
+	endpoint := cfg.Advanced.CodeWhispererEndpoint
+	fmt.Printf("\n--- Sending to %s ---\n", endpoint)
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(reqBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to create HTTP request: %v\n", err)
+		os.Exit(1)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Request failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	fmt.Printf("Status:  %d %s\n", resp.StatusCode, resp.Status)
+	fmt.Printf("Headers:\n")
+	for k, v := range resp.Header {
+		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
+	}
+
+	// Read response body
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to read response: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n--- Raw Response (%d bytes) ---\n", len(respBody))
+
+	if resp.StatusCode != http.StatusOK {
+		// Try to show error as text
+		fmt.Println(string(respBody))
+		os.Exit(1)
+	}
+
+	// Save raw response for debugging
+	debugDir, _ := os.UserHomeDir()
+	debugPath := filepath.Join(debugDir, ".claude2kiro", "last-test-response.raw")
+	os.MkdirAll(filepath.Dir(debugPath), 0755)
+	os.WriteFile(debugPath, respBody, 0600)
+	fmt.Printf("(saved raw to %s)\n", debugPath)
+
+	// Parse events
+	events := parser.ParseEvents(respBody)
+	fmt.Printf("\n--- Parsed Events (%d) ---\n", len(events))
+
+	fullText := ""
+	for i, evt := range events {
+		// SSEEvent has .Event (string) and .Data (interface{})
+		dataJSON, _ := json.Marshal(evt.Data)
+		dataStr := string(dataJSON)
+		if len(dataStr) > 300 {
+			dataStr = dataStr[:300] + "..."
+		}
+		fmt.Printf("[%d] event=%s data=%s\n", i, evt.Event, dataStr)
+
+		// Extract text from content_block_delta events
+		if evt.Event == "content_block_delta" {
+			if dataMap, ok := evt.Data.(map[string]interface{}); ok {
+				if delta, ok := dataMap["delta"].(map[string]interface{}); ok {
+					if text, ok := delta["text"].(string); ok {
+						fullText += text
+					}
+				}
+			}
+		}
+		// Also try assistantResponseEvent format (raw Kiro events before conversion)
+		if dataMap, ok := evt.Data.(map[string]interface{}); ok {
+			if content, ok := dataMap["content"].(string); ok && content != "" {
+				fullText += content
+			}
+		}
+	}
+
+	fmt.Printf("\n--- Extracted Text ---\n")
+	if fullText == "" {
+		fmt.Println("(empty - no text content found in events)")
+	} else {
+		fmt.Println(fullText)
+	}
+}
+
 // printUsage displays CLI usage information
 func printUsage() {
 	fmt.Println("Usage:")
@@ -1010,9 +1154,10 @@ func printUsage() {
 	fmt.Println("  claude2kiro refresh        - Refresh the access token")
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
 	fmt.Println("  claude2kiro export         - Export environment variables")
-	fmt.Println("  claude2kiro run [args...]   - Start proxy + launch claude (per-session, no global config)")
-	fmt.Println("  claude2kiro claude         - Configure Claude Code settings (global)")
-	fmt.Println("  claude2kiro server [port]  - Start Anthropic API proxy server (headless)")
+	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
+	fmt.Println("  claude2kiro test [msg] [model]  - Send test request to Kiro backend (debug tool)")
+	fmt.Println("  claude2kiro claude              - Configure Claude Code settings (global)")
+	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
 	fmt.Println("")
