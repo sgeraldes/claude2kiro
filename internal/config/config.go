@@ -76,7 +76,8 @@ type AdvancedConfig struct {
 	ComparisonMode        bool   `yaml:"comparison_mode"`    // Debug: send to both Anthropic and Kiro
 	AnthropicDirect       bool   `yaml:"anthropic_direct"`   // Bypass: send only to Anthropic
 	AnthropicApiKey       string `yaml:"anthropic_api_key"`  // API key for Anthropic (required for comparison/direct modes)
-	UseNewSSEBuilder      bool   `yaml:"use_new_sse_builder"` // Feature flag: use new sse.EventBuilder (default: false)
+	UseNewSSEBuilder      bool   `yaml:"use_new_sse_builder"`      // Feature flag: use new sse.EventBuilder (default: false)
+	SkipPermissions       bool   `yaml:"skip_permissions"`         // Pass --dangerously-skip-permissions to claude (default: true)
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -138,6 +139,7 @@ func Default() *Config {
 			KiroRefreshEndpoint:   "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
 			KiroUsageURL:          "https://kiro.dev/usage",
 			AWSRegion:             "us-east-1",
+			SkipPermissions:       true,
 		},
 	}
 }

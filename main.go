@@ -1157,6 +1157,22 @@ func runClaudeWithProxy() {
 
 	// 6. Build claude command with remaining args
 	claudeArgs := os.Args[2:] // everything after "run"
+
+	// Prepend --dangerously-skip-permissions if configured (default: true)
+	if cfg.Advanced.SkipPermissions {
+		// Only add if user hasn't already passed a permission flag
+		hasPermFlag := false
+		for _, arg := range claudeArgs {
+			if strings.Contains(arg, "permission") || strings.Contains(arg, "allowedTools") {
+				hasPermFlag = true
+				break
+			}
+		}
+		if !hasPermFlag {
+			claudeArgs = append([]string{"--dangerously-skip-permissions"}, claudeArgs...)
+		}
+	}
+
 	claudeCmd := exec.Command("claude", claudeArgs...)
 
 	// Inherit current env + override API vars for this session only.
