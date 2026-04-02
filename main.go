@@ -424,6 +424,10 @@ var kiroRequestSema = make(chan struct{}, 2) // Allow max 2 concurrent requests
 var ModelMap = map[string]string{
 	// Auto - lets Kiro choose the best model
 	"auto": "AUTO",
+	// Sonnet 3.5 v2
+	"claude-3-5-sonnet-20241022": "CLAUDE_SONNET_4_5_20250929_V1_0",
+	// Sonnet 3.7
+	"claude-3-7-sonnet-20250219": "CLAUDE_SONNET_4_5_20250929_V1_0",
 	// Sonnet 4
 	"claude-sonnet-4-20250514": "CLAUDE_SONNET_4_20250514_V1_0",
 	// Sonnet 4.5
@@ -431,22 +435,27 @@ var ModelMap = map[string]string{
 	"claude-sonnet-4.5":          "CLAUDE_SONNET_4_5_20250929_V1_0",
 	"claude-sonnet-4-5":          "CLAUDE_SONNET_4_5_20250929_V1_0",
 	// Sonnet 4.6 (mapped to Sonnet 4.5 until Kiro backend adds native support)
-	"claude-sonnet-4-6-20260301": "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4-6":          "CLAUDE_SONNET_4_5_20250929_V1_0",
-	"claude-sonnet-4.6":          "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4-6": "CLAUDE_SONNET_4_5_20250929_V1_0",
+	"claude-sonnet-4.6": "CLAUDE_SONNET_4_5_20250929_V1_0",
+	// Haiku 3.5
+	"claude-3-5-haiku-20241022": "CLAUDE_HAIKU_4_5_20251001_V1_0",
 	// Haiku 4.5
 	"claude-haiku-4-5-20251001": "CLAUDE_HAIKU_4_5_20251001_V1_0",
-	"claude-3-5-haiku-20241022": "CLAUDE_HAIKU_4_5_20251001_V1_0",
 	"claude-haiku-4.5":          "CLAUDE_HAIKU_4_5_20251001_V1_0",
 	"claude-haiku-4-5":          "CLAUDE_HAIKU_4_5_20251001_V1_0",
+	// Opus 4
+	"claude-opus-4-20250514": "CLAUDE_OPUS_4_5_20251101_V1_0",
+	// Opus 4.1
+	"claude-opus-4-1-20250805": "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4-1":          "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4.1":          "CLAUDE_OPUS_4_5_20251101_V1_0",
 	// Opus 4.5
 	"claude-opus-4-5-20251101": "CLAUDE_OPUS_4_5_20251101_V1_0",
 	"claude-opus-4.5":          "CLAUDE_OPUS_4_5_20251101_V1_0",
 	"claude-opus-4-5":          "CLAUDE_OPUS_4_5_20251101_V1_0",
 	// Opus 4.6 (mapped to Opus 4.5 until Kiro backend adds native support)
-	"claude-opus-4-6-20260301": "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4-6":          "CLAUDE_OPUS_4_5_20251101_V1_0",
-	"claude-opus-4.6":          "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4-6": "CLAUDE_OPUS_4_5_20251101_V1_0",
+	"claude-opus-4.6": "CLAUDE_OPUS_4_5_20251101_V1_0",
 }
 
 // getKiroModelID converts an Anthropic model name to Kiro model ID
