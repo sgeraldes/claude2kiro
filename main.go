@@ -932,6 +932,19 @@ func runClaudeWithProxy() {
 		fmt.Fprintf(w, `{"status":"ok"}`)
 	})
 
+	mux.HandleFunc("/credits", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		info := cmd.GetCreditsInfo()
+		if info.Error != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"error":"%s"}`, info.Error.Error())
+			return
+		}
+		fmt.Fprintf(w, `{"used":%.1f,"limit":%.0f,"remaining":%.1f,"days_until_reset":%d,"plan":"%s"}`,
+			info.CreditsUsed, info.CreditsLimit, info.CreditsRemaining, info.DaysUntilReset, info.SubscriptionName)
+	})
+
 	server := &http.Server{Handler: mux}
 
 	// 4. Start proxy in background goroutine
