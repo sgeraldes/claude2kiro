@@ -157,10 +157,16 @@ type CodeWhispererTool struct {
 // HistoryUserMessage represents a user message in conversation history
 type HistoryUserMessage struct {
 	UserInputMessage struct {
-		Content string `json:"content"`
-		ModelId string `json:"modelId"`
-		Origin  string `json:"origin"`
+		Content                 string `json:"content"`
+		ModelId                 string `json:"modelId"`
+		Origin                  string `json:"origin"`
+		UserInputMessageContext *HistoryUserContext `json:"userInputMessageContext,omitempty"`
 	} `json:"userInputMessage"`
+}
+
+// HistoryUserContext holds tool results for history messages
+type HistoryUserContext struct {
+	ToolResults []ToolResult `json:"toolResults,omitempty"`
 }
 
 // HistoryAssistantMessage represents an assistant message in conversation history
@@ -354,6 +360,57 @@ func getMessageToolUses(content any) []HistoryToolUse {
 	}
 
 	return toolUses
+}
+
+// getMessageToolResults extracts tool_result blocks from a user message content
+func getMessageToolResults(content any) []ToolResult {
+	var results []ToolResult
+
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return results
+	}
+
+	for _, block := range blocks {
+		m, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typeVal, _ := m["type"].(string)
+		if typeVal != "tool_result" {
+			continue
+		}
+
+		tr := ToolResult{}
+		if id, ok := m["tool_use_id"].(string); ok {
+			tr.ToolUseId = id
+		}
+		// Determine status from is_error field
+		if isErr, ok := m["is_error"].(bool); ok && isErr {
+			tr.Status = "error"
+		} else {
+			tr.Status = "success"
+		}
+		// Extract content - can be string or array of blocks
+		switch c := m["content"].(type) {
+		case string:
+			tr.Content = []ToolResultContent{{Text: c}}
+		case []interface{}:
+			for _, item := range c {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					if text, ok := itemMap["text"].(string); ok {
+						tr.Content = append(tr.Content, ToolResultContent{Text: text})
+					}
+				}
+			}
+		}
+		if tr.Content == nil {
+			tr.Content = []ToolResultContent{{Text: ""}}
+		}
+		results = append(results, tr)
+	}
+
+	return results
 }
 
 // ToolResultContent represents content in a tool result (text or image)
@@ -667,12 +724,17 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools = tools
 	}
 
-	// Extract images from the current message and add directly to UserInputMessage
+	// Extract images and tool_results from the current message
 	if len(anthropicReq.Messages) > 0 {
 		lastMsg := anthropicReq.Messages[len(anthropicReq.Messages)-1]
 		images := extractImagesFromContent(lastMsg.Content)
 		if len(images) > 0 {
 			cwReq.ConversationState.CurrentMessage.UserInputMessage.Images = images
+		}
+		// If the current message contains tool_result blocks, extract them
+		toolResults := getMessageToolResults(lastMsg.Content)
+		if len(toolResults) > 0 {
+			cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults = toolResults
 		}
 	}
 
@@ -698,24 +760,49 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			}
 		}
 
-		// Then process regular message history
+		// Process regular message history with full tool use/result support.
+		// Claude Code sends: user → assistant(+tool_use) → user(+tool_result) → assistant → ...
+		// CodeWhisperer requires: assistant.toolUses must match next user.toolResults
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
-			if anthropicReq.Messages[i].Role == "user" {
-				userContent := sanitizeHistoryContent(getMessageContent(anthropicReq.Messages[i].Content))
+			msg := anthropicReq.Messages[i]
 
+			if msg.Role == "user" {
+				userContent := sanitizeHistoryContent(getMessageContent(msg.Content))
 				userMsg := HistoryUserMessage{}
 				userMsg.UserInputMessage.Content = userContent
 				userMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
 				userMsg.UserInputMessage.Origin = "AI_EDITOR"
+
+				// Extract tool_result blocks if present
+				toolResults := getMessageToolResults(msg.Content)
+				if len(toolResults) > 0 {
+					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserContext{
+						ToolResults: toolResults,
+					}
+				}
+
 				history = append(history, userMsg)
 
 				// Check if the next message is an assistant reply
 				if i+1 < len(anthropicReq.Messages)-1 && anthropicReq.Messages[i+1].Role == "assistant" {
-					content := sanitizeHistoryContent(getMessageContent(anthropicReq.Messages[i+1].Content))
+					nextMsg := anthropicReq.Messages[i+1]
+					content := sanitizeHistoryContent(getMessageContent(nextMsg.Content))
 
 					assistantMsg := HistoryAssistantMessage{}
 					assistantMsg.AssistantResponseMessage.Content = content
-					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
+
+					// Extract tool_use blocks from assistant message
+					toolUses := getMessageToolUses(nextMsg.Content)
+					if len(toolUses) > 0 {
+						tuAny := make([]any, len(toolUses))
+						for j, tu := range toolUses {
+							tuAny[j] = tu
+						}
+						assistantMsg.AssistantResponseMessage.ToolUses = tuAny
+					} else {
+						assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
+					}
+
 					history = append(history, assistantMsg)
 					i++ // Skip the already processed assistant message
 				}
@@ -2003,12 +2090,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, capturedEvents)
 		}
 
-		outputTokens := 0
+		outputChars := 0
 		for _, e := range events {
 			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
 
 			if e.Event == "content_block_delta" {
-				outputTokens = len(getMessageContent(e.Data))
+				outputChars += len(getMessageContent(e.Data))
 				if dataMap, ok := e.Data.(map[string]any); ok {
 					if delta, ok := dataMap["delta"].(map[string]any); ok {
 						if text, ok := delta["text"].(string); ok {
@@ -2039,7 +2126,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			contentBlockStopReason := map[string]any{
 				"type":  "message_delta",
 				"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-				"usage": map[string]any{"output_tokens": outputTokens},
+				"usage": map[string]any{"output_tokens": outputChars / 4},
 			}
 			sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason, capturedEvents)
 		}
@@ -3703,16 +3790,34 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 		// Send parsed events, skipping message_delta (parser generates it prematurely)
 		// and content_block_stop (we send it ourselves to ensure correct ordering).
 		// Correct Anthropic SSE order: content_block_delta* -> content_block_stop -> message_delta -> message_stop
+		outputChars := 0
 		for _, e := range events {
 			if e.Event == "message_delta" || e.Event == "content_block_stop" || e.Event == "message_stop" {
 				continue // Skip - we'll send these in the correct order below
 			}
 			sendSSEEvent(w, flusher, e.Event, e.Data, nil)
 
+			// Accumulate output text length for approximate token count
+			if e.Event == "content_block_delta" {
+				if dataMap, ok := e.Data.(map[string]any); ok {
+					if delta, ok := dataMap["delta"].(map[string]any); ok {
+						if text, ok := delta["text"].(string); ok {
+							outputChars += len(text)
+						}
+					}
+				}
+			}
+
 			// Random delay for natural streaming (guard against Intn(0) panic)
 			if delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds()); delayMs > 0 {
 				time.Sleep(time.Duration(mathrand.Intn(delayMs)) * time.Millisecond)
 			}
+		}
+
+		// Approximate output tokens (~4 chars per token for English)
+		approxOutputTokens := outputChars / 4
+		if approxOutputTokens < 1 && outputChars > 0 {
+			approxOutputTokens = 1
 		}
 
 		// Send closing events in correct order
@@ -3724,7 +3829,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, t
 		sendSSEEvent(w, flusher, "message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-			"usage": map[string]any{"output_tokens": 0},
+			"usage": map[string]any{"output_tokens": approxOutputTokens},
 		}, nil)
 
 		sendSSEEvent(w, flusher, "message_stop", map[string]any{

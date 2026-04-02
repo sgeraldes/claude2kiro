@@ -7,9 +7,19 @@ set PATH=%PATH%;C:\Program Files\Go\bin
 REM Get current datetime as YYMMDDHHMM using PowerShell (more compatible)
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyMMddHHmm'"') do set DATETIME=%%i
 
-REM Set version string: build [major.minor] (default: 0.3)
-set BASE=0.3
-if not "%~1"=="" set BASE=%~1
+REM Version logic:
+REM   build.bat 0.5   -> saves 0.5 to .version, builds with 0.5.DATETIME
+REM   build.bat       -> reads from .version (or defaults to 0.3)
+if not "%~1"=="" (
+    set BASE=%~1
+    echo %~1> .version
+) else (
+    if exist .version (
+        set /p BASE=<.version
+    ) else (
+        set BASE=0.3
+    )
+)
 set VERSION=%BASE%.%DATETIME%
 
 echo Building Claude2Kiro v%VERSION%...
