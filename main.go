@@ -2027,17 +2027,20 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, capturedEvents)
 		}
 
+		// Separate events into text deltas and non-text (tool blocks, message_delta).
+		// Anthropic requires text block to be fully closed before tool blocks begin.
 		outputChars := 0
+		var textEvents []parser.SSEEvent
+		var toolEvents []parser.SSEEvent
 		for _, e := range events {
-			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
-
 			if e.Event == "content_block_delta" {
-				// Count all content: text deltas AND tool input JSON
 				if dataMap, ok := e.Data.(map[string]any); ok {
 					if delta, ok := dataMap["delta"].(map[string]any); ok {
 						if text, ok := delta["text"].(string); ok {
 							outputChars += len(text)
 							responseText.WriteString(text)
+							textEvents = append(textEvents, e)
+							continue
 						}
 						if pj, ok := delta["partial_json"].(string); ok {
 							outputChars += len(pj)
@@ -2045,17 +2048,32 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 					}
 				}
 			}
+			toolEvents = append(toolEvents, e)
+		}
 
-			// Random delay for natural streaming (guard against Intn(0) panic)
-			if delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds()); delayMs > 0 {
+		delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds())
+		delayFn := func() {
+			if delayMs > 0 {
 				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
 			}
 		}
 
-		// Only send text block stop if we sent text block start
+		// Phase 1: Send text deltas
+		for _, e := range textEvents {
+			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
+			delayFn()
+		}
+
+		// Close text block before tool blocks (if we opened one)
 		if hasTextContent || !hasToolUse {
 			contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
 			sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop, capturedEvents)
+		}
+
+		// Phase 2: Send tool blocks and message_delta
+		for _, e := range toolEvents {
+			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
+			delayFn()
 		}
 
 		// Always send message_delta if parser didn't already send one
