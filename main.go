@@ -795,9 +795,55 @@ func main() {
 	}
 }
 
+// ensureApiKeyApproved adds the proxy's API key to Claude Code's approved list in ~/.claude.json
+// so the "Detected a custom API key" prompt is skipped. This is a minimal, non-destructive change:
+// it only appends to the customApiKeyResponses.approved array if not already present.
+func ensureApiKeyApproved() {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	claudePath := filepath.Join(homeDir, ".claude.json")
+	var cfg map[string]any
+
+	if data, err := os.ReadFile(claudePath); err == nil {
+		json.Unmarshal(data, &cfg)
+	}
+	if cfg == nil {
+		cfg = make(map[string]any)
+	}
+
+	// Claude Code uses the last 20 chars of ANTHROPIC_API_KEY to identify it
+	const proxyKeyTail = "claude2kiro" // our ANTHROPIC_API_KEY value (< 20 chars, used as-is)
+
+	// Get or create customApiKeyResponses.approved
+	responses, _ := cfg["customApiKeyResponses"].(map[string]any)
+	if responses == nil {
+		responses = make(map[string]any)
+	}
+
+	approved, _ := responses["approved"].([]any)
+	for _, v := range approved {
+		if s, ok := v.(string); ok && s == proxyKeyTail {
+			return // already approved
+		}
+	}
+
+	approved = append(approved, proxyKeyTail)
+	responses["approved"] = approved
+	cfg["customApiKeyResponses"] = responses
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(claudePath, data, 0600)
+}
+
 // runClaudeWithProxy starts the proxy in-process, launches claude with env vars, and shuts down when claude exits.
 // Usage: claude2kiro run [claude args...]
-// This does NOT modify ~/.claude.json - it uses per-session env vars only.
+// Only minimal change to ~/.claude.json: pre-approves the proxy API key to skip the confirmation prompt.
 func runClaudeWithProxy() {
 	// 1. Verify we have a valid token (refresh if needed)
 	token, err := getToken()
@@ -806,6 +852,9 @@ func runClaudeWithProxy() {
 		os.Exit(1)
 	}
 	_ = token // token validity is checked by getToken's proactive refresh
+
+	// 1b. Pre-approve the proxy API key so Claude doesn't show the confirmation prompt
+	ensureApiKeyApproved()
 
 	// 2. Listen on a random available port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
