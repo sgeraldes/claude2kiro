@@ -894,18 +894,20 @@ func GetCreditsInfo() CreditsInfo {
 		SubscriptionName: usageResp.SubscriptionInfo.SubscriptionTitle,
 	}
 
-	if len(usageResp.UsageBreakdownList) > 0 {
-		breakdown := usageResp.UsageBreakdownList[0]
-		info.CreditsUsed = breakdown.CurrentUsageWithPrecision
-		if info.CreditsUsed == 0 {
-			info.CreditsUsed = breakdown.CurrentUsage
-		}
-		info.CreditsLimit = breakdown.UsageLimitWithPrecision
-		if info.CreditsLimit == 0 {
-			info.CreditsLimit = breakdown.UsageLimit
-		}
-		info.CreditsRemaining = info.CreditsLimit - info.CreditsUsed
+	if len(usageResp.UsageBreakdownList) == 0 {
+		return CreditsInfo{Error: fmt.Errorf("empty usage data (no usageBreakdownList in response)")}
 	}
+
+	breakdown := usageResp.UsageBreakdownList[0]
+	info.CreditsUsed = breakdown.CurrentUsageWithPrecision
+	if info.CreditsUsed == 0 {
+		info.CreditsUsed = breakdown.CurrentUsage
+	}
+	info.CreditsLimit = breakdown.UsageLimitWithPrecision
+	if info.CreditsLimit == 0 {
+		info.CreditsLimit = breakdown.UsageLimit
+	}
+	info.CreditsRemaining = info.CreditsLimit - info.CreditsUsed
 
 	return info
 }
