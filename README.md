@@ -9,9 +9,15 @@
 </p>
 
 <p align="center">
+  <img alt="GitHub Release" src="https://img.shields.io/github/v/release/sgeraldes/claude2kiro?color=success" />
+  <img alt="Downloads" src="https://img.shields.io/github/downloads/sgeraldes/claude2kiro/total?color=blue" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-8A2BE2" />
   <img alt="Built with Go" src="https://img.shields.io/badge/built%20with-Go-00ADD8?logo=go&logoColor=white" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/sgeraldes/claude2kiro/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/sgeraldes/claude2kiro?style=social" /></a>
 </p>
 
 <p align="center">
