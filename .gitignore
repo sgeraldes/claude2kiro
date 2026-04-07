@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.exe~
+claude2kiro
+claude2kiro-*
+claude2kiro-launcher*
+
+# Build output
+dist/
+build_output.txt
+.version
+
+# Local/dev-only files
+.claude/
+.vscode/
+CLAUDE.md
+
+# Debug files
+*response.raw
+logs/
+*.log
+
+# OS files
+NUL
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code temp files
+tmpclaude-*
