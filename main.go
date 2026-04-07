@@ -1108,19 +1108,16 @@ func installPlugin() {
 	}
 
 	pluginID := "kiro-proxy@local"
-	if _, exists := plugins[pluginID]; !exists {
-		plugins[pluginID] = []any{map[string]any{
-			"scope":       "project",
-			"projectPath": filepath.Join(homeDir),
-			"installPath": cacheDir,
-			"version":     menu.Version,
-			"installedAt": time.Now().Format(time.RFC3339),
-			"lastUpdated": time.Now().Format(time.RFC3339),
-		}}
-		installed["plugins"] = plugins
-		if data, err := json.MarshalIndent(installed, "", "  "); err == nil {
-			os.WriteFile(installedPath, data, 0644)
-		}
+	plugins[pluginID] = []any{map[string]any{
+		"scope":       "user",
+		"installPath": cacheDir,
+		"version":     menu.Version,
+		"installedAt": time.Now().Format(time.RFC3339),
+		"lastUpdated": time.Now().Format(time.RFC3339),
+	}}
+	installed["plugins"] = plugins
+	if data, err := json.MarshalIndent(installed, "", "  "); err == nil {
+		os.WriteFile(installedPath, data, 0644)
 	}
 
 	// Enable in settings.json
@@ -1132,12 +1129,10 @@ func installPlugin() {
 	if settings != nil {
 		enabledPlugins, _ := settings["enabledPlugins"].(map[string]any)
 		if enabledPlugins != nil {
-			if _, exists := enabledPlugins[pluginID]; !exists {
-				enabledPlugins[pluginID] = true
-				settings["enabledPlugins"] = enabledPlugins
-				if data, err := json.MarshalIndent(settings, "", "  "); err == nil {
-					os.WriteFile(settingsPath, data, 0644)
-				}
+			enabledPlugins[pluginID] = true
+			settings["enabledPlugins"] = enabledPlugins
+			if data, err := json.MarshalIndent(settings, "", "  "); err == nil {
+				os.WriteFile(settingsPath, data, 0644)
 			}
 		}
 	}
