@@ -825,31 +825,26 @@ func GetCreditsInfo() CreditsInfo {
 		return CreditsInfo{Error: fmt.Errorf("no token: %v", err)}
 	}
 
-	// Build POST request with JSON body (CodeWhisperer endpoints use POST, not GET)
+	// Build GET request with query parameters (matches Kiro SDK's GetUsageLimitsCommand)
 	cfg := config.Get()
 	baseURL := cfg.Advanced.CreditsEndpoint
 
-	// Build request body
-	reqBody := map[string]string{
-		"origin":       "AI_EDITOR",
-		"resourceType": "AGENTIC_REQUEST",
-	}
-	if token.AuthMethod != "IdC" && token.ProfileArn != "" {
-		reqBody["profileArn"] = token.ProfileArn
-	}
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return CreditsInfo{Error: fmt.Errorf("failed to marshal request: %v", err)}
-	}
-
-	req, err := http.NewRequest("POST", baseURL, bytes.NewBuffer(bodyBytes))
+	req, err := http.NewRequest("GET", baseURL, nil)
 	if err != nil {
 		return CreditsInfo{Error: fmt.Errorf("failed to create request: %v", err)}
 	}
 
+	// Add query parameters
+	q := req.URL.Query()
+	q.Set("origin", "AI_EDITOR")
+	q.Set("resourceType", "AGENTIC_REQUEST")
+	if token.ProfileArn != "" {
+		q.Set("profileArn", token.ProfileArn)
+	}
+	req.URL.RawQuery = q.Encode()
+
 	// Add headers
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
 	client := &http.Client{Timeout: config.Get().Network.HTTPTimeout}

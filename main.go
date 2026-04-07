@@ -994,6 +994,20 @@ func main() {
 		selfUpdate()
 	case "logout":
 		logout()
+	case "credits":
+		info := cmd.GetCreditsInfo()
+		if info.Error != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", info.Error)
+			os.Exit(1)
+		}
+		pct := 0.0
+		if info.CreditsLimit > 0 {
+			pct = info.CreditsUsed / info.CreditsLimit * 100
+		}
+		fmt.Printf("Plan:      %s\n", info.SubscriptionName)
+		fmt.Printf("Used:      %.1f / %.0f (%.0f%%)\n", info.CreditsUsed, info.CreditsLimit, pct)
+		fmt.Printf("Remaining: %.1f\n", info.CreditsRemaining)
+		fmt.Printf("Resets in: %d days\n", info.DaysUntilReset)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -1803,6 +1817,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro test [msg] [model]  - Send test request to Kiro backend (debug tool)")
 	fmt.Println("  claude2kiro claude              - Configure Claude Code settings (global)")
 	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
+	fmt.Println("  claude2kiro credits             - Show Kiro subscription credit usage")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
 	fmt.Println("")

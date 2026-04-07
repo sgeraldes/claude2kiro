@@ -524,8 +524,8 @@ func (m *Model) loadSettings() {
 			Type:        TypeText,
 			Value:       m.config.Advanced.CreditsEndpoint,
 			ExtendedHelp: ExtendedHelp{
-				DefaultValue:     "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits",
-				RecommendedValue: "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits",
+				DefaultValue:     "https://q.us-east-1.amazonaws.com/getUsageLimits",
+				RecommendedValue: "https://q.us-east-1.amazonaws.com/getUsageLimits",
 				Sensitive:        true,
 				DetailedDesc:     "The AWS API endpoint for fetching credit/usage information. Used to display remaining credits in the dashboard.",
 			},

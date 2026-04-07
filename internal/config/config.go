@@ -143,7 +143,7 @@ func Default() *Config {
 		},
 		Advanced: AdvancedConfig{
 			CodeWhispererEndpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-			CreditsEndpoint:       "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits",
+			CreditsEndpoint:       "https://q.us-east-1.amazonaws.com/getUsageLimits",
 			KiroAuthEndpoint:      "https://prod.us-east-1.auth.desktop.kiro.dev",
 			KiroRefreshEndpoint:   "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
 			KiroUsageURL:          "https://kiro.dev/usage",
