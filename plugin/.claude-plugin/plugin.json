@@ -1,0 +1,10 @@
+{
+  "name": "kiro-proxy",
+  "version": "1.0.0",
+  "description": "Control and monitor the claude2kiro proxy from within Claude Code",
+  "author": {
+    "name": "Sebastian Geraldes",
+    "url": "https://github.com/sgeraldes/claude2kiro"
+  },
+  "commands": "./commands"
+}
