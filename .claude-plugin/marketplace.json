@@ -1,0 +1,25 @@
+{
+  "name": "claude2kiro",
+  "owner": {
+    "name": "Sebastian Geraldes",
+    "url": "https://github.com/sgeraldes/claude2kiro"
+  },
+  "metadata": {
+    "description": "Official marketplace for the Claude2Kiro proxy plugin",
+    "version": "1.0.1"
+  },
+  "plugins": [
+    {
+      "name": "kiro-proxy",
+      "description": "Control and monitor the claude2kiro proxy from within Claude Code",
+      "version": "1.0.1",
+      "author": {
+        "name": "Sebastian Geraldes",
+        "url": "https://github.com/sgeraldes/claude2kiro"
+      },
+      "homepage": "https://github.com/sgeraldes/claude2kiro",
+      "tags": ["kiro", "proxy", "aws", "codewhisperer"],
+      "source": "./kiro-proxy"
+    }
+  ]
+}

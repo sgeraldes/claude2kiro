@@ -1055,23 +1055,24 @@ func ensureApiKeyApproved() {
 // Code version so it displays once on first Kiro session, then Claude Code
 // updates lastReleaseNotesSeen and it won't show again until next CC update.
 //
-//go:embed plugin/.claude-plugin/plugin.json plugin/commands/*.md
+//go:embed plugin/.claude-plugin/plugin.json plugin/commands/*.md .claude-plugin/marketplace.json
 var pluginFS embed.FS
 
 // installPlugin installs or updates the kiro-proxy Claude Code plugin.
-// Copies embedded plugin files to ~/.claude/plugins/local/kiro-proxy/ and
-// registers it in installed_plugins.json + enables in settings.json.
+// It creates a local marketplace for claude2kiro, copies the files there,
+// and registers the plugin globally so Claude Code loads it.
 func installPlugin() {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return
 	}
 
-	pluginDir := filepath.Join(homeDir, ".claude", "plugins", "local", "kiro-proxy")
-	cacheDir := filepath.Join(homeDir, ".claude", "plugins", "cache", "local", "kiro-proxy", menu.Version)
+	marketplaceDir := filepath.Join(homeDir, ".claude", "plugins", "marketplaces", "claude2kiro")
+	pluginSourceDir := filepath.Join(marketplaceDir, "kiro-proxy")
+	cacheDir := filepath.Join(homeDir, ".claude", "plugins", "cache", "claude2kiro", "kiro-proxy", menu.Version)
 
-	// Write plugin files to both local and cache directories
-	for _, dir := range []string{pluginDir, cacheDir} {
+	// Write plugin files to both marketplace and cache directories
+	for _, dir := range []string{pluginSourceDir, cacheDir} {
 		os.MkdirAll(filepath.Join(dir, ".claude-plugin"), 0755)
 		os.MkdirAll(filepath.Join(dir, "commands"), 0755)
 
@@ -1084,6 +1085,14 @@ func installPlugin() {
 		if data, err := pluginFS.ReadFile("plugin/.claude-plugin/plugin.json"); err == nil {
 			os.WriteFile(filepath.Join(dir, ".claude-plugin", "plugin.json"), data, 0644)
 		}
+		
+		// Copy marketplace.json to the marketplace root
+		if dir == pluginSourceDir {
+			if data, err := pluginFS.ReadFile(".claude-plugin/marketplace.json"); err == nil {
+				os.MkdirAll(filepath.Join(marketplaceDir, ".claude-plugin"), 0755)
+				os.WriteFile(filepath.Join(marketplaceDir, ".claude-plugin", "marketplace.json"), data, 0644)
+			}
+		}
 
 		// Copy command files
 		for _, e := range entries {
@@ -1091,6 +1100,27 @@ func installPlugin() {
 				os.WriteFile(filepath.Join(dir, "commands", e.Name()), data, 0644)
 			}
 		}
+	}
+
+	// Register marketplace in known_marketplaces.json
+	marketplacesPath := filepath.Join(homeDir, ".claude", "plugins", "known_marketplaces.json")
+	var marketplaces map[string]any
+	if data, err := os.ReadFile(marketplacesPath); err == nil {
+		json.Unmarshal(data, &marketplaces)
+	}
+	if marketplaces == nil {
+		marketplaces = map[string]any{}
+	}
+	marketplaces["claude2kiro"] = map[string]any{
+		"source": map[string]string{
+			"source": "directory",
+			"path":   marketplaceDir,
+		},
+		"installLocation": marketplaceDir,
+		"lastUpdated":     time.Now().Format(time.RFC3339),
+	}
+	if data, err := json.MarshalIndent(marketplaces, "", "  "); err == nil {
+		os.WriteFile(marketplacesPath, data, 0644)
 	}
 
 	// Register in installed_plugins.json
@@ -1107,7 +1137,7 @@ func installPlugin() {
 		plugins = map[string]any{}
 	}
 
-	pluginID := "kiro-proxy@local"
+	pluginID := "kiro-proxy@claude2kiro"
 	plugins[pluginID] = []any{map[string]any{
 		"scope":       "user",
 		"installPath": cacheDir,
