@@ -662,8 +662,75 @@ func extractImagesFromContent(content any) []ImageBlock {
 	return images
 }
 
+// resolveSchemaRefs resolves $ref references by inlining definitions from $defs.
+// This must be called BEFORE stripping $defs/$ref to avoid leaving empty objects.
+func resolveSchemaRefs(schema map[string]any) map[string]any {
+	if schema == nil {
+		return schema
+	}
+	// Extract $defs from the root schema
+	defs, _ := schema["$defs"].(map[string]any)
+	if defs == nil {
+		return schema
+	}
+	// Resolve all refs in the schema tree
+	return resolveRefs(schema, defs)
+}
+
+// resolveRefs recursively replaces {"$ref": "#/$defs/Name"} with the inlined definition.
+func resolveRefs(node map[string]any, defs map[string]any) map[string]any {
+	if node == nil {
+		return nil
+	}
+	// If this node IS a $ref, resolve it
+	if ref, ok := node["$ref"].(string); ok {
+		// Parse "#/$defs/Name" format
+		const prefix = "#/$defs/"
+		if strings.HasPrefix(ref, prefix) {
+			defName := ref[len(prefix):]
+			if def, ok := defs[defName].(map[string]any); ok {
+				// Return a copy of the definition (resolved recursively)
+				return resolveRefs(copyMap(def), defs)
+			}
+		}
+		// Unresolvable ref - return as-is (will be stripped later)
+		return node
+	}
+
+	resolved := make(map[string]any, len(node))
+	for k, v := range node {
+		switch val := v.(type) {
+		case map[string]any:
+			resolved[k] = resolveRefs(val, defs)
+		case []any:
+			resolvedArr := make([]any, len(val))
+			for i, item := range val {
+				if itemMap, ok := item.(map[string]any); ok {
+					resolvedArr[i] = resolveRefs(itemMap, defs)
+				} else {
+					resolvedArr[i] = item
+				}
+			}
+			resolved[k] = resolvedArr
+		default:
+			resolved[k] = v
+		}
+	}
+	return resolved
+}
+
+// copyMap creates a shallow copy of a map
+func copyMap(m map[string]any) map[string]any {
+	c := make(map[string]any, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
 // cleanToolSchema removes JSON Schema meta-fields that Kiro/CodeWhisperer rejects.
 // Fields like $schema, title, $defs are valid JSON Schema but not supported by the CW API.
+// NOTE: $ref references are resolved BEFORE calling this (see resolveSchemaRefs).
 func cleanToolSchema(schema map[string]any) map[string]any {
 	if schema == nil {
 		return schema
@@ -671,7 +738,6 @@ func cleanToolSchema(schema map[string]any) map[string]any {
 	cleaned := make(map[string]any, len(schema))
 	for k, v := range schema {
 		// Skip unsupported JSON Schema meta-fields.
-		// $ref is also stripped because we remove $defs (dangling refs would be invalid).
 		switch k {
 		case "$schema", "title", "$defs", "$id", "$comment", "$ref":
 			continue
@@ -745,7 +811,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			cwTool.ToolSpecification.Description = desc
 			// Clean the input schema: remove fields that Kiro/CodeWhisperer rejects
 			// ($schema, title, $defs are JSON Schema meta-fields not supported by CW)
-			cleanedSchema := cleanToolSchema(tool.InputSchema)
+			// First resolve $ref references by inlining $defs, then clean meta-fields
+			resolvedSchema := resolveSchemaRefs(tool.InputSchema)
+			cleanedSchema := cleanToolSchema(resolvedSchema)
 			cwTool.ToolSpecification.InputSchema = InputSchema{
 				Json: cleanedSchema,
 			}
