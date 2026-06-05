@@ -38,6 +38,7 @@ Here are the Kiro model mappings and credit costs:
 | deepseek / deepseek-3-2 | deepseek-3.2 | 0.25x |
 | minimax / minimax-m2-5 | minimax-m2.5 | 0.25x |
 | minimax-m2-1 | minimax-m2.1 | 0.15x |
+| glm-5 | glm-5 | 0.5x |
 | qwen / qwen3-coder-next | qwen3-coder-next | 0.05x |
 
 ## Family Fallback
@@ -45,6 +46,9 @@ When Claude Code sends a model not in the static map, the proxy matches by famil
 - Contains "opus" -> claude-opus-4.8
 - Contains "sonnet" -> claude-sonnet-4.8
 - Contains "haiku" -> claude-haiku-4.8
+- Contains "deepseek" -> deepseek-3.2
+- Contains "minimax" -> minimax-m2.5
+- Contains "qwen" -> qwen3-coder-next
 
 ## Kiro Plans
 
@@ -57,5 +61,5 @@ When Claude Code sends a model not in the static map, the proxy matches by famil
 
 ## Notes
 - "Auto" model (1.0x) lets Kiro choose the best model per task
-- Kiro has a tool limit of ~85 tools per request (Claude Code may send 150+, proxy truncates silently)
-- Run `/kiro-proxy:credits` to check your current usage
+- Kiro has a tool limit of ~85 tools per request (proxy truncates silently)
+- Run `/kiro-proxy:credits` to check current usage
