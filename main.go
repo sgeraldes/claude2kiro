@@ -500,6 +500,12 @@ func getKiroSema() chan struct{} {
 var ModelMap = map[string]string{
 	// Auto - lets Kiro choose the best model (1.0x credits)
 	"auto": "auto",
+	// Claude Opus 4.8
+	"claude-opus-4-8": "claude-opus-4.8",
+	"claude-opus-4.8": "claude-opus-4.8",
+	// Claude Opus 4.7
+	"claude-opus-4-7": "claude-opus-4.7",
+	"claude-opus-4.7": "claude-opus-4.7",
 	// Claude Opus 4.6 (2.2x credits, 1M context)
 	"claude-opus-4-6": "claude-opus-4.6",
 	"claude-opus-4.6": "claude-opus-4.6",
@@ -513,6 +519,12 @@ var ModelMap = map[string]string{
 	"claude-opus-4.1":          "claude-opus-4.5",
 	// Claude Opus 4.0 -> mapped to Opus 4.5
 	"claude-opus-4-20250514": "claude-opus-4.5",
+	// Claude Sonnet 4.8
+	"claude-sonnet-4-8": "claude-sonnet-4.8",
+	"claude-sonnet-4.8": "claude-sonnet-4.8",
+	// Claude Sonnet 4.7
+	"claude-sonnet-4-7": "claude-sonnet-4.7",
+	"claude-sonnet-4.7": "claude-sonnet-4.7",
 	// Claude Sonnet 4.6 (1.3x credits, 1M context)
 	"claude-sonnet-4-6": "claude-sonnet-4.6",
 	"claude-sonnet-4.6": "claude-sonnet-4.6",
@@ -526,6 +538,15 @@ var ModelMap = map[string]string{
 	"claude-3-7-sonnet-20250219": "claude-sonnet-4.5",
 	// Claude Sonnet 3.5 v2 -> mapped to Sonnet 4.5
 	"claude-3-5-sonnet-20241022": "claude-sonnet-4.5",
+	// Claude Haiku 4.8
+	"claude-haiku-4-8": "claude-haiku-4.8",
+	"claude-haiku-4.8": "claude-haiku-4.8",
+	// Claude Haiku 4.7
+	"claude-haiku-4-7": "claude-haiku-4.7",
+	"claude-haiku-4.7": "claude-haiku-4.7",
+	// Claude Haiku 4.6
+	"claude-haiku-4-6": "claude-haiku-4.6",
+	"claude-haiku-4.6": "claude-haiku-4.6",
 	// Claude Haiku 4.5 (0.4x credits, 200K context)
 	"claude-haiku-4-5-20251001": "claude-haiku-4.5",
 	"claude-haiku-4-5":          "claude-haiku-4.5",
@@ -562,11 +583,11 @@ func getKiroModelID(anthropicModel string) string {
 	lower := strings.ToLower(anthropicModel)
 	switch {
 	case strings.Contains(lower, "opus"):
-		return "claude-opus-4.6"
+		return "claude-opus-4.8"
 	case strings.Contains(lower, "haiku"):
-		return "claude-haiku-4.5"
+		return "claude-haiku-4.8"
 	case strings.Contains(lower, "sonnet"):
-		return "claude-sonnet-4.6"
+		return "claude-sonnet-4.8"
 	case strings.Contains(lower, "deepseek"):
 		return "deepseek-3.2"
 	case strings.Contains(lower, "minimax"):
@@ -767,18 +788,11 @@ func cleanToolSchema(schema map[string]any) map[string]any {
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
 	cwReq := CodeWhispererRequest{}
 
-	// Set ProfileArn based on auth method
-	if token.AuthMethod == "IdC" {
-		// For IdC, omit ProfileArn - the token itself identifies the user
-		cwReq.ProfileArn = ""
+	// Set ProfileArn - required for all auth methods since Kiro IDE 0.11.133+
+	if token.ProfileArn != "" {
+		cwReq.ProfileArn = token.ProfileArn
 	} else {
-		// For social auth (GitHub/Google), use the profileArn from the token response
-		// or fall back to the hardcoded Kiro consumer profile
-		if token.ProfileArn != "" {
-			cwReq.ProfileArn = token.ProfileArn
-		} else {
-			cwReq.ProfileArn = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
-		}
+		cwReq.ProfileArn = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
 	}
 	cwReq.ConversationState.ChatTriggerType = "MANUAL"
 	cwReq.ConversationState.ConversationId = generateUUID()
@@ -2879,6 +2893,80 @@ func getLoginConfigPath() string {
 	return filepath.Join(homeDir, ".aws", "sso", "cache", "claude2kiro-login-config.json")
 }
 
+// readKiroProfileArn reads the profileArn from Kiro IDE's local config.
+// Kiro stores this in its globalStorage after login.
+func readKiroProfileArn() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	// Kiro IDE (macOS)
+	paths := []string{
+		filepath.Join(homeDir, "Library", "Application Support", "Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json"),
+		// Linux
+		filepath.Join(homeDir, ".config", "Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json"),
+		// Windows
+		filepath.Join(homeDir, "AppData", "Roaming", "Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json"),
+	}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var profile struct {
+			Arn string `json:"arn"`
+		}
+		if json.Unmarshal(data, &profile) == nil && profile.Arn != "" {
+			return profile.Arn
+		}
+	}
+	return ""
+}
+
+// fetchProfileArnFromAPI discovers the profileArn by calling Kiro's ListAvailableProfiles API.
+// This is the fallback for users who don't have Kiro IDE installed.
+func fetchProfileArnFromAPI(accessToken string) string {
+	regions := []string{"us-east-1", "eu-central-1"}
+	for _, region := range regions {
+		url := fmt.Sprintf("https://management.%s.kiro.dev/ListAvailableProfiles", region)
+		req, err := http.NewRequest("POST", url, bytes.NewBufferString("{}"))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			continue
+		}
+		// Response contains profiles array with ARNs
+		var result struct {
+			Profiles []struct {
+				Arn string `json:"arn"`
+			} `json:"profiles"`
+		}
+		if json.Unmarshal(body, &result) == nil && len(result.Profiles) > 0 {
+			return result.Profiles[0].Arn
+		}
+		// Try alternate response shape
+		var alt struct {
+			ProfileArn string `json:"profileArn"`
+		}
+		if json.Unmarshal(body, &alt) == nil && alt.ProfileArn != "" {
+			return alt.ProfileArn
+		}
+	}
+	return ""
+}
+
 // readLoginConfig reads the saved login configuration
 func readLoginConfig() (*LoginConfig, error) {
 	path := getLoginConfigPath()
@@ -3111,7 +3199,7 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "0.11.28" // Kiro IDE version to impersonate
+	kiroVersion      = "0.11.107" // Kiro IDE version to impersonate
 )
 
 // generatePKCE generates PKCE code verifier and challenge
@@ -3570,6 +3658,13 @@ func loginIdC(provider, startUrl, region string) {
 		if err != nil {
 			fmt.Printf("Failed to exchange code for tokens: %v\n", err)
 			os.Exit(1)
+		}
+
+		// Discover profileArn from Kiro IDE config or API
+		if arn := readKiroProfileArn(); arn != "" {
+			token.ProfileArn = arn
+		} else if arn := fetchProfileArnFromAPI(token.AccessToken); arn != "" {
+			token.ProfileArn = arn
 		}
 
 		// Save token to file
@@ -4110,6 +4205,15 @@ func getToken() (TokenData, error) {
 	var token TokenData
 	if err := jsonStr.Unmarshal(data, &token); err != nil {
 		return TokenData{}, fmt.Errorf("failed to parse token file: %v", err)
+	}
+
+	// Auto-discover profileArn from Kiro IDE if missing
+	if token.ProfileArn == "" && token.AuthMethod == "IdC" {
+		if arn := readKiroProfileArn(); arn != "" {
+			token.ProfileArn = arn
+		} else if arn := fetchProfileArnFromAPI(token.AccessToken); arn != "" {
+			token.ProfileArn = arn
+		}
 	}
 
 	cachedToken = &token
