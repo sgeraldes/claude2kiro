@@ -1,37 +1,26 @@
 ---
 name: Bug report
-about: Reportar un comportamiento inesperado del framework PAA
-title: "[BUG] "
+about: Report a bug in claude2kiro
+title: ''
 labels: bug
-assignees: ''
 ---
 
-## Descripción del bug
-Una descripción clara y concisa de qué está fallando.
+## Description
+<!-- What happened? -->
 
-## Pasos para reproducir
-1. Estructura del agente (pattern usado, mode declarado): ...
-2. Comando que falló: `...`
-3. Output / traceback:
-```
-<paste here>
-```
+## Steps to reproduce
+1. 
+2. 
+3. 
 
-## Comportamiento esperado
-Qué esperabas que pasara.
+## Expected behavior
+<!-- What should have happened? -->
 
-## Entorno
-- Versión PAA (paa_core): `__version__`
-- Versión `paa_plugin_antamina` (si aplica): ...
-- Python: `python --version`
-- OS: macOS / Linux / Windows
-- AWS env donde se desplegó: dev / qa / prod / sandbox
-- Si hay shim involucrado: versión del snapshot (se reporta en `/v1/_meta`)
+## Environment
+- OS: 
+- claude2kiro version: 
+- Auth method: (GitHub / Google / Builder ID / IdC)
+- Model: 
 
-## Logs / lint output
-```
-<paste here>
-```
-
-## Contexto adicional
-Otra info relevante: ADRs relacionados, otros agentes afectados, etc.
+## Logs
+<!-- Paste relevant lines from ~/.claude2kiro/logs/ -->

@@ -4214,6 +4214,10 @@ func getToken() (TokenData, error) {
 		} else if arn := fetchProfileArnFromAPI(token.AccessToken); arn != "" {
 			token.ProfileArn = arn
 		}
+		// Persist so we don't fetch again next time
+		if token.ProfileArn != "" {
+			saveToken(&token)
+		}
 	}
 
 	cachedToken = &token

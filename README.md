@@ -151,6 +151,16 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro logout` | Remove saved credentials |
 | `claude2kiro server [port]` | Run only the headless proxy for advanced/manual setups |
 
+## Model selection
+
+By default Claude Code picks its own model. To force a specific model:
+
+```bash
+ANTHROPIC_MODEL=claude-opus-4-8 claude2kiro run
+```
+
+Supported Claude models: Opus, Sonnet, and Haiku from 4.5 to 4.8. Use `/kiro-proxy:models` inside Claude Code to see the full list with credit multipliers.
+
 ## Docs
 
 - [Installation](docs/INSTALLATION.md)

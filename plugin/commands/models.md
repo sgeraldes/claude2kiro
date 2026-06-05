@@ -2,7 +2,7 @@
 description: Show Kiro model mappings and credit multipliers
 ---
 
-Here are the Kiro model mappings and credit costs:
+Display the following tables exactly as shown to the user:
 
 ## Model Mappings (Anthropic -> Kiro)
 

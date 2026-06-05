@@ -1,45 +1,25 @@
-# Pull Request
-
-## Resumen
-<!-- Una o dos oraciones sobre qué cambia este PR. -->
+## Summary
+<!-- One or two sentences about what this PR changes. -->
 
 
-## Tipo de cambio
-- [ ] feat — funcionalidad nueva
+## Type of change
+- [ ] feat — new functionality
 - [ ] fix — bug fix
-- [ ] docs — solo documentación
-- [ ] refactor — cambio interno sin afectar comportamiento
-- [ ] adapter — adapter nuevo o modificación de uno existente
-- [ ] ADR — decisión arquitectónica (incluir el ADR en este PR)
-- [ ] otro: ___
-
-## Modo afectado
-- [ ] quick_deploy
-- [ ] development
-- [ ] production
-- [ ] N/A (cambio en core / docs)
+- [ ] docs — documentation only
+- [ ] refactor — internal change without affecting behavior
+- [ ] other: ___
 
 ## Checklist
-- [ ] El linter pasa: `python tools/compliance/paa-lint-compliance.py --ci`
-- [ ] Sintaxis Python OK: `python -m py_compile $(git diff --name-only main HEAD | grep '\.py$')`
-- [ ] Pruebas agregadas o actualizadas (si aplica)
-- [ ] Documentación actualizada (`docs/`, READMEs, ADRs)
-- [ ] Si es un adapter nuevo: registrado en `paa_core/composer.py`
-- [ ] Si es un dominio nuevo: defaults agregados a `shared/modes/*_defaults.yaml`
-- [ ] Sin secretos hardcoded (revisado)
-- [ ] Sin valores `<<TODO>>` que bloqueen ejecución
+- [ ] Build passes: `go build ./...`
+- [ ] Tests pass: `go test ./...`
+- [ ] Tests added or updated (if applicable)
+- [ ] Documentation updated (if applicable)
+- [ ] No hardcoded secrets
 
-## ADRs relacionados
-<!-- Si este PR implementa o modifica una decisión registrada, link aquí. -->
+## How to test
+<!-- Steps for the reviewer to reproduce your change. -->
 
 
-## Cómo probar
-<!-- Pasos concretos para que el reviewer reproduzca tu cambio. -->
+## Risk / blast radius
+<!-- What breaks if this goes wrong? -->
 
-
-## Riesgo / blast radius
-<!-- ¿Qué se rompe si esto sale mal? ¿Qué tenants/agentes afecta? -->
-
-
-## Owner del cambio
-<!-- @nombre del autor / team -->
