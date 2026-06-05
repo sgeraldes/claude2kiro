@@ -792,6 +792,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	if token.ProfileArn != "" {
 		cwReq.ProfileArn = token.ProfileArn
 	} else {
+		// Fallback: Kiro's shared consumer profile for individual subscriptions
+		// (social auth: GitHub/Google/Builder ID). AWS-managed, not org-specific.
+		// IdC/Enterprise users discover their profile via ListAvailableProfiles.
 		cwReq.ProfileArn = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
 	}
 	cwReq.ConversationState.ChatTriggerType = "MANUAL"
