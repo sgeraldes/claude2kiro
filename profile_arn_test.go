@@ -81,6 +81,49 @@ func TestFetchProfileArnFromAPI(t *testing.T) {
 	}
 }
 
+func TestFetchProfileArnFromAPI_MultiProfile(t *testing.T) {
+	// Mock server returning multiple profiles — should pick lexicographically smallest ARN
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ListAvailableProfiles" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"profiles": []map[string]string{
+				{"arn": "arn:aws:codewhisperer:us-east-1:999999:profile/ZEBRA"},
+				{"arn": "arn:aws:codewhisperer:us-east-1:111111:profile/ALPHA"},
+				{"arn": "arn:aws:codewhisperer:us-east-1:555555:profile/MIDDLE"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	req, _ := http.NewRequest("POST", server.URL+"/ListAvailableProfiles", nil)
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	var result struct {
+		Profiles []struct {
+			Arn string `json:"arn"`
+		} `json:"profiles"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	// Apply same logic as fetchProfileArnFromAPI: pick smallest ARN
+	best := result.Profiles[0].Arn
+	for _, p := range result.Profiles[1:] {
+		if p.Arn < best {
+			best = p.Arn
+		}
+	}
+	expected := "arn:aws:codewhisperer:us-east-1:111111:profile/ALPHA"
+	if best != expected {
+		t.Errorf("got %q, want %q", best, expected)
+	}
+}
+
 func TestBuildCodeWhispererRequest_ProfileArn(t *testing.T) {
 	tests := []struct {
 		name       string

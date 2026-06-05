@@ -2954,7 +2954,14 @@ func fetchProfileArnFromAPI(accessToken string) string {
 			} `json:"profiles"`
 		}
 		if json.Unmarshal(body, &result) == nil && len(result.Profiles) > 0 {
-			return result.Profiles[0].Arn
+			// Pick deterministically: lexicographically smallest ARN
+			best := result.Profiles[0].Arn
+			for _, p := range result.Profiles[1:] {
+				if p.Arn < best {
+					best = p.Arn
+				}
+			}
+			return best
 		}
 		// Try alternate response shape
 		var alt struct {

@@ -7,6 +7,7 @@ Display the following tables exactly as shown to the user:
 ## Model Mappings (Anthropic -> Kiro)
 
 ### Claude Opus (2.2x credits)
+
 | Anthropic Model ID | Kiro Model ID |
 |---------------------|---------------|
 | claude-opus-4-8 | claude-opus-4.8 |
@@ -16,6 +17,7 @@ Display the following tables exactly as shown to the user:
 | claude-opus-4-1 / 4-20250514 | claude-opus-4.5 (mapped) |
 
 ### Claude Sonnet (1.3x credits)
+
 | Anthropic Model ID | Kiro Model ID |
 |---------------------|---------------|
 | claude-sonnet-4-8 | claude-sonnet-4.8 |
@@ -25,6 +27,7 @@ Display the following tables exactly as shown to the user:
 | claude-sonnet-4-20250514 | claude-sonnet-4 |
 
 ### Claude Haiku (0.4x credits)
+
 | Anthropic Model ID | Kiro Model ID |
 |---------------------|---------------|
 | claude-haiku-4-8 | claude-haiku-4.8 |
@@ -33,6 +36,7 @@ Display the following tables exactly as shown to the user:
 | claude-haiku-4-5 | claude-haiku-4.5 |
 
 ### Non-Claude models
+
 | Anthropic Model ID | Kiro Model ID | Credits |
 |---------------------|---------------|---------|
 | deepseek / deepseek-3-2 | deepseek-3.2 | 0.25x |
@@ -42,6 +46,7 @@ Display the following tables exactly as shown to the user:
 | qwen / qwen3-coder-next | qwen3-coder-next | 0.05x |
 
 ## Family Fallback
+
 When Claude Code sends a model not in the static map, the proxy matches by family name:
 - Contains "opus" -> claude-opus-4.8
 - Contains "sonnet" -> claude-sonnet-4.8
@@ -60,6 +65,7 @@ When Claude Code sends a model not in the static map, the proxy matches by famil
 | Power | 10,000 | $200 |
 
 ## Notes
+
 - "Auto" model (1.0x) lets Kiro choose the best model per task
 - Kiro has a tool limit of ~85 tools per request (proxy truncates silently)
 - Run `/kiro-proxy:credits` to check current usage
