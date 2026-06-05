@@ -6,27 +6,45 @@ Here are the Kiro model mappings and credit costs:
 
 ## Model Mappings (Anthropic -> Kiro)
 
-| Anthropic Model ID | Kiro Model ID | Credit Multiplier |
-|---------------------|---------------|-------------------|
-| claude-sonnet-4-20250514 | claude-sonnet-4.0 | 1.3x |
-| claude-sonnet-4-5-20250620 | claude-sonnet-4.5 | 1.3x |
-| claude-sonnet-4-6-20250620 | claude-sonnet-4.6 | 1.3x |
-| claude-sonnet-4-6 | claude-sonnet-4.6 | 1.3x |
-| claude-haiku-4-5-20251001 | claude-haiku-4.5 | 0.4x |
-| claude-opus-4-20250514 | claude-opus-4.0 | 2.2x |
-| claude-opus-4-5-20250521 | claude-opus-4.5 | 2.2x |
-| claude-opus-4-6-20250626 | claude-opus-4.6 | 2.2x |
+### Claude Opus (2.2x credits)
+| Anthropic Model ID | Kiro Model ID |
+|---------------------|---------------|
+| claude-opus-4-8 | claude-opus-4.8 |
+| claude-opus-4-7 | claude-opus-4.7 |
+| claude-opus-4-6 | claude-opus-4.6 |
+| claude-opus-4-5 | claude-opus-4.5 |
+| claude-opus-4-1 / 4-20250514 | claude-opus-4.5 (mapped) |
 
-Non-Claude models (also available through Kiro):
-| deepseek-r1 / deepseek-reasoner | deepseek-r1 | varies |
-| minimax-m1 | minimax-m1 | varies |
-| qwen-2.5-max / qwen-3 | qwen-2.5-max / qwen-3 | varies |
+### Claude Sonnet (1.3x credits)
+| Anthropic Model ID | Kiro Model ID |
+|---------------------|---------------|
+| claude-sonnet-4-8 | claude-sonnet-4.8 |
+| claude-sonnet-4-7 | claude-sonnet-4.7 |
+| claude-sonnet-4-6 | claude-sonnet-4.6 |
+| claude-sonnet-4-5 | claude-sonnet-4.5 |
+| claude-sonnet-4-20250514 | claude-sonnet-4 |
+
+### Claude Haiku (0.4x credits)
+| Anthropic Model ID | Kiro Model ID |
+|---------------------|---------------|
+| claude-haiku-4-8 | claude-haiku-4.8 |
+| claude-haiku-4-7 | claude-haiku-4.7 |
+| claude-haiku-4-6 | claude-haiku-4.6 |
+| claude-haiku-4-5 | claude-haiku-4.5 |
+
+### Non-Claude models
+| Anthropic Model ID | Kiro Model ID | Credits |
+|---------------------|---------------|---------|
+| deepseek / deepseek-3-2 | deepseek-3.2 | 0.25x |
+| minimax / minimax-m2-5 | minimax-m2.5 | 0.25x |
+| minimax-m2-1 | minimax-m2.1 | 0.15x |
+| qwen / qwen3-coder-next | qwen3-coder-next | 0.05x |
 
 ## Family Fallback
 When Claude Code sends a model not in the static map, the proxy matches by family name:
-- Contains "sonnet" -> claude-sonnet-4.6
-- Contains "haiku" -> claude-haiku-4.5
-- Contains "opus" -> claude-opus-4.6
+- Contains "opus" -> claude-opus-4.8
+- Contains "sonnet" -> claude-sonnet-4.8
+- Contains "haiku" -> claude-haiku-4.8
 
 ## Kiro Plans
 
@@ -38,6 +56,6 @@ When Claude Code sends a model not in the static map, the proxy matches by famil
 | Power | 10,000 | $200 |
 
 ## Notes
-- "Auto" model uses 1.0x multiplier
+- "Auto" model (1.0x) lets Kiro choose the best model per task
 - Kiro has a tool limit of ~85 tools per request (Claude Code may send 150+, proxy truncates silently)
 - Run `/kiro-proxy:credits` to check your current usage
