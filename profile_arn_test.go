@@ -10,31 +10,38 @@ import (
 )
 
 func TestReadKiroProfileArn_FromFile(t *testing.T) {
-	// Create temp dir simulating Kiro IDE config
 	tmpDir := t.TempDir()
-	profileDir := filepath.Join(tmpDir, "kiro.kiroagent")
-	os.MkdirAll(profileDir, 0755)
 
-	profile := map[string]string{
+	data, _ := json.Marshal(map[string]string{
 		"arn":  "arn:aws:codewhisperer:us-east-1:123456789:profile/TESTPROFILE",
 		"name": "TestProfile",
-	}
-	data, _ := json.Marshal(profile)
-	os.WriteFile(filepath.Join(profileDir, "profile.json"), data, 0644)
+	})
 
-	// Read from the file directly (can't override homeDir, so test the parsing logic)
-	var parsed struct {
-		Arn string `json:"arn"`
+	// Create the expected path structures for all platforms
+	paths := []string{
+		filepath.Join(tmpDir, "Library", "Application Support", "Kiro", "User", "globalStorage", "kiro.kiroagent"),
+		filepath.Join(tmpDir, ".config", "Kiro", "User", "globalStorage", "kiro.kiroagent"),
+		filepath.Join(tmpDir, "AppData", "Roaming", "Kiro", "User", "globalStorage", "kiro.kiroagent"),
 	}
-	raw, err := os.ReadFile(filepath.Join(profileDir, "profile.json"))
-	if err != nil {
-		t.Fatalf("failed to read test file: %v", err)
+	for _, p := range paths {
+		os.MkdirAll(p, 0755)
+		os.WriteFile(filepath.Join(p, "profile.json"), data, 0644)
 	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatalf("failed to parse: %v", err)
-	}
-	if parsed.Arn != "arn:aws:codewhisperer:us-east-1:123456789:profile/TESTPROFILE" {
-		t.Errorf("got %q, want test ARN", parsed.Arn)
+
+	// Override HOME so readKiroProfileArn finds our temp path
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	origUserProfile := os.Getenv("USERPROFILE")
+	os.Setenv("USERPROFILE", tmpDir)
+	defer func() {
+		os.Setenv("HOME", origHome)
+		os.Setenv("USERPROFILE", origUserProfile)
+	}()
+
+	got := readKiroProfileArn()
+	expected := "arn:aws:codewhisperer:us-east-1:123456789:profile/TESTPROFILE"
+	if got != expected {
+		t.Errorf("readKiroProfileArn() = %q, want %q", got, expected)
 	}
 }
 
