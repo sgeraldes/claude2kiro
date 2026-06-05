@@ -2926,10 +2926,16 @@ func readKiroProfileArn() string {
 // fetchProfileArnFromAPI discovers the profileArn by calling Kiro's ListAvailableProfiles API.
 // This is the fallback for users who don't have Kiro IDE installed.
 func fetchProfileArnFromAPI(accessToken string) string {
-	regions := []string{"us-east-1", "eu-central-1"}
-	for _, region := range regions {
-		url := fmt.Sprintf("https://management.%s.kiro.dev/ListAvailableProfiles", region)
-		req, err := http.NewRequest("POST", url, bytes.NewBufferString("{}"))
+	return fetchProfileArnFromEndpoints(accessToken, []string{
+		"https://management.us-east-1.kiro.dev/ListAvailableProfiles",
+		"https://management.eu-central-1.kiro.dev/ListAvailableProfiles",
+	})
+}
+
+// fetchProfileArnFromEndpoints tries each endpoint URL to discover the profileArn.
+func fetchProfileArnFromEndpoints(accessToken string, endpoints []string) string {
+	for _, endpoint := range endpoints {
+		req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString("{}"))
 		if err != nil {
 			continue
 		}

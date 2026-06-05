@@ -46,7 +46,6 @@ func TestReadKiroProfileArn_FromFile(t *testing.T) {
 }
 
 func TestFetchProfileArnFromAPI(t *testing.T) {
-	// Mock server returning a profiles response
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ListAvailableProfiles" {
 			http.NotFound(w, r)
@@ -65,36 +64,15 @@ func TestFetchProfileArnFromAPI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Call with the mock URL directly (simulating what fetchProfileArnFromAPI does)
-	req, _ := http.NewRequest("POST", server.URL+"/ListAvailableProfiles", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Profiles []struct {
-			Arn string `json:"arn"`
-		} `json:"profiles"`
-	}
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	if len(result.Profiles) == 0 || result.Profiles[0].Arn != "arn:aws:codewhisperer:us-east-1:111222333:profile/DISCOVERED" {
-		t.Errorf("unexpected result: %+v", result)
+	got := fetchProfileArnFromEndpoints("test-token", []string{server.URL + "/ListAvailableProfiles"})
+	expected := "arn:aws:codewhisperer:us-east-1:111222333:profile/DISCOVERED"
+	if got != expected {
+		t.Errorf("fetchProfileArnFromEndpoints() = %q, want %q", got, expected)
 	}
 }
 
 func TestFetchProfileArnFromAPI_MultiProfile(t *testing.T) {
-	// Mock server returning multiple profiles — should pick lexicographically smallest ARN
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/ListAvailableProfiles" {
-			http.NotFound(w, r)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"profiles": []map[string]string{
@@ -106,28 +84,10 @@ func TestFetchProfileArnFromAPI_MultiProfile(t *testing.T) {
 	}))
 	defer server.Close()
 
-	req, _ := http.NewRequest("POST", server.URL+"/ListAvailableProfiles", nil)
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
-	defer resp.Body.Close()
-
-	var result struct {
-		Profiles []struct {
-			Arn string `json:"arn"`
-		} `json:"profiles"`
-	}
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	// Apply same logic as fetchProfileArnFromAPI: pick smallest ARN
-	best := result.Profiles[0].Arn
-	for _, p := range result.Profiles[1:] {
-		if p.Arn < best {
-			best = p.Arn
-		}
-	}
+	got := fetchProfileArnFromEndpoints("token", []string{server.URL + "/ListAvailableProfiles"})
 	expected := "arn:aws:codewhisperer:us-east-1:111111:profile/ALPHA"
-	if best != expected {
-		t.Errorf("got %q, want %q", best, expected)
+	if got != expected {
+		t.Errorf("fetchProfileArnFromEndpoints() = %q, want %q", got, expected)
 	}
 }
 
