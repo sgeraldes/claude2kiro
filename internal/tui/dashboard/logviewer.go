@@ -207,10 +207,7 @@ func NewLogViewerModel(width, height int) LogViewerModel {
 	detailW := width - listW - 1 // Rest for detail (minus 1 for gap space)
 
 	// Panel: rendered width = detailW, text area = detailW - 4 (border + padding)
-	vpWidth := detailW - 4
-	if vpWidth < 10 {
-		vpWidth = 10
-	}
+	vpWidth := max(detailW-4, 10)
 	vp := viewport.New(vpWidth, height-4)
 	vp.SetContent("")
 
@@ -580,10 +577,7 @@ func (m *LogViewerModel) applySessionFilter() {
 
 	// Adjust selection if needed
 	if m.selectedIndex >= len(m.entries) {
-		m.selectedIndex = len(m.entries) - 1
-		if m.selectedIndex < 0 {
-			m.selectedIndex = 0
-		}
+		m.selectedIndex = max(len(m.entries)-1, 0)
 	}
 	m.ensureVisible()
 }
@@ -883,7 +877,7 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 	var lines []string
 
 	// Try to parse as JSON
-	var req map[string]interface{}
+	var req map[string]any
 	if err := json.Unmarshal([]byte(content), &req); err != nil {
 		// Not valid JSON, show as plain text
 		lines = append(lines, headerStyle.Render("Content:"))
@@ -896,10 +890,7 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 	// ═══════════════════════════════════════════════════════════════════════
 	// Create full-width header
 	headerText := "─── Request "
-	remainingWidth := maxWidth - lipgloss.Width(headerText) - 2
-	if remainingWidth < 0 {
-		remainingWidth = 0
-	}
+	remainingWidth := max(maxWidth-lipgloss.Width(headerText)-2, 0)
 	lines = append(lines, headerStyle.Render("╭"+headerText+strings.Repeat("─", remainingWidth)+"╮"))
 
 	// Build header info line
@@ -929,12 +920,9 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 	// ═══════════════════════════════════════════════════════════════════════
 	// TOOLS SECTION - Compact list (limited to 10 in compact mode)
 	// ═══════════════════════════════════════════════════════════════════════
-	if tools, ok := req["tools"].([]interface{}); ok && len(tools) > 0 {
+	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
 		toolsHeaderText := fmt.Sprintf("─── Tools (%d) ", len(tools))
-		toolsRemaining := maxWidth - lipgloss.Width(toolsHeaderText) - 2
-		if toolsRemaining < 0 {
-			toolsRemaining = 0
-		}
+		toolsRemaining := max(maxWidth-lipgloss.Width(toolsHeaderText)-2, 0)
 		lines = append(lines, headerStyle.Render("╭"+toolsHeaderText+strings.Repeat("─", toolsRemaining)+"╮"))
 
 		// In compact mode, show only first 10 tools
@@ -945,7 +933,7 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 
 		for i := 0; i < maxTools; i++ {
 			tool := tools[i]
-			if toolMap, ok := tool.(map[string]interface{}); ok {
+			if toolMap, ok := tool.(map[string]any); ok {
 				name := "?"
 				if n, ok := toolMap["name"].(string); ok {
 					name = n
@@ -969,10 +957,7 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 		systemTexts := extractSystemTexts(system)
 		if len(systemTexts) > 0 {
 			sysHeaderText := "─── System "
-			sysRemaining := maxWidth - lipgloss.Width(sysHeaderText) - 2
-			if sysRemaining < 0 {
-				sysRemaining = 0
-			}
+			sysRemaining := max(maxWidth-lipgloss.Width(sysHeaderText)-2, 0)
 			lines = append(lines, headerStyle.Render("╭"+sysHeaderText+strings.Repeat("─", sysRemaining)+"╮"))
 			for _, sysText := range systemTexts {
 				formatted := formatSystemText(sysText, maxWidth, expand, systemTagStyle, dimStyle)
@@ -985,17 +970,14 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 	// ═══════════════════════════════════════════════════════════════════════
 	// MESSAGES SECTION - Chat-like conversation view
 	// ═══════════════════════════════════════════════════════════════════════
-	if messages, ok := req["messages"].([]interface{}); ok && len(messages) > 0 {
+	if messages, ok := req["messages"].([]any); ok && len(messages) > 0 {
 		convHeaderText := fmt.Sprintf("─── Conversation (%d) ", len(messages))
-		convRemaining := maxWidth - lipgloss.Width(convHeaderText) - 2
-		if convRemaining < 0 {
-			convRemaining = 0
-		}
+		convRemaining := max(maxWidth-lipgloss.Width(convHeaderText)-2, 0)
 		lines = append(lines, headerStyle.Render("╭"+convHeaderText+strings.Repeat("─", convRemaining)+"╮"))
 		lines = append(lines, "")
 
 		for i, msg := range messages {
-			if msgMap, ok := msg.(map[string]interface{}); ok {
+			if msgMap, ok := msg.(map[string]any); ok {
 				role := "unknown"
 				if r, ok := msgMap["role"].(string); ok {
 					role = r
@@ -1032,14 +1014,14 @@ func formatRequestContent(content string, maxWidth int, expand bool) []string {
 }
 
 // extractSystemTexts extracts text content from system field (string or array)
-func extractSystemTexts(system interface{}) []string {
+func extractSystemTexts(system any) []string {
 	var texts []string
 	switch s := system.(type) {
 	case string:
 		texts = append(texts, s)
-	case []interface{}:
+	case []any:
 		for _, sysMsg := range s {
-			if msgMap, ok := sysMsg.(map[string]interface{}); ok {
+			if msgMap, ok := sysMsg.(map[string]any); ok {
 				if text, ok := msgMap["text"].(string); ok {
 					texts = append(texts, text)
 				}
@@ -1148,7 +1130,7 @@ func splitByTags(text, tagName string) []tagPart {
 }
 
 // formatMessageContent formats the content field of a message
-func formatMessageContent(content interface{}, maxWidth int, expand bool, valueStyle, toolStyle, toolDimStyle, dimStyle, tagStyle lipgloss.Style) []string {
+func formatMessageContent(content any, maxWidth int, expand bool, valueStyle, toolStyle, toolDimStyle, dimStyle, tagStyle lipgloss.Style) []string {
 	var lines []string
 
 	switch c := content.(type) {
@@ -1157,10 +1139,10 @@ func formatMessageContent(content interface{}, maxWidth int, expand bool, valueS
 		formatted := formatUserText(c, maxWidth, expand, valueStyle, tagStyle, dimStyle)
 		lines = append(lines, formatted...)
 
-	case []interface{}:
+	case []any:
 		// Array of content blocks
 		for _, block := range c {
-			if blockMap, ok := block.(map[string]interface{}); ok {
+			if blockMap, ok := block.(map[string]any); ok {
 				blockType := "unknown"
 				if t, ok := blockMap["type"].(string); ok {
 					blockType = t
@@ -1263,7 +1245,7 @@ func formatUserText(text string, maxWidth int, expand bool, valueStyle, tagStyle
 }
 
 // formatToolUseBlock formats a tool_use content block
-func formatToolUseBlock(blockMap map[string]interface{}, maxWidth int, expand bool, toolStyle, toolDimStyle, dimStyle lipgloss.Style) []string {
+func formatToolUseBlock(blockMap map[string]any, maxWidth int, expand bool, toolStyle, toolDimStyle, dimStyle lipgloss.Style) []string {
 	var lines []string
 
 	name := "unknown"
@@ -1312,7 +1294,7 @@ func formatToolUseBlock(blockMap map[string]interface{}, maxWidth int, expand bo
 }
 
 // formatToolResultBlock formats a tool_result content block
-func formatToolResultBlock(blockMap map[string]interface{}, maxWidth int, expand bool, toolStyle, toolDimStyle, dimStyle lipgloss.Style) []string {
+func formatToolResultBlock(blockMap map[string]any, maxWidth int, expand bool, toolStyle, toolDimStyle, dimStyle lipgloss.Style) []string {
 	var lines []string
 
 	toolUseID := ""
@@ -1338,9 +1320,9 @@ func formatToolResultBlock(blockMap map[string]interface{}, maxWidth int, expand
 		for _, line := range wrapped {
 			lines = append(lines, dimStyle.Render("  │ "+line))
 		}
-	} else if contentArr, ok := blockMap["content"].([]interface{}); ok {
+	} else if contentArr, ok := blockMap["content"].([]any); ok {
 		for _, item := range contentArr {
-			if itemMap, ok := item.(map[string]interface{}); ok {
+			if itemMap, ok := item.(map[string]any); ok {
 				if text, ok := itemMap["text"].(string); ok {
 					maxChars := maxWidth * 5
 					if expand {
@@ -1421,7 +1403,7 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 	var lines []string
 
 	// Try to parse as JSON
-	var resp map[string]interface{}
+	var resp map[string]any
 	if err := json.Unmarshal([]byte(content), &resp); err != nil {
 		// Not valid JSON, show as plain text (common for streamed responses)
 		lines = append(lines, labelStyle.Render("Response:"))
@@ -1435,10 +1417,7 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 
 	// Full-width response header
 	respHeaderText := "─── Response "
-	respRemaining := maxWidth - lipgloss.Width(respHeaderText) - 2
-	if respRemaining < 0 {
-		respRemaining = 0
-	}
+	respRemaining := max(maxWidth-lipgloss.Width(respHeaderText)-2, 0)
 	lines = append(lines, labelStyle.Render("╭"+respHeaderText+strings.Repeat("─", respRemaining)+"╮"))
 	lines = append(lines, "")
 
@@ -1471,7 +1450,7 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 	}
 
 	// Usage
-	if usage, ok := resp["usage"].(map[string]interface{}); ok {
+	if usage, ok := resp["usage"].(map[string]any); ok {
 		var usageParts []string
 		if input, ok := usage["input_tokens"].(float64); ok {
 			usageParts = append(usageParts, fmt.Sprintf("in:%d", int(input)))
@@ -1487,16 +1466,13 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 	lines = append(lines, "")
 
 	// Content blocks
-	if contentArr, ok := resp["content"].([]interface{}); ok && len(contentArr) > 0 {
+	if contentArr, ok := resp["content"].([]any); ok && len(contentArr) > 0 {
 		contHeaderText := "─── Content "
-		contRemaining := maxWidth - lipgloss.Width(contHeaderText) - 2
-		if contRemaining < 0 {
-			contRemaining = 0
-		}
+		contRemaining := max(maxWidth-lipgloss.Width(contHeaderText)-2, 0)
 		lines = append(lines, labelStyle.Render("╭"+contHeaderText+strings.Repeat("─", contRemaining)+"╮"))
 
 		for _, block := range contentArr {
-			if blockMap, ok := block.(map[string]interface{}); ok {
+			if blockMap, ok := block.(map[string]any); ok {
 				blockType := "unknown"
 				if t, ok := blockMap["type"].(string); ok {
 					blockType = t
@@ -1562,13 +1538,10 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 	}
 
 	// Error (if present)
-	if errObj, ok := resp["error"].(map[string]interface{}); ok {
+	if errObj, ok := resp["error"].(map[string]any); ok {
 		lines = append(lines, "")
 		errHeaderText := "─── ERROR "
-		errRemaining := maxWidth - lipgloss.Width(errHeaderText) - 2
-		if errRemaining < 0 {
-			errRemaining = 0
-		}
+		errRemaining := max(maxWidth-lipgloss.Width(errHeaderText)-2, 0)
 		lines = append(lines, lipgloss.NewStyle().Foreground(errorColor).Bold(true).Render("╭"+errHeaderText+strings.Repeat("─", errRemaining)+"╮"))
 		if errType, ok := errObj["type"].(string); ok {
 			lines = append(lines, lipgloss.NewStyle().Foreground(errorColor).Render("Type: "+errType))
@@ -1670,7 +1643,7 @@ func formatContent(content string, maxWidth int) string {
 	if (strings.HasPrefix(content, "{") && strings.HasSuffix(content, "}")) ||
 		(strings.HasPrefix(content, "[") && strings.HasSuffix(content, "]")) {
 		// Try to parse as JSON
-		var parsed interface{}
+		var parsed any
 		if err := json.Unmarshal([]byte(content), &parsed); err == nil {
 			// Successfully parsed - format it nicely
 			return formatJSONValue(parsed, 0, maxWidth)
@@ -1682,7 +1655,7 @@ func formatContent(content string, maxWidth int) string {
 }
 
 // formatJSONValue formats a JSON value with syntax highlighting
-func formatJSONValue(v interface{}, indent int, maxWidth int) string {
+func formatJSONValue(v any, indent int, maxWidth int) string {
 	// Styles for syntax highlighting
 	keyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Bold(true)
 	stringStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6BFF6B"))
@@ -1718,7 +1691,7 @@ func formatJSONValue(v interface{}, indent int, maxWidth int) string {
 		}
 		return stringStyle.Render(fmt.Sprintf("%q", val))
 
-	case []interface{}:
+	case []any:
 		if len(val) == 0 {
 			return bracketStyle.Render("[]")
 		}
@@ -1748,7 +1721,7 @@ func formatJSONValue(v interface{}, indent int, maxWidth int) string {
 		lines = append(lines, indentStr+bracketStyle.Render("]"))
 		return strings.Join(lines, "\n")
 
-	case map[string]interface{}:
+	case map[string]any:
 		if len(val) == 0 {
 			return bracketStyle.Render("{}")
 		}
@@ -1795,10 +1768,7 @@ func formatJSONValue(v interface{}, indent int, maxWidth int) string {
 // formatLongString formats a long string value with wrapping
 func formatLongString(s string, indent int, maxWidth int, style lipgloss.Style) string {
 	// Calculate available width for string content
-	availWidth := maxWidth - indent*2 - 4
-	if availWidth < 20 {
-		availWidth = 20
-	}
+	availWidth := max(maxWidth-indent*2-4, 20)
 
 	// If it contains newlines, handle them specially
 	if strings.Contains(s, "\n") || strings.Contains(s, "\\n") {
@@ -2059,10 +2029,7 @@ func (m LogViewerModel) renderListPanel(height int) string {
 
 	// Always reserve 2 lines for pagination indicators (to match ensureVisible calculation)
 	// This prevents the mismatch where selection appears too high when at list boundaries
-	entriesHeight := height - 2
-	if entriesHeight < 1 {
-		entriesHeight = 1
-	}
+	entriesHeight := max(height-2, 1)
 
 	// Determine pagination state
 	hasMoreAbove := m.listOffset > 0
@@ -2074,10 +2041,7 @@ func (m LogViewerModel) renderListPanel(height int) string {
 	} else {
 		// Calculate visible range for position indicator
 		firstVisible := m.listOffset + 1 // 1-indexed for display
-		lastVisible := m.listOffset + entriesHeight
-		if lastVisible > totalEntries {
-			lastVisible = totalEntries
-		}
+		lastVisible := min(m.listOffset+entriesHeight, totalEntries)
 		positionStr := fmt.Sprintf("%d-%d of %d", firstVisible, lastVisible, totalEntries)
 
 		// Add "more above" indicator with position, or empty line
@@ -2099,10 +2063,7 @@ func (m LogViewerModel) renderListPanel(height int) string {
 
 			if isSelected {
 				// Pad to full width for selection highlight
-				padWidth := contentWidth - lipgloss.Width(line)
-				if padWidth < 0 {
-					padWidth = 0
-				}
+				padWidth := max(contentWidth-lipgloss.Width(line), 0)
 				padded := line + strings.Repeat(" ", padWidth)
 				lines = append(lines, selectedStyle.Render(padded))
 			} else {
@@ -2293,10 +2254,9 @@ func (m LogViewerModel) renderEntryLine(entry logger.LogEntry, contentWidth int,
 	}
 
 	// PREVIEW column (rest of line)
-	maxPreview := contentWidth - usedWidth - 1 // -1 for space before preview
-	if maxPreview < 5 {
-		maxPreview = 5
-	}
+	maxPreview := max(
+		// -1 for space before preview
+		contentWidth-usedWidth-1, 5)
 	preview := entry.Preview
 	// Truncate by visual width (runes), not byte length
 	previewRunes := []rune(preview)
@@ -2353,10 +2313,7 @@ func (m LogViewerModel) renderDetailPanel(height int) string {
 	// Calculate scroll position as percentage
 	scrollPercent := 0
 	if totalLines > m.detailView.Height {
-		scrollPercent = (m.detailView.YOffset * 100) / (totalLines - m.detailView.Height)
-		if scrollPercent > 100 {
-			scrollPercent = 100
-		}
+		scrollPercent = min((m.detailView.YOffset*100)/(totalLines-m.detailView.Height), 100)
 	}
 
 	// Calculate available content space
@@ -2447,14 +2404,8 @@ func (m *LogViewerModel) SetSize(width, height int) {
 	// Calculate viewport width to match panel content area
 	// Panel: Width(w) + border(2) = rendered width, so w = rendered - 2
 	// Inside w: padding(2) is subtracted, so text area = w - 2 = rendered - 4
-	vpWidth := m.detailWidth - 4
-	if vpWidth < 10 {
-		vpWidth = 10
-	}
-	vpHeight := height - 4
-	if vpHeight < 3 {
-		vpHeight = 3
-	}
+	vpWidth := max(m.detailWidth-4, 10)
+	vpHeight := max(height-4, 3)
 	m.detailView.Width = vpWidth
 	m.detailView.Height = vpHeight
 	m.updateDetailContent()
@@ -2672,7 +2623,7 @@ func (m *LogViewerModel) getExportContent() string {
 		return content
 	case ViewModeJSON:
 		// Try to format as JSON
-		var parsed interface{}
+		var parsed any
 		if err := json.Unmarshal([]byte(content), &parsed); err == nil {
 			formatted, err := json.MarshalIndent(parsed, "", "  ")
 			if err == nil {
@@ -2719,7 +2670,7 @@ func (m *LogViewerModel) getExportParsedContent(entry logger.LogEntry, content s
 	lines = append(lines, "")
 
 	// Try to parse as JSON for structured output
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	if err := json.Unmarshal([]byte(content), &parsed); err == nil {
 		formatted, _ := json.MarshalIndent(parsed, "", "  ")
 		lines = append(lines, string(formatted))
@@ -2909,11 +2860,11 @@ func (m *LogViewerModel) extractSessionTitle(entry logger.LogEntry) {
 
 	// Try to parse body as JSON and extract text content
 	if body != "" {
-		var resp map[string]interface{}
+		var resp map[string]any
 		if err := json.Unmarshal([]byte(body), &resp); err == nil {
-			if content, ok := resp["content"].([]interface{}); ok {
+			if content, ok := resp["content"].([]any); ok {
 				for _, block := range content {
-					if blockMap, ok := block.(map[string]interface{}); ok {
+					if blockMap, ok := block.(map[string]any); ok {
 						if blockType, ok := blockMap["type"].(string); ok && blockType == "text" {
 							if text, ok := blockMap["text"].(string); ok {
 								if title := checkForTitle(text); title != "" {

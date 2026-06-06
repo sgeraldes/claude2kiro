@@ -106,7 +106,7 @@ func ExampleStore_deduplication() {
 
 	// Save the same image 3 times
 	imageData := []byte("shared company logo")
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		_, isNew, err := store.Save(imageData, "image/png")
 		if err != nil {
 			log.Fatal(err)

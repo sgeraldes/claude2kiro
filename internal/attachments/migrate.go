@@ -172,10 +172,7 @@ func processLine(line string, store *Store, result *MigrationResult, seenHashes 
 		fieldSuffix := parts[3] // closing "
 
 		// Try to decode a sample to verify it's valid base64
-		sampleSize := 100
-		if len(base64Content) < sampleSize {
-			sampleSize = len(base64Content)
-		}
+		sampleSize := min(len(base64Content), 100)
 		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
 			// Not valid base64, keep original
 			return match

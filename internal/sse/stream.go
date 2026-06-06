@@ -5,6 +5,7 @@ package sse
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 )
 
@@ -33,7 +34,7 @@ func NewStreamWriter(w http.ResponseWriter, flusher http.Flusher, capturedEvents
 }
 
 // WriteEvent writes an SSE event to the response writer.
-func (s *StreamWriter) WriteEvent(eventType string, data interface{}) error {
+func (s *StreamWriter) WriteEvent(eventType string, data any) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal event data: %w", err)
@@ -57,17 +58,17 @@ func (s *StreamWriter) WriteEvent(eventType string, data interface{}) error {
 
 // MessageStart writes the message_start event which initiates a response.
 func (s *StreamWriter) MessageStart(messageID, model string, inputTokens, outputTokens int) error {
-	return s.WriteEvent("message_start", map[string]interface{}{
+	return s.WriteEvent("message_start", map[string]any{
 		"type": "message_start",
-		"message": map[string]interface{}{
+		"message": map[string]any{
 			"id":            messageID,
 			"type":          "message",
 			"role":          "assistant",
-			"content":       []interface{}{},
+			"content":       []any{},
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]interface{}{
+			"usage": map[string]any{
 				"input_tokens":  inputTokens,
 				"output_tokens": outputTokens,
 			},
@@ -81,15 +82,13 @@ func (s *StreamWriter) Ping() error {
 }
 
 // ContentBlockStart writes a content_block_start event.
-func (s *StreamWriter) ContentBlockStart(index int, blockType string, extraFields map[string]interface{}) error {
-	contentBlock := map[string]interface{}{
+func (s *StreamWriter) ContentBlockStart(index int, blockType string, extraFields map[string]any) error {
+	contentBlock := map[string]any{
 		"type": blockType,
 	}
-	for k, v := range extraFields {
-		contentBlock[k] = v
-	}
+	maps.Copy(contentBlock, extraFields)
 
-	return s.WriteEvent("content_block_start", map[string]interface{}{
+	return s.WriteEvent("content_block_start", map[string]any{
 		"type":          "content_block_start",
 		"index":         index,
 		"content_block": contentBlock,
@@ -97,15 +96,13 @@ func (s *StreamWriter) ContentBlockStart(index int, blockType string, extraField
 }
 
 // ContentBlockDelta writes a content_block_delta event.
-func (s *StreamWriter) ContentBlockDelta(index int, deltaType string, deltaFields map[string]interface{}) error {
-	delta := map[string]interface{}{
+func (s *StreamWriter) ContentBlockDelta(index int, deltaType string, deltaFields map[string]any) error {
+	delta := map[string]any{
 		"type": deltaType,
 	}
-	for k, v := range deltaFields {
-		delta[k] = v
-	}
+	maps.Copy(delta, deltaFields)
 
-	return s.WriteEvent("content_block_delta", map[string]interface{}{
+	return s.WriteEvent("content_block_delta", map[string]any{
 		"type":  "content_block_delta",
 		"index": index,
 		"delta": delta,
@@ -114,7 +111,7 @@ func (s *StreamWriter) ContentBlockDelta(index int, deltaType string, deltaField
 
 // ContentBlockStop writes a content_block_stop event for the given index.
 func (s *StreamWriter) ContentBlockStop(index int) error {
-	return s.WriteEvent("content_block_stop", map[string]interface{}{
+	return s.WriteEvent("content_block_stop", map[string]any{
 		"type":  "content_block_stop",
 		"index": index,
 	})
@@ -122,7 +119,7 @@ func (s *StreamWriter) ContentBlockStop(index int) error {
 
 // MessageDelta writes a message_delta event with stop reason and usage.
 func (s *StreamWriter) MessageDelta(stopReason, stopSequence string, usage map[string]int) error {
-	delta := map[string]interface{}{
+	delta := map[string]any{
 		"stop_reason": stopReason,
 	}
 	if stopSequence != "" {
@@ -132,12 +129,12 @@ func (s *StreamWriter) MessageDelta(stopReason, stopSequence string, usage map[s
 	}
 
 	// Convert usage to interface{} map for JSON marshaling
-	usageMap := map[string]interface{}{}
+	usageMap := map[string]any{}
 	for k, v := range usage {
 		usageMap[k] = v
 	}
 
-	return s.WriteEvent("message_delta", map[string]interface{}{
+	return s.WriteEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": delta,
 		"usage": usageMap,
@@ -146,21 +143,21 @@ func (s *StreamWriter) MessageDelta(stopReason, stopSequence string, usage map[s
 
 // MessageStop writes the final message_stop event.
 func (s *StreamWriter) MessageStop() error {
-	return s.WriteEvent("message_stop", map[string]interface{}{
+	return s.WriteEvent("message_stop", map[string]any{
 		"type": "message_stop",
 	})
 }
 
 // TextDelta is a convenience method for writing a text content delta.
 func (s *StreamWriter) TextDelta(index int, text string) error {
-	return s.ContentBlockDelta(index, "text_delta", map[string]interface{}{
+	return s.ContentBlockDelta(index, "text_delta", map[string]any{
 		"text": text,
 	})
 }
 
 // ToolInputDelta is a convenience method for writing a tool input JSON delta.
 func (s *StreamWriter) ToolInputDelta(index int, partialJSON string) error {
-	return s.ContentBlockDelta(index, "input_json_delta", map[string]interface{}{
+	return s.ContentBlockDelta(index, "input_json_delta", map[string]any{
 		"partial_json": partialJSON,
 	})
 }

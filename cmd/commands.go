@@ -69,7 +69,7 @@ type SSOCreateTokenResponse struct {
 	TokenType    string `json:"tokenType"`
 }
 
-const kiroVersion = "0.11.28"
+const kiroVersion = "0.11.107"
 
 // GetTokenFilePath returns the cross-platform token file path
 func GetTokenFilePath() string {
@@ -525,7 +525,7 @@ func ConfigureClaudeCmd() tea.Msg {
 
 	// Configure ~/.claude.json
 	claudePath := filepath.Join(homeDir, ".claude.json")
-	var config map[string]interface{}
+	var config map[string]any
 	claudeConfigured := false
 
 	// Read existing config or create new one
@@ -539,7 +539,7 @@ func ConfigureClaudeCmd() tea.Msg {
 		if k, ok := config["claude2kiro"].(bool); ok && k {
 			claude2kiroSet = true
 		}
-		if oauth, ok := config["oauthAccount"].(map[string]interface{}); ok {
+		if oauth, ok := config["oauthAccount"].(map[string]any); ok {
 			if t, ok := oauth["type"].(string); ok && t == "api_key" {
 				apiKeySet = true
 			}
@@ -568,7 +568,7 @@ func ConfigureClaudeCmd() tea.Msg {
 		}
 	}
 	if config == nil {
-		config = make(map[string]interface{})
+		config = make(map[string]any)
 	}
 
 	// Only modify if not already configured
@@ -577,10 +577,10 @@ func ConfigureClaudeCmd() tea.Msg {
 		config["claude2kiro"] = true
 
 		// Set oauthAccount type to api_key (preserve other fields if they exist)
-		if existingOauth, ok := config["oauthAccount"].(map[string]interface{}); ok {
+		if existingOauth, ok := config["oauthAccount"].(map[string]any); ok {
 			existingOauth["type"] = "api_key"
 		} else {
-			config["oauthAccount"] = map[string]interface{}{
+			config["oauthAccount"] = map[string]any{
 				"type": "api_key",
 			}
 		}
@@ -648,7 +648,7 @@ claude @args
 		} else if pathAdded {
 			scriptMsg = fmt.Sprintf("claude-kiro added to PATH (%s)", binDir)
 		} else {
-			scriptMsg = fmt.Sprintf("claude-kiro ready (already in PATH)")
+			scriptMsg = "claude-kiro ready (already in PATH)"
 		}
 	} else {
 		// Unix (Linux/macOS): create shell script in ~/.local/bin
@@ -709,7 +709,7 @@ func UnconfigureCmd() tea.Msg {
 		actions = append(actions, "restored ~/.claude.json")
 	} else if data, err := os.ReadFile(claudePath); err == nil {
 		// No backup, but config exists - remove Claude2Kiro settings
-		var config map[string]interface{}
+		var config map[string]any
 		if err := json.Unmarshal(data, &config); err == nil {
 			modified := false
 			if _, ok := config["claude2kiro"]; ok {
@@ -877,10 +877,7 @@ func GetCreditsInfo() CreditsInfo {
 	daysUntilReset := usageResp.DaysUntilReset
 	if daysUntilReset == 0 && usageResp.NextDateReset > 0 {
 		resetTime := time.Unix(int64(usageResp.NextDateReset), 0)
-		daysUntilReset = int(time.Until(resetTime).Hours() / 24)
-		if daysUntilReset < 0 {
-			daysUntilReset = 0
-		}
+		daysUntilReset = max(int(time.Until(resetTime).Hours()/24), 0)
 	}
 
 	// Extract credit info from response

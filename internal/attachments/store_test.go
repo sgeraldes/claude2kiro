@@ -501,7 +501,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 	// Concurrent reads and writes
 	done := make(chan bool)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		go func(id int) {
 			// Read
 			_, _, err := store.Get(hash)
@@ -525,7 +525,7 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	// Wait for all goroutines
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		<-done
 	}
 }

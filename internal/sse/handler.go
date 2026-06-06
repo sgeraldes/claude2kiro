@@ -80,7 +80,7 @@ func StreamEvents(w http.ResponseWriter, flusher http.Flusher, events []parser.S
 
 	// Only send text content_block_start if there's text content (not tool-only)
 	if analysis.HasTextContent || !analysis.HasToolUse {
-		sw.ContentBlockStart(0, "text", map[string]interface{}{"text": ""})
+		sw.ContentBlockStart(0, "text", map[string]any{"text": ""})
 	}
 
 	outputTokens := 0
@@ -131,7 +131,7 @@ func StreamEmptyResponse(w http.ResponseWriter, flusher http.Flusher, cfg Stream
 	sw.MessageStart(cfg.MessageID, cfg.Model, 0, 0)
 
 	// Text block with error message
-	sw.ContentBlockStart(0, "text", map[string]interface{}{"text": errorMessage})
+	sw.ContentBlockStart(0, "text", map[string]any{"text": errorMessage})
 	sw.ContentBlockStop(0)
 
 	sw.MessageDelta("end_turn", "", map[string]int{"output_tokens": 0})
@@ -188,7 +188,7 @@ func StreamEmptyResponseWithCapture(w http.ResponseWriter, flusher http.Flusher,
 	sw.MessageStart(cfg.MessageID, cfg.Model, 0, 0)
 
 	// Text block with error message
-	sw.ContentBlockStart(0, "text", map[string]interface{}{"text": errorMessage})
+	sw.ContentBlockStart(0, "text", map[string]any{"text": errorMessage})
 	sw.ContentBlockStop(0)
 
 	sw.MessageDelta("end_turn", "", map[string]int{"output_tokens": 0})

@@ -183,10 +183,9 @@ func (m AttachmentBrowserModel) View() string {
 		config.FormatBytes(savedByDedup))
 
 	// List section
-	listHeight := m.height - 12 // Reserve space for header, detail, footer
-	if listHeight < 5 {
-		listHeight = 5
-	}
+	listHeight := max(
+		// Reserve space for header, detail, footer
+		m.height-12, 5)
 	listView := m.renderList(listHeight)
 
 	// Detail section (if enabled)
@@ -252,17 +251,11 @@ func (m AttachmentBrowserModel) renderList(height int) string {
 	var lines []string
 
 	// Calculate visible range
-	start := m.selectedIndex - height/2
-	if start < 0 {
-		start = 0
-	}
+	start := max(m.selectedIndex-height/2, 0)
 	end := start + height
 	if end > len(m.attachments) {
 		end = len(m.attachments)
-		start = end - height
-		if start < 0 {
-			start = 0
-		}
+		start = max(end-height, 0)
 	}
 
 	for i := start; i < end; i++ {
@@ -356,10 +349,7 @@ func (m *AttachmentBrowserModel) SetSize(width, height int) {
 // updateLayout recalculates component sizes
 func (m *AttachmentBrowserModel) updateLayout() {
 	// Update viewport size for detail panel
-	vpWidth := m.width - 6
-	if vpWidth < 20 {
-		vpWidth = 20
-	}
+	vpWidth := max(m.width-6, 20)
 	vpHeight := 7 // Fixed height for detail panel
 	m.viewport.Width = vpWidth
 	m.viewport.Height = vpHeight

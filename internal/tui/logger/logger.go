@@ -187,10 +187,7 @@ func (e LogEntry) Format(maxWidth int) string {
 	// Calculate available width for preview
 	// Format: [HH:MM:SS] [TYP] details | preview
 	baseLen := len(timestamp) + 3 + 5 + len(details) + 3 // brackets, spaces, pipe
-	previewWidth := maxWidth - baseLen
-	if previewWidth < 10 {
-		previewWidth = 10
-	}
+	previewWidth := max(maxWidth-baseLen, 10)
 
 	preview := truncate(e.Preview, previewWidth)
 
@@ -479,7 +476,7 @@ func generateRequestPreview(body string, maxLen int) string {
 	}
 
 	// Try to parse as JSON
-	var req map[string]interface{}
+	var req map[string]any
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		// Not valid JSON, fall back to sanitizePreview
 		return sanitizePreview(body, maxLen)
@@ -488,10 +485,10 @@ func generateRequestPreview(body string, maxLen int) string {
 	var parts []string
 
 	// Extract last user message text (most relevant info)
-	if messages, ok := req["messages"].([]interface{}); ok && len(messages) > 0 {
+	if messages, ok := req["messages"].([]any); ok && len(messages) > 0 {
 		// Find last user message
 		for i := len(messages) - 1; i >= 0; i-- {
-			if msg, ok := messages[i].(map[string]interface{}); ok {
+			if msg, ok := messages[i].(map[string]any); ok {
 				if role, _ := msg["role"].(string); role == "user" {
 					content := extractUserMessageText(msg["content"])
 					if content != "" {
@@ -510,10 +507,10 @@ func generateRequestPreview(body string, maxLen int) string {
 
 	// Add metadata summary
 	var meta []string
-	if tools, ok := req["tools"].([]interface{}); ok && len(tools) > 0 {
+	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
 		meta = append(meta, fmt.Sprintf("%d tools", len(tools)))
 	}
-	if messages, ok := req["messages"].([]interface{}); ok {
+	if messages, ok := req["messages"].([]any); ok {
 		meta = append(meta, fmt.Sprintf("%d msgs", len(messages)))
 	}
 
@@ -670,7 +667,7 @@ func extractSSETextPreview(content string, maxLen int) string {
 }
 
 // extractUserMessageText extracts text from a message content field
-func extractUserMessageText(content interface{}) string {
+func extractUserMessageText(content any) string {
 	switch c := content.(type) {
 	case string:
 		// Simple string content - clean up newlines
@@ -680,10 +677,10 @@ func extractUserMessageText(content interface{}) string {
 			text = strings.ReplaceAll(text, "  ", " ")
 		}
 		return strings.TrimSpace(text)
-	case []interface{}:
+	case []any:
 		// Array of content blocks - find first text block
 		for _, block := range c {
-			if blockMap, ok := block.(map[string]interface{}); ok {
+			if blockMap, ok := block.(map[string]any); ok {
 				if blockType, _ := blockMap["type"].(string); blockType == "text" {
 					if text, ok := blockMap["text"].(string); ok {
 						text = strings.ReplaceAll(text, "\n", " ")
@@ -772,10 +769,7 @@ func (l *Logger) extractAndSaveAttachments(body string, timestamp time.Time) (st
 		}
 
 		// Try to decode a sample to verify it's valid base64
-		sampleSize := 100
-		if len(base64Content) < sampleSize {
-			sampleSize = len(base64Content)
-		}
+		sampleSize := min(len(base64Content), 100)
 		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
 			// Not valid base64, keep original
 			return match
@@ -874,10 +868,7 @@ func (l *Logger) extractAndSaveAttachmentsLegacy(body string, timestamp time.Tim
 		}
 
 		// Try to decode a sample to verify it's valid base64
-		sampleSize := 100
-		if len(base64Content) < sampleSize {
-			sampleSize = len(base64Content)
-		}
+		sampleSize := min(len(base64Content), 100)
 		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
 			// Not valid base64, keep original
 			return match
@@ -1038,10 +1029,7 @@ func replaceBase64WithPlaceholders(body string, maxSizeKB int) string {
 
 		// Try to decode a sample to verify it's valid base64
 		// (prevents false positives on long alphanumeric strings)
-		sampleSize := 100
-		if len(base64Content) < sampleSize {
-			sampleSize = len(base64Content)
-		}
+		sampleSize := min(len(base64Content), 100)
 		if _, err := base64.StdEncoding.DecodeString(base64Content[:sampleSize]); err != nil {
 			// Not valid base64, keep original
 			return match

@@ -109,13 +109,9 @@ Use this first if you have not authenticated yet, or if you need to switch accou
 claude2kiro run
 ```
 
-The main command for day-to-day use.
+The quickest way to start a session. It starts an embedded proxy, launches Claude Code pointing at it, and tears the proxy down when Claude Code exits.
 
-It:
-- starts the local proxy
-- installs or refreshes the Claude Code plugin
-- sets up the environment for Claude Code
-- launches Claude Code using your Kiro-backed access
+Each `claude2kiro run` is self-contained — multiple instances run independently, each with its own proxy on a random port.
 
 <p align="center">
   <img src="docs/images/claude-code-using-proxy-light.png" alt="Claude Code running through Claude2Kiro" width="900" />
@@ -129,6 +125,27 @@ It also installs the local **kiro-proxy** plugin, which gives you slash commands
 - `/kiro-proxy:logs`
 - `/kiro-proxy:models`
 - `/kiro-proxy:config`
+
+### `claude2kiro remote`
+
+```bash
+claude2kiro remote
+```
+
+Launches Claude Code connected to an already-running proxy (started by the TUI or `claude2kiro server`).
+
+Use this when you want multiple Claude Code sessions sharing the same proxy. The TUI dashboard will show all requests from every connected session in one place.
+
+```
+# Terminal 1 — start the TUI and its proxy
+claude2kiro
+
+# Terminal 2 — connect a Claude Code session to it
+claude2kiro remote
+
+# Terminal 3 — connect another one
+claude2kiro remote --resume
+```
 
 ### `claude2kiro update`
 
@@ -146,7 +163,8 @@ Use this when you want to upgrade without reinstalling manually.
 |---|---|
 | `claude2kiro` | Open the interactive TUI for login, dashboard, settings, and launch actions |
 | `claude2kiro login` | Authenticate with Kiro and save credentials locally |
-| `claude2kiro run` | Start the proxy and launch Claude Code through Kiro |
+| `claude2kiro run` | Start an embedded proxy and launch Claude Code (self-contained) |
+| `claude2kiro remote` | Launch Claude Code connected to an already-running proxy (TUI or server) |
 | `claude2kiro update` | Download and switch to the latest released version |
 | `claude2kiro logout` | Remove saved credentials |
 | `claude2kiro server [port]` | Run only the headless proxy for advanced/manual setups |
@@ -167,6 +185,20 @@ Claude2Kiro is useful if you:
 - already pay for **Kiro** and want to use **Claude Code** with it
 - want a local **Anthropic-compatible endpoint** for tools that speak the Messages API
 - want a simpler install and update path than building from source
+
+### Proxy modes
+
+| Mode | Command | Proxy lifecycle | Multi-session |
+|---|---|---|---|
+| **Run** | `claude2kiro run` | One proxy per session — starts and stops with Claude Code | Independent, no sharing |
+| **Dashboard** | `claude2kiro` | Persistent — managed from the TUI | Shared via `claude2kiro remote` |
+| **Server** | `claude2kiro server [port]` | Persistent — runs until stopped (Ctrl+C) | Shared via `claude2kiro remote` |
+
+**Run** is the simplest option for a single session. It starts a self-contained proxy on a random port, launches Claude Code, and tears the proxy down when Claude Code exits. Each `claude2kiro run` is independent — other sessions cannot connect to its proxy.
+
+**Dashboard and server** both start a persistent proxy on a fixed port (default 8080). You can open additional Claude Code sessions against it with `claude2kiro remote`. All requests are logged to the same files on disk.
+
+The proxy is stateless — it reads the auth token from disk on every request and holds no session data in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
 
 ## License
 

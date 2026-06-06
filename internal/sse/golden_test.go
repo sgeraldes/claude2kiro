@@ -18,10 +18,10 @@ func textOnlyEvents() []parser.SSEEvent {
 	return []parser.SSEEvent{
 		{
 			Event: "content_block_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_delta",
 				"index": 0,
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"type": "text_delta",
 					"text": "Hello, ",
 				},
@@ -29,10 +29,10 @@ func textOnlyEvents() []parser.SSEEvent {
 		},
 		{
 			Event: "content_block_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_delta",
 				"index": 0,
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"type": "text_delta",
 					"text": "world!",
 				},
@@ -40,13 +40,13 @@ func textOnlyEvents() []parser.SSEEvent {
 		},
 		{
 			Event: "message_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type": "message_delta",
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"stop_reason":   "end_turn",
 					"stop_sequence": nil,
 				},
-				"usage": map[string]interface{}{"output_tokens": 0},
+				"usage": map[string]any{"output_tokens": 0},
 			},
 		},
 	}
@@ -57,23 +57,23 @@ func toolUseEvents() []parser.SSEEvent {
 	return []parser.SSEEvent{
 		{
 			Event: "content_block_start",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_start",
 				"index": 0,
-				"content_block": map[string]interface{}{
+				"content_block": map[string]any{
 					"type":  "tool_use",
 					"id":    "tool_123",
 					"name":  "read_file",
-					"input": map[string]interface{}{},
+					"input": map[string]any{},
 				},
 			},
 		},
 		{
 			Event: "content_block_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_delta",
 				"index": 0,
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"type":         "input_json_delta",
 					"partial_json": `{"path":"/test.txt"}`,
 				},
@@ -81,20 +81,20 @@ func toolUseEvents() []parser.SSEEvent {
 		},
 		{
 			Event: "content_block_stop",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_stop",
 				"index": 0,
 			},
 		},
 		{
 			Event: "message_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type": "message_delta",
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"stop_reason":   "tool_use",
 					"stop_sequence": nil,
 				},
-				"usage": map[string]interface{}{"output_tokens": 0},
+				"usage": map[string]any{"output_tokens": 0},
 			},
 		},
 	}
@@ -105,10 +105,10 @@ func mixedEvents() []parser.SSEEvent {
 	return []parser.SSEEvent{
 		{
 			Event: "content_block_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_delta",
 				"index": 0,
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"type": "text_delta",
 					"text": "Let me read that file.",
 				},
@@ -116,23 +116,23 @@ func mixedEvents() []parser.SSEEvent {
 		},
 		{
 			Event: "content_block_start",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_start",
 				"index": 1,
-				"content_block": map[string]interface{}{
+				"content_block": map[string]any{
 					"type":  "tool_use",
 					"id":    "tool_456",
 					"name":  "read_file",
-					"input": map[string]interface{}{},
+					"input": map[string]any{},
 				},
 			},
 		},
 		{
 			Event: "content_block_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_delta",
 				"index": 1,
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"type":         "input_json_delta",
 					"partial_json": `{"path":"/example.txt"}`,
 				},
@@ -140,20 +140,20 @@ func mixedEvents() []parser.SSEEvent {
 		},
 		{
 			Event: "content_block_stop",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_stop",
 				"index": 1,
 			},
 		},
 		{
 			Event: "message_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type": "message_delta",
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"stop_reason":   "tool_use",
 					"stop_sequence": nil,
 				},
-				"usage": map[string]interface{}{"output_tokens": 0},
+				"usage": map[string]any{"output_tokens": 0},
 			},
 		},
 	}
@@ -170,8 +170,8 @@ func generateSSEOutput(events []parser.SSEEvent, model string, messageID string)
 
 	for _, e := range events {
 		if e.Event == "content_block_delta" {
-			if dataMap, ok := e.Data.(map[string]interface{}); ok {
-				if delta, ok := dataMap["delta"].(map[string]interface{}); ok {
+			if dataMap, ok := e.Data.(map[string]any); ok {
+				if delta, ok := dataMap["delta"].(map[string]any); ok {
 					if _, ok := delta["text"]; ok {
 						hasTextContent = true
 					}
@@ -182,8 +182,8 @@ func generateSSEOutput(events []parser.SSEEvent, model string, messageID string)
 			}
 		}
 		if e.Event == "content_block_start" {
-			if dataMap, ok := e.Data.(map[string]interface{}); ok {
-				if cb, ok := dataMap["content_block"].(map[string]interface{}); ok {
+			if dataMap, ok := e.Data.(map[string]any); ok {
+				if cb, ok := dataMap["content_block"].(map[string]any); ok {
 					if cbType, ok := cb["type"].(string); ok && cbType == "tool_use" {
 						hasToolUse = true
 					}
@@ -203,7 +203,7 @@ func generateSSEOutput(events []parser.SSEEvent, model string, messageID string)
 
 	// Only send text content_block_start if there's text content (not tool-only)
 	if hasTextContent || !hasToolUse {
-		builder.ContentBlockStart(0, "text", map[string]interface{}{"text": ""})
+		builder.ContentBlockStart(0, "text", map[string]any{"text": ""})
 	}
 
 	// Process all parser events

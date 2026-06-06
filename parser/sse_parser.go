@@ -59,8 +59,8 @@ type assistantResponseEvent struct {
 }
 
 type SSEEvent struct {
-	Event string      `json:"event"`
-	Data  interface{} `json:"data"`
+	Event string `json:"event"`
+	Data  any    `json:"data"`
 }
 
 func ParseEvents(resp []byte) []SSEEvent {
@@ -191,13 +191,13 @@ func ParseEvents(resp []byte) []SSEEvent {
 		}
 		events = append(events, SSEEvent{
 			Event: "message_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type": "message_delta",
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"stop_reason":   stopReason,
 					"stop_sequence": nil,
 				},
-				"usage": map[string]interface{}{"output_tokens": 0},
+				"usage": map[string]any{"output_tokens": 0},
 			},
 		})
 	}
@@ -217,10 +217,10 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 	if evt.Content != "" {
 		return SSEEvent{
 			Event: "content_block_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_delta",
 				"index": 0,
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"type": "text_delta",
 					"text": evt.Content,
 				},
@@ -239,14 +239,14 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 			// First event for this tool - content_block_start
 			return SSEEvent{
 				Event: "content_block_start",
-				Data: map[string]interface{}{
+				Data: map[string]any{
 					"type":  "content_block_start",
 					"index": toolIndex,
-					"content_block": map[string]interface{}{
+					"content_block": map[string]any{
 						"type":  "tool_use",
 						"id":    evt.ToolUseId,
 						"name":  evt.Name,
-						"input": map[string]interface{}{},
+						"input": map[string]any{},
 					},
 				},
 			}
@@ -254,10 +254,10 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 			// Subsequent events - input_json_delta
 			return SSEEvent{
 				Event: "content_block_delta",
-				Data: map[string]interface{}{
+				Data: map[string]any{
 					"type":  "content_block_delta",
 					"index": toolIndex,
-					"delta": map[string]interface{}{
+					"delta": map[string]any{
 						"type":         "input_json_delta",
 						"partial_json": *evt.Input,
 					},
@@ -272,7 +272,7 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 		}
 		return SSEEvent{
 			Event: "content_block_stop",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type":  "content_block_stop",
 				"index": toolIndex,
 			},

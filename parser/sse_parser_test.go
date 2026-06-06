@@ -109,10 +109,10 @@ func TestTextOnlyResponseGetsEndTurn(t *testing.T) {
 	// Add a fake text event
 	events = append(events, SSEEvent{
 		Event: "content_block_delta",
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"type":  "content_block_delta",
 			"index": 0,
-			"delta": map[string]interface{}{
+			"delta": map[string]any{
 				"type": "text_delta",
 				"text": "Hello world",
 			},
@@ -128,13 +128,13 @@ func TestTextOnlyResponseGetsEndTurn(t *testing.T) {
 		}
 		events = append(events, SSEEvent{
 			Event: "message_delta",
-			Data: map[string]interface{}{
+			Data: map[string]any{
 				"type": "message_delta",
-				"delta": map[string]interface{}{
+				"delta": map[string]any{
 					"stop_reason":   stopReason,
 					"stop_sequence": nil,
 				},
-				"usage": map[string]interface{}{"output_tokens": 0},
+				"usage": map[string]any{"output_tokens": 0},
 			},
 		})
 	}
@@ -150,13 +150,13 @@ func TestTextOnlyResponseGetsEndTurn(t *testing.T) {
 		t.Errorf("Expected last event to be message_delta, got %s", lastEvent.Event)
 	}
 
-	dataMap, ok := lastEvent.Data.(map[string]interface{})
+	dataMap, ok := lastEvent.Data.(map[string]any)
 	if !ok {
 		t.Error("Expected Data to be a map")
 		return
 	}
 
-	deltaMap, ok := dataMap["delta"].(map[string]interface{})
+	deltaMap, ok := dataMap["delta"].(map[string]any)
 	if !ok {
 		t.Error("Expected delta to be a map")
 		return

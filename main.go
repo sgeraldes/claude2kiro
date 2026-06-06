@@ -9,10 +9,12 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	jsonStr "encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net"
 	"net/http"
@@ -20,7 +22,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +35,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
+	"github.com/sgeraldes/claude2kiro/internal/models"
 	"github.com/sgeraldes/claude2kiro/internal/sse"
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
@@ -204,7 +209,7 @@ type AnthropicStreamResponse struct {
 	ContentDelta struct {
 		Text string `json:"text"`
 		Type string `json:"type"`
-	} `json:"delta,omitempty"`
+	} `json:"delta"`
 	Content []struct {
 		Text string `json:"text"`
 		Type string `json:"type"`
@@ -214,7 +219,7 @@ type AnthropicStreamResponse struct {
 	Usage        struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
-	} `json:"usage,omitempty"`
+	} `json:"usage"`
 }
 
 // AnthropicRequestMessage represents the Anthropic API message structure
@@ -254,10 +259,8 @@ func sanitizeHistoryContent(content string) string {
 		"answer for user question",
 		"(no content)",
 	}
-	for _, garbage := range garbageContent {
-		if content == garbage {
-			return "" // Replace with empty string
-		}
+	if slices.Contains(garbageContent, content) {
+		return "" // Replace with empty string
 	}
 	return content
 }
@@ -270,12 +273,12 @@ func getMessageContent(content any) string {
 			return "" // Empty content is valid
 		}
 		return v
-	case []interface{}:
+	case []any:
 		var texts []string
 		hasToolUse := false
 		hasToolResult := false
 		for _, block := range v {
-			if m, ok := block.(map[string]interface{}); ok {
+			if m, ok := block.(map[string]any); ok {
 				// Get the block type
 				blockType, _ := m["type"].(string)
 				switch blockType {
@@ -284,10 +287,10 @@ func getMessageContent(content any) string {
 					// Tool result content can be a string or an array of content blocks
 					if contentStr, ok := m["content"].(string); ok {
 						texts = append(texts, contentStr)
-					} else if contentArr, ok := m["content"].([]interface{}); ok {
+					} else if contentArr, ok := m["content"].([]any); ok {
 						// Content is an array of blocks - extract text from each
 						for _, innerBlock := range contentArr {
-							if innerMap, ok := innerBlock.(map[string]interface{}); ok {
+							if innerMap, ok := innerBlock.(map[string]any); ok {
 								if innerType, _ := innerMap["type"].(string); innerType == "text" {
 									if textVal, ok := innerMap["text"].(string); ok {
 										texts = append(texts, textVal)
@@ -335,17 +338,19 @@ type HistoryToolUse struct {
 func getMessageToolUses(content any) []HistoryToolUse {
 	var toolUses []HistoryToolUse
 
-	blocks, ok := content.([]interface{})
+	blocks, ok := content.([]any)
 	if !ok {
 		return toolUses
 	}
 
 	for _, block := range blocks {
-		if m, ok := block.(map[string]interface{}); ok {
+		if m, ok := block.(map[string]any); ok {
 			if typeVal, ok := m["type"].(string); ok && typeVal == "tool_use" {
 				toolUse := HistoryToolUse{}
 				if name, ok := m["name"].(string); ok {
-					toolUse.Name = name
+					// Sanitize to match the (sanitized) tool-definition names so
+					// history references stay consistent with the current tools.
+					toolUse.Name = sanitizeToolName(name)
 				}
 				if id, ok := m["id"].(string); ok {
 					toolUse.ToolUseId = id
@@ -368,13 +373,13 @@ func getMessageToolUses(content any) []HistoryToolUse {
 func getMessageToolResults(content any) []ToolResult {
 	var results []ToolResult
 
-	blocks, ok := content.([]interface{})
+	blocks, ok := content.([]any)
 	if !ok {
 		return results
 	}
 
 	for _, block := range blocks {
-		m, ok := block.(map[string]interface{})
+		m, ok := block.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -397,9 +402,9 @@ func getMessageToolResults(content any) []ToolResult {
 		switch c := m["content"].(type) {
 		case string:
 			tr.Content = []ToolResultContent{{Text: c}}
-		case []interface{}:
+		case []any:
 			for _, item := range c {
-				if itemMap, ok := item.(map[string]interface{}); ok {
+				if itemMap, ok := item.(map[string]any); ok {
 					if text, ok := itemMap["text"].(string); ok {
 						tr.Content = append(tr.Content, ToolResultContent{Text: text})
 					}
@@ -500,6 +505,12 @@ func getKiroSema() chan struct{} {
 var ModelMap = map[string]string{
 	// Auto - lets Kiro choose the best model (1.0x credits)
 	"auto": "auto",
+	// Claude Opus 4.8 (2.2x credits, 1M context, 128K output) - experimental preview
+	"claude-opus-4-8": "claude-opus-4.8",
+	"claude-opus-4.8": "claude-opus-4.8",
+	// Claude Opus 4.7 (2.2x credits, 1M context, 128K output) - experimental preview
+	"claude-opus-4-7": "claude-opus-4.7",
+	"claude-opus-4.7": "claude-opus-4.7",
 	// Claude Opus 4.6 (2.2x credits, 1M context)
 	"claude-opus-4-6": "claude-opus-4.6",
 	"claude-opus-4.6": "claude-opus-4.6",
@@ -548,18 +559,56 @@ var ModelMap = map[string]string{
 	"qwen3-coder-next": "qwen3-coder-next",
 	"qwen3":            "qwen3-coder-next",
 	"qwen":             "qwen3-coder-next",
+	// GLM 5 (0.5x credits, 200K context, text only)
+	"glm-5": "glm-5",
+	"glm5":  "glm-5",
+	"glm":   "glm-5",
 }
 
-// getKiroModelID converts an Anthropic model name to Kiro model ID
-// First checks the static map, then falls back to family-based mapping
+// getKiroModelID converts an Anthropic model name to a Kiro model ID.
+//
+// Resolution order:
+//  1. Curated static ModelMap (exact match) - fast, offline, handles legacy remaps.
+//  2. Normalized form against the live catalog - lets a brand-new Claude version
+//     (e.g. a freshly released Opus) route correctly the moment Kiro exposes it,
+//     with no code change. "claude-opus-4-8" -> "claude-opus-4.8" -> available? use it.
+//  3. Raw lowercased id against the live catalog - if Claude Code already sent a
+//     Kiro-style id.
+//  4. Family resolution from the live catalog - highest available version in the
+//     requested family (opus/sonnet/haiku/...).
+//  5. Static family fallback - newest known stable when the catalog is unreachable.
+//  6. Pass through as-is.
 func getKiroModelID(anthropicModel string) string {
-	// Check static map first
+	// 1. Curated static map first.
 	if kiroModel, ok := ModelMap[anthropicModel]; ok {
 		return kiroModel
 	}
 
-	// Family-based fallback: map unknown versions to the latest known Kiro model
+	// 2. Normalize to Kiro's dotted form and check the live catalog.
+	if normalized := models.NormalizeAnthropicID(anthropicModel); normalized != "" {
+		if modelCatalog.Has(normalized) {
+			return normalized
+		}
+	}
+
+	// 3. Maybe Claude Code already sent a Kiro-style id (e.g. "glm-5").
 	lower := strings.ToLower(anthropicModel)
+	if modelCatalog.Has(lower) {
+		return lower
+	}
+
+	// 4. Family resolution from the live catalog: pick the highest available
+	//    version in the requested family.
+	for _, family := range []string{"opus", "haiku", "sonnet", "deepseek", "minimax", "qwen", "glm"} {
+		if strings.Contains(lower, family) {
+			if id, ok := modelCatalog.ResolveFamily(family); ok {
+				return id
+			}
+			break
+		}
+	}
+
+	// 5. Static family fallback (catalog unreachable): newest known stable model.
 	switch {
 	case strings.Contains(lower, "opus"):
 		return "claude-opus-4.6"
@@ -573,10 +622,118 @@ func getKiroModelID(anthropicModel string) string {
 		return "minimax-m2.5"
 	case strings.Contains(lower, "qwen"):
 		return "qwen3-coder-next"
+	case strings.Contains(lower, "glm"):
+		return "glm-5"
 	}
 
-	// Last resort: pass through as-is (Kiro may accept it)
+	// 6. Last resort: pass through as-is (Kiro may accept it).
 	return anthropicModel
+}
+
+// modelCatalog is the dynamic layer over ListAvailableModels. It caches the live
+// model list (10-minute TTL) and serves stale data on fetch failure so model
+// resolution on the request path never breaks.
+var modelCatalog = models.NewCatalog(10*time.Minute, fetchKiroModels)
+
+// fetchKiroModels retrieves the current model list from CodeWhisperer using the
+// saved auth token and configured endpoint.
+func fetchKiroModels() ([]models.KiroModel, error) {
+	token, err := getToken()
+	if err != nil {
+		return nil, err
+	}
+	cfg := config.Get()
+	ua := fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS)
+	return models.Fetch(
+		cfg.Advanced.CodeWhispererEndpoint,
+		token.AccessToken,
+		token.ProfileArn,
+		ua,
+		cfg.Network.HTTPTimeout,
+	)
+}
+
+// printModels fetches the live model list from Kiro and prints it. This is the
+// user-facing view of the dynamic model catalog.
+func printModels() {
+	list, err := fetchKiroModels()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error fetching models: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%d models available via Kiro (live from ListAvailableModels):\n\n", len(list))
+	fmt.Printf("%-20s %-22s %6s %9s %9s  %s\n", "MODEL ID", "NAME", "RATE", "MAX IN", "MAX OUT", "INPUTS")
+	fmt.Printf("%-20s %-22s %6s %9s %9s  %s\n", "--------", "----", "----", "------", "-------", "------")
+	for _, m := range list {
+		inputs := strings.Join(m.SupportedInputTypes, "+")
+		fmt.Printf("%-20s %-22s %5.2fx %9d %9d  %s\n",
+			m.ModelID, m.ModelName, m.RateMultiplier,
+			m.TokenLimits.MaxInputTokens, m.TokenLimits.MaxOutputTokens, inputs)
+	}
+	fmt.Println("\nClaude Code model IDs are resolved to these via the static map + family fallback.")
+
+	// Keep the installed /models slash command in sync with what we just fetched.
+	updateModelsDoc(list)
+}
+
+// pluginCommandDirs returns the installed kiro-proxy plugin "commands" directories
+// that hold the slash-command markdown files. It includes the version-independent
+// marketplace copy, this build's version cache, and every other already-installed
+// version cache found on disk — so the doc is refreshed even when the running
+// binary's version differs from the active install.
+func pluginCommandDirs() []string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	base := filepath.Join(homeDir, ".claude", "plugins")
+	cacheBase := filepath.Join(base, "cache", "claude2kiro", "kiro-proxy")
+
+	seen := map[string]bool{}
+	var dirs []string
+	add := func(d string) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+
+	add(filepath.Join(base, "marketplaces", "claude2kiro", "kiro-proxy", "commands"))
+	add(filepath.Join(cacheBase, menu.Version, "commands"))
+
+	// Pick up any already-installed version caches (e.g. the active release).
+	if entries, err := os.ReadDir(cacheBase); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				add(filepath.Join(cacheBase, e.Name(), "commands"))
+			}
+		}
+	}
+	return dirs
+}
+
+// updateModelsDoc regenerates the installed /models slash command from a live
+// model list and writes it to each plugin command directory, but only when the
+// content actually differs. This is the change-driven updater: it is wired to
+// modelCatalog.OnChange so the doc tracks Kiro's (roughly weekly) model changes
+// automatically, and it overwrites the embedded static copy on first fetch.
+// Best-effort and silent (like installPlugin) so it never disrupts the TUI.
+func updateModelsDoc(list []models.KiroModel) {
+	if len(list) == 0 {
+		return
+	}
+	content := models.RenderMarkdown(list)
+	for _, dir := range pluginCommandDirs() {
+		path := filepath.Join(dir, "models.md")
+		if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+			continue // already up to date
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			continue
+		}
+		_ = os.WriteFile(path, []byte(content), 0644)
+	}
 }
 
 // cryptoRandIntn returns a random int in [0, n) using crypto/rand.
@@ -606,13 +763,13 @@ func generateUUID() string {
 func extractImagesFromContent(content any) []ImageBlock {
 	var images []ImageBlock
 
-	contentBlocks, ok := content.([]interface{})
+	contentBlocks, ok := content.([]any)
 	if !ok {
 		return images
 	}
 
 	for _, block := range contentBlocks {
-		blockMap, ok := block.(map[string]interface{})
+		blockMap, ok := block.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -622,7 +779,7 @@ func extractImagesFromContent(content any) []ImageBlock {
 			continue
 		}
 
-		source, ok := blockMap["source"].(map[string]interface{})
+		source, ok := blockMap["source"].(map[string]any)
 		if !ok {
 			continue
 		}
@@ -722,9 +879,7 @@ func resolveRefs(node map[string]any, defs map[string]any) map[string]any {
 // copyMap creates a shallow copy of a map
 func copyMap(m map[string]any) map[string]any {
 	c := make(map[string]any, len(m))
-	for k, v := range m {
-		c[k] = v
-	}
+	maps.Copy(c, m)
 	return c
 }
 
@@ -763,22 +918,227 @@ func cleanToolSchema(schema map[string]any) map[string]any {
 	return cleaned
 }
 
+// maxToolNameLen is CodeWhisperer/Bedrock's hard limit on tool names. Requests
+// with a longer tool name are rejected with "Improperly formed request." Claude
+// Code's MCP tool names (e.g. "mcp__plugin_<server>_<server>__<tool>") routinely
+// exceed this, so the proxy must sanitize them.
+const maxToolNameLen = 64
+
+// invalidToolNameChars matches characters not allowed in a CodeWhisperer tool name
+// (the allowed set is [a-zA-Z0-9_-]).
+var invalidToolNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+// sanitizeToolName returns a CodeWhisperer-safe tool name: at most maxToolNameLen
+// characters, all within [a-zA-Z0-9_-]. It is deterministic — the same input
+// always yields the same output — so tool definitions and the tool_use names in
+// conversation history stay consistent. Uniqueness for shortened names is
+// preserved via an 8-hex-char hash suffix derived from the full original name.
+func sanitizeToolName(name string) string {
+	safe := invalidToolNameChars.ReplaceAllString(name, "_")
+	if len(safe) <= maxToolNameLen {
+		return safe
+	}
+	sum := sha256.Sum256([]byte(name))
+	suffix := "_" + hex.EncodeToString(sum[:])[:8] // 9 chars, e.g. "_1a2b3c4d"
+	return safe[:maxToolNameLen-len(suffix)] + suffix
+}
+
+// buildToolNameMap returns a map from sanitized tool name back to the original,
+// for every tool whose name had to be changed. It is used to restore the original
+// names in the model's tool_use responses so Claude Code recognizes its tools.
+func buildToolNameMap(tools []AnthropicTool) map[string]string {
+	if len(tools) == 0 {
+		return nil
+	}
+	m := make(map[string]string)
+	for _, t := range tools {
+		if s := sanitizeToolName(t.Name); s != t.Name {
+			m[s] = t.Name
+		}
+	}
+	return m
+}
+
+// restoreToolNames rewrites sanitized tool_use names back to their originals in
+// parsed SSE events, so Claude Code sees the tool names it sent. nameMap is
+// sanitized->original (from buildToolNameMap).
+func restoreToolNames(events []parser.SSEEvent, nameMap map[string]string) {
+	if len(nameMap) == 0 {
+		return
+	}
+	for _, e := range events {
+		if e.Event != "content_block_start" {
+			continue
+		}
+		data, ok := e.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		cb, ok := data["content_block"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if cb["type"] != "tool_use" {
+			continue
+		}
+		if name, ok := cb["name"].(string); ok {
+			if orig, ok := nameMap[name]; ok {
+				cb["name"] = orig
+			}
+		}
+	}
+}
+
+// consumerProfileArn is Kiro's shared CodeWhisperer profile for individual
+// (social-auth) subscriptions: GitHub / Google / Builder ID. IdC/Enterprise
+// users must use their own account-specific profile instead.
+const consumerProfileArn = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+
+// kiroProfileFilePaths returns the candidate paths to Kiro IDE's stored profile.json.
+func kiroProfileFilePaths() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	rel := filepath.Join("Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json")
+	return []string{
+		filepath.Join(home, "AppData", "Roaming", rel),                  // Windows
+		filepath.Join(home, "Library", "Application Support", rel),       // macOS
+		filepath.Join(home, ".config", rel),                             // Linux
+	}
+}
+
+// readKiroProfileArn reads the profileArn that Kiro IDE itself selected, from its
+// globalStorage. This is the authoritative source (exactly the profile Kiro uses),
+// so it is preferred over API discovery. Returns "" if not found.
+func readKiroProfileArn() string {
+	for _, p := range kiroProfileFilePaths() {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var prof struct {
+			Arn string `json:"arn"`
+		}
+		if json.Unmarshal(data, &prof) == nil && prof.Arn != "" {
+			return prof.Arn
+		}
+	}
+	return ""
+}
+
+// arnAccount extracts the AWS account id from an ARN
+// (arn:partition:service:region:ACCOUNT:resource). Returns "" if malformed.
+func arnAccount(arn string) string {
+	parts := strings.Split(arn, ":")
+	if len(parts) < 5 {
+		return ""
+	}
+	return parts[4]
+}
+
+// kiroProfile is one entry from the ListAvailableProfiles API.
+type kiroProfile struct {
+	Arn             string `json:"arn"`
+	ProfileName     string `json:"profileName"`
+	IdentityDetails struct {
+		SsoIdentityDetails struct {
+			OidcClientId string `json:"oidcClientId"`
+		} `json:"ssoIdentityDetails"`
+	} `json:"identityDetails"`
+}
+
+// fetchProfilesFromAPI calls ListAvailableProfiles and returns the profiles.
+func fetchProfilesFromAPI(accessToken string) []kiroProfile {
+	cfg := config.Get()
+	endpoint := cfg.Advanced.ProfilesEndpoint
+	if endpoint == "" {
+		return nil
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBufferString("{}"))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+	var r struct {
+		Profiles []kiroProfile `json:"profiles"`
+	}
+	if json.Unmarshal(body, &r) != nil {
+		return nil
+	}
+	return r.Profiles
+}
+
+// selectProfileArn picks the best profile ARN from the available list:
+//   - exactly one profile -> use it
+//   - multiple -> the profile whose account matches its own SSO oidcClientId
+//     account (the org/enterprise profile living in the identity-center account)
+//   - otherwise -> "" (ambiguous: never guess, since a wrong profile breaks
+//     model access)
+func selectProfileArn(profiles []kiroProfile) string {
+	if len(profiles) == 1 {
+		return profiles[0].Arn
+	}
+	var matches []string
+	for _, p := range profiles {
+		ssoAcct := arnAccount(p.IdentityDetails.SsoIdentityDetails.OidcClientId)
+		if ssoAcct != "" && ssoAcct == arnAccount(p.Arn) {
+			matches = append(matches, p.Arn)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return ""
+}
+
+// discoverProfileArn finds the user's CodeWhisperer profile ARN: first from Kiro
+// IDE's stored profile (authoritative), then via the ListAvailableProfiles API
+// with a conservative selection. Returns "" if none can be determined safely.
+func discoverProfileArn(accessToken string) string {
+	if arn := readKiroProfileArn(); arn != "" {
+		return arn
+	}
+	return selectProfileArn(fetchProfilesFromAPI(accessToken))
+}
+
 // buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
 	cwReq := CodeWhispererRequest{}
 
-	// Set ProfileArn based on auth method
-	if token.AuthMethod == "IdC" {
-		// For IdC, omit ProfileArn - the token itself identifies the user
+	// Set ProfileArn.
+	//
+	// The Kiro backend associates each request with a CodeWhisperer profile. For
+	// IdC/Enterprise users the correct profile is account-specific and is
+	// discovered + persisted on the token (see discoverProfileArn). Sending the
+	// WRONG profile is worse than sending none — it 403s or silently loses model
+	// access — so we never blindly fall back to the shared consumer profile for
+	// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+	switch {
+	case token.ProfileArn != "":
+		cwReq.ProfileArn = token.ProfileArn
+	case token.AuthMethod != "IdC":
+		cwReq.ProfileArn = consumerProfileArn
+	default:
+		// IdC with no discovered profile: omit (works for tokens the backend
+		// doesn't yet require a profile for).
 		cwReq.ProfileArn = ""
-	} else {
-		// For social auth (GitHub/Google), use the profileArn from the token response
-		// or fall back to the hardcoded Kiro consumer profile
-		if token.ProfileArn != "" {
-			cwReq.ProfileArn = token.ProfileArn
-		} else {
-			cwReq.ProfileArn = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
-		}
 	}
 	cwReq.ConversationState.ChatTriggerType = "MANUAL"
 	cwReq.ConversationState.ConversationId = generateUUID()
@@ -802,7 +1162,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		}
 		for _, tool := range toolsToProcess {
 			cwTool := CodeWhispererTool{}
-			cwTool.ToolSpecification.Name = tool.Name
+			// CodeWhisperer rejects tool names longer than 64 chars; sanitize
+			// (deterministically) so long MCP names don't break the whole request.
+			cwTool.ToolSpecification.Name = sanitizeToolName(tool.Name)
 			// Truncate long descriptions to avoid 400 errors
 			desc := tool.Description
 			if len(desc) > maxToolDescLength {
@@ -859,52 +1221,74 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		}
 
 		// Process regular message history with full tool use/result support.
-		// Claude Code sends: user → assistant(+tool_use) → user(+tool_result) → assistant → ...
-		// CodeWhisperer requires: assistant.toolUses must match next user.toolResults
+		// Claude Code does NOT guarantee strict user/assistant alternation: it may
+		// interleave a role:"system" message (e.g. injected reminders) between a
+		// user turn and the assistant's tool_use. CodeWhisperer requires (a)
+		// alternating user/assistant turns and (b) that every tool_result's
+		// tool_use_id has a matching tool_use in a PRIOR assistant turn. The old
+		// loop paired user→assistant via lookahead, so an interposed system message
+		// caused the assistant tool_use to be silently dropped — and the matching
+		// tool_result then failed with "Improperly formed request".
+		//
+		// We instead handle each message by role and emit through a helper that
+		// inserts a synthetic filler turn whenever two same-role turns would be
+		// adjacent, so an assistant tool_use is never dropped.
+		defaultUserMsg := HistoryUserMessage{}
+		defaultUserMsg.UserInputMessage.Content = "Continue."
+		defaultUserMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
+		defaultUserMsg.UserInputMessage.Origin = "AI_EDITOR"
+
+		lastRole := ""
+		if len(history) > 0 {
+			lastRole = "assistant" // the system-array block above ends on an assistant turn
+		}
+		emit := func(role string, entry any) {
+			if lastRole == role {
+				// Keep user/assistant strictly alternating.
+				if role == "user" {
+					history = append(history, assistantDefaultMsg)
+				} else {
+					history = append(history, defaultUserMsg)
+				}
+			}
+			history = append(history, entry)
+			lastRole = role
+		}
+
+		// All messages except the last one (the last is the current message).
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			msg := anthropicReq.Messages[i]
 
-			if msg.Role == "user" {
-				userContent := sanitizeHistoryContent(getMessageContent(msg.Content))
-				userMsg := HistoryUserMessage{}
-				userMsg.UserInputMessage.Content = userContent
-				userMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
-				userMsg.UserInputMessage.Origin = "AI_EDITOR"
+			if msg.Role == "assistant" {
+				assistantMsg := HistoryAssistantMessage{}
+				assistantMsg.AssistantResponseMessage.Content = sanitizeHistoryContent(getMessageContent(msg.Content))
 
-				// Extract tool_result blocks if present
-				toolResults := getMessageToolResults(msg.Content)
-				if len(toolResults) > 0 {
-					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserContext{
-						ToolResults: toolResults,
+				toolUses := getMessageToolUses(msg.Content)
+				if len(toolUses) > 0 {
+					tuAny := make([]any, len(toolUses))
+					for j, tu := range toolUses {
+						tuAny[j] = tu
 					}
+					assistantMsg.AssistantResponseMessage.ToolUses = tuAny
+				} else {
+					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
+				emit("assistant", assistantMsg)
+				continue
+			}
 
-				history = append(history, userMsg)
+			// "user", "system", or any other role -> treated as a user turn.
+			userMsg := HistoryUserMessage{}
+			userMsg.UserInputMessage.Content = sanitizeHistoryContent(getMessageContent(msg.Content))
+			userMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
+			userMsg.UserInputMessage.Origin = "AI_EDITOR"
 
-				// Check if the next message is an assistant reply
-				if i+1 < len(anthropicReq.Messages)-1 && anthropicReq.Messages[i+1].Role == "assistant" {
-					nextMsg := anthropicReq.Messages[i+1]
-					content := sanitizeHistoryContent(getMessageContent(nextMsg.Content))
-
-					assistantMsg := HistoryAssistantMessage{}
-					assistantMsg.AssistantResponseMessage.Content = content
-
-					// Extract tool_use blocks from assistant message
-					toolUses := getMessageToolUses(nextMsg.Content)
-					if len(toolUses) > 0 {
-						tuAny := make([]any, len(toolUses))
-						for j, tu := range toolUses {
-							tuAny[j] = tu
-						}
-						assistantMsg.AssistantResponseMessage.ToolUses = tuAny
-					} else {
-						assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
-					}
-
-					history = append(history, assistantMsg)
-					i++ // Skip the already processed assistant message
+			if toolResults := getMessageToolResults(msg.Content); len(toolResults) > 0 {
+				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserContext{
+					ToolResults: toolResults,
 				}
 			}
+			emit("user", userMsg)
 		}
 
 		cwReq.ConversationState.History = history
@@ -914,6 +1298,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 }
 
 func main() {
+	// Keep the installed /models slash command in sync whenever the live model
+	// set changes (fires on the first fetch and on every subsequent change).
+	modelCatalog.SetOnChange(updateModelsDoc)
+
 	if len(os.Args) < 2 {
 		// No arguments - launch TUI
 		runTUI()
@@ -1058,6 +1446,8 @@ func main() {
 		remoteConnect()
 	case "test":
 		testProxy()
+	case "models":
+		printModels()
 	case "update":
 		selfUpdate()
 	case "logout":
@@ -1167,7 +1557,7 @@ func installPlugin() {
 		if data, err := pluginFS.ReadFile("plugin/.claude-plugin/plugin.json"); err == nil {
 			os.WriteFile(filepath.Join(dir, ".claude-plugin", "plugin.json"), data, 0644)
 		}
-		
+
 		// Copy marketplace.json to the marketplace root
 		if dir == pluginSourceDir {
 			if data, err := pluginFS.ReadFile(".claude-plugin/marketplace.json"); err == nil {
@@ -1649,10 +2039,9 @@ func runClaudeWithProxy() {
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	portStr := fmt.Sprintf("%d", port)
 
 	// 4. Build the proxy HTTP server using the logged handler (same as TUI)
-	mux := buildServerMux(lg, portStr)
+	mux := buildServerMux(lg)
 	server := &http.Server{Handler: mux}
 
 	// 5. Start proxy in background goroutine
@@ -1829,7 +2218,7 @@ func testProxy() {
 
 	fullText := ""
 	for i, evt := range events {
-		// SSEEvent has .Event (string) and .Data (interface{})
+		// SSEEvent has .Event (string) and .Data (any)
 		dataJSON, _ := json.Marshal(evt.Data)
 		dataStr := string(dataJSON)
 		if len(dataStr) > 300 {
@@ -1839,8 +2228,8 @@ func testProxy() {
 
 		// Extract text from content_block_delta events
 		if evt.Event == "content_block_delta" {
-			if dataMap, ok := evt.Data.(map[string]interface{}); ok {
-				if delta, ok := dataMap["delta"].(map[string]interface{}); ok {
+			if dataMap, ok := evt.Data.(map[string]any); ok {
+				if delta, ok := dataMap["delta"].(map[string]any); ok {
 					if text, ok := delta["text"].(string); ok {
 						fullText += text
 					}
@@ -1848,7 +2237,7 @@ func testProxy() {
 			}
 		}
 		// Also try assistantResponseEvent format (raw Kiro events before conversion)
-		if dataMap, ok := evt.Data.(map[string]interface{}); ok {
+		if dataMap, ok := evt.Data.(map[string]any); ok {
 			if content, ok := dataMap["content"].(string); ok && content != "" {
 				fullText += content
 			}
@@ -1886,6 +2275,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro claude              - Configure Claude Code settings (global)")
 	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
 	fmt.Println("  claude2kiro credits             - Show Kiro subscription credit usage")
+	fmt.Println("  claude2kiro models              - List models available via Kiro (live)")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
 	fmt.Println("")
@@ -2010,7 +2400,7 @@ func decompressResponse(resp *http.Response) ([]byte, error) {
 // AnthropicSSEEvent represents a parsed SSE event from Anthropic API
 type AnthropicSSEEvent struct {
 	Type string
-	Data map[string]interface{}
+	Data map[string]any
 }
 
 // parseAnthropicSSE parses Anthropic SSE response into structured events
@@ -2020,12 +2410,12 @@ func parseAnthropicSSE(body []byte) []AnthropicSSEEvent {
 	var currentEvent, currentData string
 
 	for _, line := range lines {
-		if strings.HasPrefix(line, "event: ") {
-			currentEvent = strings.TrimPrefix(line, "event: ")
-		} else if strings.HasPrefix(line, "data: ") {
-			currentData = strings.TrimPrefix(line, "data: ")
+		if after, ok := strings.CutPrefix(line, "event: "); ok {
+			currentEvent = after
+		} else if after, ok := strings.CutPrefix(line, "data: "); ok {
+			currentData = after
 		} else if line == "" && currentEvent != "" && currentData != "" {
-			var data map[string]interface{}
+			var data map[string]any
 			if json.Unmarshal([]byte(currentData), &data) == nil {
 				events = append(events, AnthropicSSEEvent{Type: currentEvent, Data: data})
 			}
@@ -2042,16 +2432,16 @@ func extractAnthropicTextPreview(sseResponse string, maxLen int) string {
 	lines := strings.Split(sseResponse, "\n")
 	var textParts []string
 
-	for i := 0; i < len(lines); i++ {
+	for i := range lines {
 		line := lines[i]
 		// Look for event: content_block_delta
 		if strings.HasPrefix(line, "event: content_block_delta") {
 			// Next line should be "data: {...}"
 			if i+1 < len(lines) && strings.HasPrefix(lines[i+1], "data: ") {
 				dataJSON := strings.TrimPrefix(lines[i+1], "data: ")
-				var data map[string]interface{}
+				var data map[string]any
 				if err := jsonStr.Unmarshal([]byte(dataJSON), &data); err == nil {
-					if delta, ok := data["delta"].(map[string]interface{}); ok {
+					if delta, ok := data["delta"].(map[string]any); ok {
 						if text, ok := delta["text"].(string); ok {
 							textParts = append(textParts, text)
 						}
@@ -2072,7 +2462,7 @@ func extractAnthropicTextPreview(sseResponse string, maxLen int) string {
 }
 
 // Copies ALL headers from the original request unchanged
-func forwardToAnthropic(originalReq *http.Request, body []byte, lg *logger.Logger) (*http.Response, error) {
+func forwardToAnthropic(originalReq *http.Request, body []byte) (*http.Response, error) {
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -2098,7 +2488,7 @@ func forwardToAnthropic(originalReq *http.Request, body []byte, lg *logger.Logge
 
 // forwardToAnthropicWithHeaders forwards a request to Anthropic API using pre-copied headers
 // Used by comparison mode goroutines to avoid race conditions with request reuse
-func forwardToAnthropicWithHeaders(headers http.Header, body []byte, lg *logger.Logger) (*http.Response, error) {
+func forwardToAnthropicWithHeaders(headers http.Header, body []byte) (*http.Response, error) {
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -2124,8 +2514,13 @@ func forwardToAnthropicWithHeaders(headers http.Header, body []byte, lg *logger.
 
 // buildServerMux creates the HTTP mux with all endpoints using the logger.
 // Shared by TUI mode (startServerWithLogger) and run mode (runClaudeWithProxy).
-func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
+func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
+
+	// Warm the model catalog in the background so the first request doesn't pay
+	// the ListAvailableModels fetch latency. This also fires the OnChange hook,
+	// which refreshes the installed /models slash command if the model set changed.
+	go modelCatalog.Warm()
 
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -2209,7 +2604,7 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 
 		if cfg.Advanced.AnthropicDirect {
 			// Anthropic Direct Mode: forward request unchanged to Anthropic
-			resp, err := forwardToAnthropic(r, body, lg)
+			resp, err := forwardToAnthropic(r, body)
 			if err != nil {
 				lg.LogError(fmt.Sprintf("[ANTHROPIC DIRECT] Forward failed: %v", err))
 				http.Error(w, fmt.Sprintf("Anthropic forward failed: %v", err), http.StatusBadGateway)
@@ -2218,9 +2613,7 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 			defer resp.Body.Close()
 
 			// Copy ALL response headers
-			for k, v := range resp.Header {
-				w.Header()[k] = v
-			}
+			maps.Copy(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
 
 			// Check if this is a streaming response (SSE)
@@ -2237,7 +2630,7 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 				var textParts []string
 				for _, evt := range events {
 					if evt.Type == "content_block_delta" {
-						if delta, ok := evt.Data["delta"].(map[string]interface{}); ok {
+						if delta, ok := evt.Data["delta"].(map[string]any); ok {
 							if text, ok := delta["text"].(string); ok {
 								textParts = append(textParts, text)
 							}
@@ -2294,16 +2687,14 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 			// Comparison Mode: send to both Anthropic and Kiro in parallel
 			// Copy headers before goroutine to avoid race condition (request may be reused)
 			headersCopy := make(http.Header)
-			for k, v := range r.Header {
-				headersCopy[k] = v
-			}
+			maps.Copy(headersCopy, r.Header)
 			// Capture IDs for correlation
 			compSessionID := sessionID
 			compRequestID := reqResult.RequestID
 			// Anthropic request runs in background goroutine
 			go func(headers http.Header, sid, rid, ts string) {
 				lg.LogComparison(sid, rid, "Sending parallel request to Anthropic")
-				resp, err := forwardToAnthropicWithHeaders(headers, body, lg)
+				resp, err := forwardToAnthropicWithHeaders(headers, body)
 				if err != nil {
 					lg.LogComparison(sid, rid, fmt.Sprintf("Anthropic error: %v", err))
 					return
@@ -2356,8 +2747,8 @@ func buildServerMux(lg *logger.Logger, port string) *http.ServeMux {
 			// Format events as SSE text
 			var sseBuffer strings.Builder
 			for _, event := range capturedKiroEvents {
-				sseBuffer.WriteString(fmt.Sprintf("event: %s\n", event.Event))
-				sseBuffer.WriteString(fmt.Sprintf("data: %s\n\n", event.Data))
+				fmt.Fprintf(&sseBuffer, "event: %s\n", event.Event)
+				fmt.Fprintf(&sseBuffer, "data: %s\n\n", event.Data)
 			}
 
 			if cfg.Advanced.DebugMode {
@@ -2412,7 +2803,7 @@ var (
 
 // startServerWithLogger starts the HTTP server with logging (used by TUI mode).
 func startServerWithLogger(port string, lg *logger.Logger) {
-	mux := buildServerMux(lg, port)
+	mux := buildServerMux(lg)
 
 	// Write proxy port file so `claude2kiro remote` can find us
 	writeProxyPortFile(port)
@@ -2515,7 +2906,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	var resp *http.Response
 	var lastErr error
 
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range 3 {
 		if attempt > 0 {
 			// Recreate request for retry (body was consumed)
 			proxyReq, err = http.NewRequest(
@@ -2594,6 +2985,10 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 	// Use CodeWhisperer parser
 	events := parser.ParseEvents(respBody)
+
+	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit)
+	// so Claude Code recognizes its tools.
+	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
 	var responseText strings.Builder
 
 	// Debug: Log if no events parsed
@@ -3111,7 +3506,7 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "0.11.28" // Kiro IDE version to impersonate
+	kiroVersion      = "0.11.107" // Kiro IDE version to impersonate
 )
 
 // generatePKCE generates PKCE code verifier and challenge
@@ -3326,7 +3721,7 @@ var idcScopes = []string{
 
 // getClientIdHash generates a hash for the client ID based on start URL
 func getClientIdHash(startUrl string) string {
-	hash := sha256.Sum256([]byte(fmt.Sprintf(`{"startUrl":"%s"}`, startUrl)))
+	hash := sha256.Sum256(fmt.Appendf(nil, `{"startUrl":"%s"}`, startUrl))
 	return fmt.Sprintf("%x", hash[:20]) // SHA1-like length
 }
 
@@ -4047,7 +4442,7 @@ func setClaude() {
 		os.Exit(1)
 	}
 
-	var jsonData map[string]interface{}
+	var jsonData map[string]any
 
 	err = jsonStr.Unmarshal(data, &jsonData)
 
@@ -4058,7 +4453,7 @@ func setClaude() {
 
 	jsonData["hasCompletedOnboarding"] = true
 	jsonData["claude2kiro"] = true
-	jsonData["oauthAccount"] = map[string]interface{}{
+	jsonData["oauthAccount"] = map[string]any{
 		"type":                "api_key",
 		"isMaxSubscription":   false,
 		"isApiKeyPrimaryAuth": true,
@@ -4110,6 +4505,17 @@ func getToken() (TokenData, error) {
 	var token TokenData
 	if err := jsonStr.Unmarshal(data, &token); err != nil {
 		return TokenData{}, fmt.Errorf("failed to parse token file: %v", err)
+	}
+
+	// Discover and persist the IdC/Enterprise profile ARN once. The Kiro backend
+	// associates requests with a CodeWhisperer profile; for IdC users it must be
+	// their own account-specific profile. We persist it so this runs only until
+	// the token file has it.
+	if token.AuthMethod == "IdC" && token.ProfileArn == "" {
+		if arn := discoverProfileArn(token.AccessToken); arn != "" {
+			token.ProfileArn = arn
+			_ = saveToken(&token) // best-effort
+		}
 	}
 
 	cachedToken = &token
@@ -4174,6 +4580,9 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	respBodyStr := string(cwRespBody)
 
 	events := parser.ParseEvents(cwRespBody)
+
+	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
+	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
 
 	textContent := ""
 	toolName := ""

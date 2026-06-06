@@ -216,7 +216,7 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 		return ClaudeConfigStatus{FileExists: false}
 	}
 
-	var config map[string]interface{}
+	var config map[string]any
 	if err := json.Unmarshal(data, &config); err != nil {
 		return ClaudeConfigStatus{FileExists: true}
 	}
@@ -231,7 +231,7 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 		status.Onboarded = true
 	}
 
-	if oauthAccount, ok := config["oauthAccount"].(map[string]interface{}); ok {
+	if oauthAccount, ok := config["oauthAccount"].(map[string]any); ok {
 		if authType, ok := oauthAccount["type"].(string); ok && authType == "api_key" {
 			status.ApiKeyAuth = true
 		}
@@ -816,17 +816,11 @@ func (m Model) View() string {
 	if statusBar != "" {
 		// Status on left, version on right
 		statusWidth := lipgloss.Width(statusBar)
-		padding := footerWidth - statusWidth - len("v"+Version)
-		if padding < 1 {
-			padding = 1
-		}
+		padding := max(footerWidth-statusWidth-len("v"+Version), 1)
 		footer = statusBar + strings.Repeat(" ", padding) + versionText
 	} else {
 		// Just version on right
-		padding := footerWidth - len("v"+Version)
-		if padding < 0 {
-			padding = 0
-		}
+		padding := max(footerWidth-len("v"+Version), 0)
 		footer = strings.Repeat(" ", padding) + versionText
 	}
 

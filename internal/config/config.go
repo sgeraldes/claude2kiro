@@ -73,6 +73,7 @@ type NetworkConfig struct {
 type AdvancedConfig struct {
 	CodeWhispererEndpoint string `yaml:"codewhisperer_endpoint"`
 	CreditsEndpoint       string `yaml:"credits_endpoint"`
+	ProfilesEndpoint      string `yaml:"profiles_endpoint"` // ListAvailableProfiles (IdC profileArn discovery)
 	KiroAuthEndpoint      string `yaml:"kiro_auth_endpoint"`
 	KiroRefreshEndpoint   string `yaml:"kiro_refresh_endpoint"`
 	KiroUsageURL          string `yaml:"kiro_usage_url"`
@@ -144,6 +145,7 @@ func Default() *Config {
 		Advanced: AdvancedConfig{
 			CodeWhispererEndpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
 			CreditsEndpoint:       "https://q.us-east-1.amazonaws.com/getUsageLimits",
+			ProfilesEndpoint:      "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles",
 			KiroAuthEndpoint:      "https://prod.us-east-1.auth.desktop.kiro.dev",
 			KiroRefreshEndpoint:   "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
 			KiroUsageURL:          "https://kiro.dev/usage",

@@ -57,7 +57,7 @@ func TestPing(t *testing.T) {
 
 func TestContentBlockStart_Text(t *testing.T) {
 	builder := NewEventBuilder()
-	err := builder.ContentBlockStart(0, "text", map[string]interface{}{"text": ""})
+	err := builder.ContentBlockStart(0, "text", map[string]any{"text": ""})
 	if err != nil {
 		t.Fatalf("ContentBlockStart failed: %v", err)
 	}
@@ -76,10 +76,10 @@ func TestContentBlockStart_Text(t *testing.T) {
 
 func TestContentBlockStart_ToolUse(t *testing.T) {
 	builder := NewEventBuilder()
-	err := builder.ContentBlockStart(1, "tool_use", map[string]interface{}{
+	err := builder.ContentBlockStart(1, "tool_use", map[string]any{
 		"id":    "tool_abc",
 		"name":  "read_file",
-		"input": map[string]interface{}{},
+		"input": map[string]any{},
 	})
 	if err != nil {
 		t.Fatalf("ContentBlockStart failed: %v", err)
@@ -204,7 +204,7 @@ func TestMessageStop(t *testing.T) {
 
 func TestContentBlockSequence(t *testing.T) {
 	builder := NewEventBuilder()
-	builder.ContentBlockStart(0, "text", map[string]interface{}{"text": ""})
+	builder.ContentBlockStart(0, "text", map[string]any{"text": ""})
 	builder.TextDelta(0, "Hello")
 	builder.ContentBlockStop(0)
 
@@ -220,7 +220,7 @@ func TestCompleteTextResponse(t *testing.T) {
 	builder := NewEventBuilder()
 	builder.MessageStart("msg_test", "claude-sonnet-4", 100, 1)
 	builder.Ping()
-	builder.ContentBlockStart(0, "text", map[string]interface{}{"text": ""})
+	builder.ContentBlockStart(0, "text", map[string]any{"text": ""})
 	builder.TextDelta(0, "Hello, world!")
 	builder.ContentBlockStop(0)
 	builder.MessageDelta("end_turn", "", map[string]int{"output_tokens": 3})
@@ -263,10 +263,10 @@ func TestCompleteToolUseResponse(t *testing.T) {
 	builder := NewEventBuilder()
 	builder.MessageStart("msg_test", "claude-sonnet-4", 100, 1)
 	builder.Ping()
-	builder.ContentBlockStart(0, "tool_use", map[string]interface{}{
+	builder.ContentBlockStart(0, "tool_use", map[string]any{
 		"id":    "tool_123",
 		"name":  "read_file",
-		"input": map[string]interface{}{},
+		"input": map[string]any{},
 	})
 	builder.ToolInputDelta(0, `{"path":"/test.txt"}`)
 	builder.ContentBlockStop(0)
@@ -335,10 +335,10 @@ func TestWriteRawEvent(t *testing.T) {
 	builder := NewEventBuilder()
 
 	// Test with a map[string]interface{} data structure (like from parser)
-	data := map[string]interface{}{
+	data := map[string]any{
 		"type":  "content_block_delta",
 		"index": 0,
-		"delta": map[string]interface{}{
+		"delta": map[string]any{
 			"type": "text_delta",
 			"text": "Hello",
 		},
@@ -362,7 +362,7 @@ func TestJSONValidity(t *testing.T) {
 	builder := NewEventBuilder()
 	builder.MessageStart("msg_test", "claude-sonnet-4", 100, 1)
 	builder.Ping()
-	builder.ContentBlockStart(0, "text", map[string]interface{}{"text": ""})
+	builder.ContentBlockStart(0, "text", map[string]any{"text": ""})
 	builder.TextDelta(0, "Hello, world!")
 	builder.ContentBlockStop(0)
 	builder.MessageDelta("end_turn", "", map[string]int{"output_tokens": 3})
@@ -373,9 +373,9 @@ func TestJSONValidity(t *testing.T) {
 	// Extract and validate each JSON data line
 	lines := strings.Split(output, "\n")
 	for _, line := range lines {
-		if strings.HasPrefix(line, "data: ") {
-			jsonStr := strings.TrimPrefix(line, "data: ")
-			var parsed interface{}
+		if after, ok := strings.CutPrefix(line, "data: "); ok {
+			jsonStr := after
+			var parsed any
 			if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
 				t.Errorf("Invalid JSON in SSE data: %s\nError: %v", jsonStr, err)
 			}

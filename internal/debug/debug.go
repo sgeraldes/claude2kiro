@@ -94,7 +94,7 @@ func CleanOldDebugFiles(maxAge time.Duration) error {
 }
 
 // ScrubSensitiveData removes sensitive fields from a map before writing
-func ScrubSensitiveData(data map[string]interface{}) {
+func ScrubSensitiveData(data map[string]any) {
 	// Sensitive keys to redact (case-insensitive check)
 	sensitiveKeys := []string{
 		"authorization",
@@ -122,14 +122,14 @@ func ScrubSensitiveData(data map[string]interface{}) {
 		}
 
 		// Recursively scrub nested objects
-		if nested, ok := value.(map[string]interface{}); ok {
+		if nested, ok := value.(map[string]any); ok {
 			ScrubSensitiveData(nested)
 		}
 
 		// Handle arrays of objects
-		if nestedArray, ok := value.([]interface{}); ok {
+		if nestedArray, ok := value.([]any); ok {
 			for _, item := range nestedArray {
-				if nestedMap, ok := item.(map[string]interface{}); ok {
+				if nestedMap, ok := item.(map[string]any); ok {
 					ScrubSensitiveData(nestedMap)
 				}
 			}
@@ -139,7 +139,7 @@ func ScrubSensitiveData(data map[string]interface{}) {
 
 // WriteDebugFileWithScrub writes data to debug directory after scrubbing sensitive fields
 func WriteDebugFileWithScrub(prefix string, rawData []byte) (string, error) {
-	var data map[string]interface{}
+	var data map[string]any
 	if err := json.Unmarshal(rawData, &data); err != nil {
 		// If not valid JSON, write as-is
 		return WriteDebugFile(prefix, rawData)

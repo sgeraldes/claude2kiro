@@ -736,10 +736,7 @@ func (m *Model) updateLayout() {
 
 	// Log viewer gets remaining space
 	// Total: m.height - sessionHeight - filterBarHeight - helpHeight - 2 (margins)
-	logHeight := m.height - sessionHeight - filterBarHeight - helpHeight - 2
-	if logHeight < 5 {
-		logHeight = 5
-	}
+	logHeight := max(m.height-sessionHeight-filterBarHeight-helpHeight-2, 5)
 	m.logViewer.SetSize(contentWidth, logHeight)
 }
 
@@ -1002,10 +999,7 @@ func (m Model) renderSessionStatsPanel(availableWidth int) string {
 	headerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Bold(true)
 
 	// Content width for text (width - border(2) - padding(2))
-	contentWidth := availableWidth - 4
-	if contentWidth < 20 {
-		contentWidth = 20
-	}
+	contentWidth := max(availableWidth-4, 20)
 
 	var lines []string
 
@@ -1068,7 +1062,6 @@ func (m Model) renderSessionStatsPanel(availableWidth int) string {
 	return boxStyle.Render(strings.Join(lines, "\n"))
 }
 
-
 // GetLogger returns the logger instance
 func (m Model) GetLogger() *logger.Logger {
 	return m.logger
@@ -1129,7 +1122,7 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 		return ClaudeConfigStatus{FileExists: false}
 	}
 
-	var config map[string]interface{}
+	var config map[string]any
 	if err := json.Unmarshal(data, &config); err != nil {
 		return ClaudeConfigStatus{FileExists: true}
 	}
@@ -1140,7 +1133,7 @@ func getClaudeConfigStatus() ClaudeConfigStatus {
 		status.Claude2KiroSet = true
 	}
 
-	if oauthAccount, ok := config["oauthAccount"].(map[string]interface{}); ok {
+	if oauthAccount, ok := config["oauthAccount"].(map[string]any); ok {
 		if authType, ok := oauthAccount["type"].(string); ok && authType == "api_key" {
 			status.ApiKeyAuth = true
 		}

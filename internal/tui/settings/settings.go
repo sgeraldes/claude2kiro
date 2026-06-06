@@ -1027,10 +1027,7 @@ func (m Model) handleEditing(msg tea.Msg) (Model, tea.Cmd) {
 			// For numbers: decrement by 1
 			if s.Type == TypeNumber {
 				if v, err := strconv.Atoi(m.textInput.Value()); err == nil {
-					newVal := v - 1
-					if newVal < s.Min {
-						newVal = s.Min
-					}
+					newVal := max(v-1, s.Min)
 					m.textInput.SetValue(fmt.Sprintf("%d", newVal))
 					m.textInput.CursorEnd()
 				}
