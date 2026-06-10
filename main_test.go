@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/sgeraldes/claude2kiro/internal/models"
+	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/parser"
 )
 
@@ -216,3 +220,84 @@ var errStub = stubErr("stub fetch failure")
 type stubErr string
 
 func (e stubErr) Error() string { return string(e) }
+
+func TestIsInvalidBearerToken(t *testing.T) {
+	invalid := []string{
+		`{"message":"The bearer token included in the request is invalid.","reason":null}`,
+		`{"message":"Token expired"}`,
+		`{"error":"invalid_token"}`,
+	}
+	for _, b := range invalid {
+		if !isInvalidBearerToken([]byte(b)) {
+			t.Errorf("isInvalidBearerToken(%s) = false, want true", b)
+		}
+	}
+	// 403s that are NOT auth failures (e.g. model not available for the
+	// account) must not trigger the token-refresh path, or the user gets an
+	// endless "Token refreshed, please retry" loop.
+	denied := []string{
+		`{"message":"User is not authorized to access this resource","__type":"AccessDeniedException"}`,
+		`{"message":"You do not have access to the requested model"}`,
+		``,
+	}
+	for _, b := range denied {
+		if isInvalidBearerToken([]byte(b)) {
+			t.Errorf("isInvalidBearerToken(%s) = true, want false", b)
+		}
+	}
+}
+
+// TestResolveModelInfo encodes the per-account availability scenario: Kiro
+// exposes different model lists per account/plan, so a model in the static map
+// but absent from this account's live catalog must be flagged, and family
+// resolution must cap at the account's highest available version.
+func TestResolveModelInfo(t *testing.T) {
+	// Account that has Opus 4.8 (previews enabled).
+	withStubCatalog(t, stubList())
+	info := resolveModelInfo("claude-opus-4-8")
+	if info.KiroModel != "claude-opus-4.8" || !info.InCatalog {
+		t.Errorf("full catalog: got %+v, want kiro_model=claude-opus-4.8 in catalog", info)
+	}
+
+	// Account whose catalog tops out at Opus 4.6 and has no GLM.
+	withStubCatalog(t, []models.KiroModel{
+		mk("auto"), mk("claude-opus-4.6"), mk("claude-sonnet-4.6"), mk("claude-haiku-4.5"),
+	})
+	info = resolveModelInfo("claude-opus-4-8")
+	if info.KiroModel != "claude-opus-4.8" || info.InCatalog || info.Note == "" {
+		t.Errorf("limited catalog: got %+v, want static-mapped claude-opus-4.8 flagged as not in catalog", info)
+	}
+	info = resolveModelInfo("glm-5")
+	if info.KiroModel != "glm-5" || info.InCatalog {
+		t.Errorf("limited catalog: got %+v, want glm-5 flagged as not in catalog", info)
+	}
+	// A generic/unknown opus id resolves within the account's own catalog,
+	// which is why such an account always lands on Opus 4.6.
+	if got := getKiroModelID("claude-opus-4-9"); got != "claude-opus-4.6" {
+		t.Errorf("family resolution on limited catalog = %q, want claude-opus-4.6", got)
+	}
+}
+
+func TestResolveEndpoint(t *testing.T) {
+	withStubCatalog(t, stubList())
+	mux := buildServerMux(logger.NewLogger(10))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/resolve?model=glm-5", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /resolve status = %d, want 200", rec.Code)
+	}
+	var info modelResolveInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &info); err != nil {
+		t.Fatalf("response is not JSON: %v (body: %s)", err, rec.Body.String())
+	}
+	if info.KiroModel != "glm-5" || !info.InCatalog {
+		t.Errorf("got %+v, want kiro_model=glm-5 in catalog", info)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/resolve", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("GET /resolve without model status = %d, want 400", rec.Code)
+	}
+}

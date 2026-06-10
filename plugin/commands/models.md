@@ -63,6 +63,30 @@ cannot add entries to it. A model missing from that dialog is still fully
 usable by passing its id explicitly: `/model <id>` always reaches the
 proxy, which maps it to a valid Kiro model (see resolution order below).
 
+## Checking the current model
+
+To answer "which model am I actually on?", do not guess from conversation
+context:
+
+1. Your own system prompt states the exact model id Claude Code sends (the
+   "exact model ID is …" line); the statusline shows it too.
+2. Map it to the Kiro model that actually serves it:
+   `curl -s "$ANTHROPIC_BASE_URL/resolve?model=<that-id>"`
+   (outside a session: `claude2kiro resolve <that-id>`).
+   The JSON answers: `kiro_model` (what serves the request) and
+   `in_live_catalog` (whether THIS account can use it).
+
+## Availability vs. actually working
+
+The table above is this account's live list — Kiro exposes different models
+per account/plan, so another user's table may differ. `in_live_catalog: false`
+from /resolve means Kiro will likely reject the model for this account.
+To prove a model responds end-to-end (uses a fraction of a credit):
+
+```bash
+claude2kiro test "Reply with OK" <kiro-model-id>
+```
+
 ## Model Resolution Order
 
 When Claude Code sends a model ID, the proxy resolves it as follows:

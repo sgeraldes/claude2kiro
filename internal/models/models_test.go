@@ -204,6 +204,9 @@ func TestRenderMarkdown(t *testing.T) {
 		"| claude-opus-4.8 |",
 		"## Switching the active model",
 		"/model <id>",
+		"## Checking the current model",
+		"/resolve?model=",
+		"## Availability vs. actually working",
 		"200,000", // thousands-grouped token limit
 	} {
 		if !strings.Contains(out, want) {
