@@ -198,9 +198,12 @@ func TestRenderMarkdown(t *testing.T) {
 		t.Error("RenderMarkdown should be deterministic")
 	}
 	for _, want := range []string{
-		"description: Show Kiro model mappings",
+		"description: Show available Kiro models",
+		"allowed-tools",
 		"AUTO-GENERATED",
 		"| claude-opus-4.8 |",
+		"## Switching the active model",
+		"/model <id>",
 		"200,000", // thousands-grouped token limit
 	} {
 		if !strings.Contains(out, want) {

@@ -656,6 +656,19 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 // printModels fetches the live model list from Kiro and prints it. This is the
 // user-facing view of the dynamic model catalog.
 func printModels() {
+	// Refresh an expired (or about-to-expire) token first, same as `run` does,
+	// so the command works without a running proxy session.
+	if token, err := getToken(); err == nil && token.ExpiresAt != "" {
+		if expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt); err == nil {
+			if time.Until(expiresAt) < 5*time.Minute {
+				if err := tryRefreshToken(); err != nil {
+					fmt.Fprintf(os.Stderr, "Token refresh failed: %v\nRun 'claude2kiro login' to re-authenticate.\n", err)
+					os.Exit(1)
+				}
+			}
+		}
+	}
+
 	list, err := fetchKiroModels()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching models: %v\n", err)

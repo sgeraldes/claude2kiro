@@ -77,6 +77,30 @@ It also installs the local **kiro-proxy** plugin so you can use these slash comm
 - `/kiro-proxy:models`
 - `/kiro-proxy:config`
 
+### Choosing a model
+
+Claude Code's `/model` dialog only lists the models built into your Claude Code
+binary — it does not query the proxy. On an older Claude Code build the newest
+models are simply missing from that dialog (Homebrew in particular lags behind;
+prefer the native installer from <https://claude.ai/install.sh> and keep Claude
+Code updated).
+
+Every model Kiro exposes works regardless of what the dialog shows:
+
+- **in-session**: type `/model claude-opus-4-8` (any id from `/kiro-proxy:models`,
+  Anthropic-style `claude-opus-4-8` or Kiro-style `claude-opus-4.8`)
+- **at launch**: `claude2kiro run --model claude-opus-4-8`
+- **via env**: `ANTHROPIC_MODEL=claude-opus-4-8 claude2kiro run`
+- **as default**: set `"model": "claude-opus-4-8"` in `~/.claude/settings.json`
+
+Run `claude2kiro models` (CLI) or `/kiro-proxy:models` (inside Claude Code) to
+see the live list with credit multipliers.
+
+Being logged in or out of claude.ai does **not** change how a `claude2kiro run`
+session is billed: with the proxy environment set, every request goes through
+the proxy and is served by Kiro. Login state only changes which entries Claude
+Code shows in its `/model` dialog.
+
 ### `claude2kiro update`
 
 Downloads the latest release and switches the launcher to the new version.
