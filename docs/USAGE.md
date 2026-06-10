@@ -96,10 +96,16 @@ Every model Kiro exposes works regardless of what the dialog shows:
 Run `claude2kiro models` (CLI) or `/kiro-proxy:models` (inside Claude Code) to
 see the live list with credit multipliers.
 
-Being logged in or out of claude.ai does **not** change how a `claude2kiro run`
-session is billed: with the proxy environment set, every request goes through
-the proxy and is served by Kiro. Login state only changes which entries Claude
-Code shows in its `/model` dialog.
+Being logged into claude.ai when you **launch** `claude2kiro run` is fine: with
+the proxy environment set, requests go through the proxy and are served by
+Kiro. Login state at launch only changes which entries the `/model` dialog
+shows.
+
+What you must **not** do is run `/login` (or log out and back in) *inside* a
+claude2kiro session. Choosing "Claude account with subscription" there switches
+the session out of API mode — from that point requests go directly to Anthropic
+on your subscription, bypassing Kiro entirely. If that happens, exit Claude
+Code and relaunch with `claude2kiro run` to get back on Kiro billing.
 
 ### `claude2kiro update`
 
