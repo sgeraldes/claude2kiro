@@ -1079,9 +1079,9 @@ func kiroProfileFilePaths() []string {
 	}
 	rel := filepath.Join("Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json")
 	return []string{
-		filepath.Join(home, "AppData", "Roaming", rel),                  // Windows
-		filepath.Join(home, "Library", "Application Support", rel),       // macOS
-		filepath.Join(home, ".config", rel),                             // Linux
+		filepath.Join(home, "AppData", "Roaming", rel),             // Windows
+		filepath.Join(home, "Library", "Application Support", rel), // macOS
+		filepath.Join(home, ".config", rel),                        // Linux
 	}
 }
 

@@ -167,7 +167,7 @@ func TestArnAccount(t *testing.T) {
 	cases := map[string]string{
 		"arn:aws:codewhisperer:us-east-1:908475551805:profile/P9VYA4W3X47Y": "908475551805",
 		"arn:aws:sso::908475551805:application/ssoins-x/apl-y":              "908475551805",
-		"not-an-arn":                                                        "",
+		"not-an-arn": "",
 	}
 	for in, want := range cases {
 		if got := arnAccount(in); got != want {
