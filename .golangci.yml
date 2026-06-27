@@ -1,0 +1,24 @@
+# golangci-lint v2 configuration.
+#
+# Scope is deliberately conservative: high-signal correctness linters only.
+# We do NOT enable errcheck (the codebase intentionally ignores many
+# best-effort os.WriteFile/JSON errors) or the staticcheck ST*/QF* style
+# families (stylistic suggestions, not bugs). gofmt and go vet run separately
+# in CI. This keeps the gate meaningful — it catches dead code, ineffective
+# assignments, and real staticcheck bugs (e.g. SA4005) without drowning in
+# style noise.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - ineffassign
+    - unused
+    - staticcheck
+  settings:
+    staticcheck:
+      # SA = bug-prone constructs, S1 = code simplifications. Exclude ST
+      # (style) and QF (quickfix suggestions).
+      checks:
+        - "SA*"
+        - "S1*"

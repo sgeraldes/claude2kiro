@@ -1489,9 +1489,7 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 						// Use glamour for markdown content in responses
 						if isMarkdownContent(text) {
 							rendered := renderMarkdown(text, maxWidth-2)
-							for _, line := range strings.Split(rendered, "\n") {
-								lines = append(lines, line)
-							}
+							lines = append(lines, strings.Split(rendered, "\n")...)
 						} else {
 							wrapped := wrapTextSimple(text, maxWidth)
 							for _, line := range strings.Split(wrapped, "\n") {
@@ -1552,14 +1550,6 @@ func formatResponseContent(content string, maxWidth int, expand bool) []string {
 	}
 
 	return lines
-}
-
-// truncateText truncates text to maxChars and wraps to width
-func truncateText(text string, maxChars int, width int) string {
-	if len(text) > maxChars {
-		text = text[:maxChars-3] + "..."
-	}
-	return wrapTextSimple(text, width)
 }
 
 // base64Pattern matches base64 data blocks (images, documents, etc.)
@@ -2466,43 +2456,6 @@ func (m *LogViewerModel) Clear() {
 	m.sessionSeqMap = make(map[string]map[string]int)
 	m.sessionSeqCounter = make(map[string]int)
 	m.updateDetailContent()
-}
-
-// assignPerSessionSeqNum assigns a per-session sequence number to an entry.
-// Note: Only call this from the Bubble Tea update loop.
-func (m *LogViewerModel) assignPerSessionSeqNum(idx int) {
-	if idx < 0 || idx >= len(m.allEntries) {
-		return
-	}
-	entry := &m.allEntries[idx]
-	sessionID := entry.SessionID
-	requestID := entry.RequestID
-
-	// Initialize maps if needed
-	if m.sessionSeqMap == nil {
-		m.sessionSeqMap = make(map[string]map[string]int)
-	}
-	if m.sessionSeqCounter == nil {
-		m.sessionSeqCounter = make(map[string]int)
-	}
-
-	if requestID == "" {
-		return // Skip entries without RequestID
-	}
-
-	if _, exists := m.sessionSeqMap[sessionID]; !exists {
-		m.sessionSeqMap[sessionID] = make(map[string]int)
-	}
-
-	if _, assigned := m.sessionSeqMap[sessionID][requestID]; !assigned {
-		counter := m.sessionSeqCounter[sessionID]
-		counter++
-		m.sessionSeqCounter[sessionID] = counter
-		m.sessionSeqMap[sessionID][requestID] = counter
-		entry.SeqNum = counter
-	} else {
-		entry.SeqNum = m.sessionSeqMap[sessionID][requestID]
-	}
 }
 
 // reassignPerSessionSeqNums rebuilds all per-session sequence numbers.

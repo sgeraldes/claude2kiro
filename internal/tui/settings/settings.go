@@ -1077,7 +1077,6 @@ func (m Model) View() string {
 		mainWidth = m.width - 8
 		helpWidth = mainWidth
 		helpHeight = (m.height - 6) / 2
-		mainHeight = m.height - 6 - helpHeight - 1
 	}
 
 	// Main container style

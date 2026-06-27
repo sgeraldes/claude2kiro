@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
@@ -273,9 +272,7 @@ func (i MenuItem) FilterValue() string { return i.title }
 
 // ItemDelegate handles rendering of menu items
 type ItemDelegate struct {
-	styles        ItemStyles
-	shortHelpFunc func() []key.Binding
-	fullHelpFunc  func() [][]key.Binding
+	styles ItemStyles
 }
 
 type ItemStyles struct {
