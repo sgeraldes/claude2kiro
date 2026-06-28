@@ -502,10 +502,17 @@ func trimRate(r float64) string {
 // apiModel is one entry in the Anthropic Models API response shape
 // (GET /v1/models). Claude Desktop's gateway model discovery hits this endpoint
 // at launch and auto-populates its model picker from it.
+//
+// MaxInputTokens/MaxTokens were added to the Anthropic Models API in Mar 2026
+// and are how Claude Desktop learns a model's context window — without them it
+// falls back to a 200K default even for a 1M-context model. They're emitted with
+// omitempty so a 0 (unknown) limit is left off rather than forced to a wrong value.
 type apiModel struct {
-	Type        string `json:"type"`
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
+	Type           string `json:"type"`
+	ID             string `json:"id"`
+	DisplayName    string `json:"display_name"`
+	MaxInputTokens int    `json:"max_input_tokens,omitempty"`
+	MaxTokens      int    `json:"max_tokens,omitempty"`
 }
 
 // apiModelList is the Anthropic Models API list envelope.
@@ -535,9 +542,11 @@ func RenderModelsAPI(list []KiroModel) string {
 			name += " (preview)"
 		}
 		out.Data = append(out.Data, apiModel{
-			Type:        "model",
-			ID:          m.ModelID,
-			DisplayName: name,
+			Type:           "model",
+			ID:             m.ModelID,
+			DisplayName:    name,
+			MaxInputTokens: m.TokenLimits.MaxInputTokens,
+			MaxTokens:      m.TokenLimits.MaxOutputTokens,
 		})
 	}
 	if len(out.Data) > 0 {

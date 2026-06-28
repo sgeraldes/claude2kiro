@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<!--
+  Claude2Kiro live dashboard. Served by the proxy at /dashboard.
+  Polls /credits and /v1/models on a timer so the view is real-time — this is
+  the real-time credit surface that Claude Desktop's own UI does not provide
+  (its banner is read-once for external writers; "Plan Usage" is Anthropic-only).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude2Kiro</title>
+  <style>
+    :root {
+      --bg: #0f1115; --card: #181b22; --line: #262b34;
+      --txt: #e6e8ec; --dim: #9aa3b2; --accent: #7c9cff;
+      --good: #4caf50; --warn: #ffb454; --bad: #ff5c5c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--txt);
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      padding: 24px; max-width: 760px; margin-inline: auto;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+    .sub { color: var(--dim); font-size: 12px; margin-bottom: 20px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+    .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .big { font-size: 34px; font-weight: 700; letter-spacing: -0.5px; }
+    .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .bar { height: 10px; background: var(--line); border-radius: 6px; overflow: hidden; margin: 14px 0 6px; }
+    .bar > div { height: 100%; background: var(--accent); transition: width .4s ease; }
+    .meta { display: flex; gap: 24px; color: var(--dim); font-size: 12px; flex-wrap: wrap; }
+    .meta b { color: var(--txt); font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+    th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--line); color: var(--dim); }
+    .err { color: var(--bad); }
+    .foot { color: var(--dim); font-size: 11px; margin-top: 18px; text-align: center; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--good); margin-right: 6px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <h1>Claude2Kiro</h1>
+  <div class="sub"><span class="dot" id="dot"></span><span id="status">connecting…</span></div>
+
+  <div class="card">
+    <div class="row">
+      <span class="label">Credits remaining</span>
+      <span class="pill" id="plan">—</span>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <span class="big" id="remaining">—</span>
+      <span class="label" id="oflimit"></span>
+    </div>
+    <div class="bar"><div id="barfill" style="width:0%"></div></div>
+    <div class="meta">
+      <span>Used <b id="used">—</b></span>
+      <span>Resets in <b id="reset">—</b></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:10px">Available models</div>
+    <table>
+      <thead><tr><th>Model</th><th class="num">Context</th><th class="num">Max out</th></tr></thead>
+      <tbody id="models"><tr><td colspan="3" class="num">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="foot">Auto-refreshes every <span id="iv">10</span>s · <span id="ts">—</span></div>
+
+  <script>
+    var REFRESH_MS = 10000;
+    document.getElementById('iv').textContent = REFRESH_MS / 1000;
+
+    function fmt(n) { return (n == null) ? '—' : Number(n).toLocaleString(); }
+    function fmtCtx(n) {
+      if (!n) return '—';
+      if (n >= 1000000) return (n / 1000000) + 'M';
+      if (n >= 1000) return Math.round(n / 1000) + 'K';
+      return String(n);
+    }
+
+    function setStatus(ok, msg) {
+      document.getElementById('dot').style.background = ok ? 'var(--good)' : 'var(--bad)';
+      document.getElementById('status').textContent = msg;
+      document.getElementById('status').className = ok ? '' : 'err';
+    }
+
+    async function loadCredits() {
+      try {
+        var r = await fetch('/credits', { cache: 'no-store' });
+        var d = await r.json();
+        if (d.error) { setStatus(false, 'credits error: ' + d.error); return; }
+        document.getElementById('remaining').textContent = fmt(d.remaining);
+        document.getElementById('oflimit').textContent = 'of ' + fmt(d.limit);
+        document.getElementById('used').textContent = fmt(d.used);
+        document.getElementById('plan').textContent = d.plan || '—';
+        document.getElementById('reset').textContent =
+          (d.days_until_reset === 1 ? '1 day' : d.days_until_reset + ' days');
+        var pct = d.limit > 0 ? Math.max(0, Math.min(100, (d.remaining / d.limit) * 100)) : 0;
+        var fill = document.getElementById('barfill');
+        fill.style.width = pct + '%';
+        fill.style.background = pct < 10 ? 'var(--bad)' : (pct < 25 ? 'var(--warn)' : 'var(--accent)');
+        setStatus(true, 'live');
+      } catch (e) {
+        setStatus(false, 'proxy unreachable — is claude2kiro running?');
+      }
+    }
+
+    async function loadModels() {
+      try {
+        var r = await fetch('/v1/models', { cache: 'no-store' });
+        var d = await r.json();
+        var rows = (d.data || []).map(function (m) {
+          return '<tr><td>' + (m.display_name || m.id) + '</td>' +
+                 '<td class="num">' + fmtCtx(m.max_input_tokens) + '</td>' +
+                 '<td class="num">' + fmtCtx(m.max_tokens) + '</td></tr>';
+        }).join('');
+        document.getElementById('models').innerHTML = rows ||
+          '<tr><td colspan="3" class="num">no models</td></tr>';
+      } catch (e) { /* leave previous content */ }
+    }
+
+    function tick() {
+      loadCredits();
+      loadModels();
+      document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+    }
+    tick();
+    setInterval(tick, REFRESH_MS);
+  </script>
+</body>
+</html>
