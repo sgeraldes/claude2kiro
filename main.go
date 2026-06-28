@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
@@ -25,6 +26,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 	"github.com/sgeraldes/claude2kiro/internal/sse"
@@ -1563,6 +1566,12 @@ func main() {
 	case "logout":
 		logout()
 	case "credits":
+		// `credits --web` opens the live auto-refreshing dashboard in a browser
+		// instead of printing a one-shot snapshot.
+		if len(os.Args) > 2 && (os.Args[2] == "--web" || os.Args[2] == "-w") {
+			openCreditsDashboard()
+			return
+		}
 		info := cmd.GetCreditsInfo()
 		if info.Error != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", info.Error)
@@ -1576,6 +1585,8 @@ func main() {
 		fmt.Printf("Used:      %.1f / %.0f (%.0f%%)\n", info.CreditsUsed, info.CreditsLimit, pct)
 		fmt.Printf("Remaining: %.1f\n", info.CreditsRemaining)
 		fmt.Printf("Resets in: %d days\n", info.DaysUntilReset)
+	case "desktop":
+		launchDesktop()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -2386,12 +2397,13 @@ func printUsage() {
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
 	fmt.Println("  claude2kiro export         - Export environment variables")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
+	fmt.Println("  claude2kiro desktop             - Ensure proxy is up + launch Claude Desktop (Windows)")
 	fmt.Println("  claude2kiro remote [args...]     - Connect to running proxy (start TUI first)")
 	fmt.Println("  claude2kiro update              - Self-update to latest GitHub release")
 	fmt.Println("  claude2kiro test [msg] [model]  - Send test request to Kiro backend (debug tool)")
 	fmt.Println("  claude2kiro claude              - Configure Claude Code settings (global)")
 	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
-	fmt.Println("  claude2kiro credits             - Show Kiro subscription credit usage")
+	fmt.Println("  claude2kiro credits [--web]     - Show Kiro credit usage (--web opens live dashboard)")
 	fmt.Println("  claude2kiro models              - List models available via Kiro (live)")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
@@ -2951,6 +2963,16 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			return
 		}
 		w.Write(data)
+	})
+
+	// Live web dashboard: an auto-refreshing page that polls /credits and
+	// /v1/models. This is the real-time credit view Claude Desktop's own UI
+	// doesn't provide (its banner is read-once for external writers, and the
+	// "Plan Usage" button is Anthropic-subscription telemetry, not gateway-fed).
+	// Open with `claude2kiro credits --web` or browse to http://localhost:<port>/dashboard.
+	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.Copy(w, strings.NewReader(webdash.HTML()))
 	})
 
 	// Add 404 handler
@@ -3722,6 +3744,156 @@ func openBrowser(url string) error {
 		cmd = exec.Command("xdg-open", url)
 	}
 	return cmd.Start()
+}
+
+// proxyBaseURL returns the local proxy base URL from configured port (default 8080).
+func proxyBaseURL() string {
+	port := config.Get().Server.Port
+	if port == "" {
+		port = "8080"
+	}
+	return "http://localhost:" + port
+}
+
+// proxyReachable reports whether a proxy is already answering /health at baseURL.
+func proxyReachable(baseURL string) bool {
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Get(baseURL + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// openCreditsDashboard opens the live web dashboard, telling the user to start
+// the proxy first if it isn't reachable. Triggered by `claude2kiro credits --web`.
+func openCreditsDashboard() {
+	base := proxyBaseURL()
+	url := base + "/dashboard"
+	if !proxyReachable(base) {
+		fmt.Fprintf(os.Stderr, "Proxy not reachable at %s.\nStart it first with `claude2kiro server` (or `claude2kiro desktop`), then re-run.\n", base)
+		fmt.Printf("Dashboard URL (once the proxy is up): %s\n", url)
+		os.Exit(1)
+	}
+	fmt.Printf("Opening live dashboard: %s\n", url)
+	if err := openBrowser(url); err != nil {
+		fmt.Fprintf(os.Stderr, "Could not open browser automatically: %v\nOpen this URL manually: %s\n", err, url)
+		os.Exit(1)
+	}
+}
+
+// claudeDesktopPIDs returns the PIDs of running Claude Desktop GUI processes
+// (the Store app's Claude.exe), excluding the embedded claude-code CLI under
+// Claude-3p so we never kill an active Code-tab session. Windows-only detail;
+// returns nil elsewhere.
+func claudeDesktopPIDs() []int {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	// CSV: "Name","PID",... — filter to the GUI exe by image path via WMIC-free
+	// tasklist, then exclude the claude-code CLI by its distinct path.
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		`Get-Process claude -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*claude-code*' } | Select-Object -ExpandProperty Id`).Output()
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Fields(string(out)) {
+		if n, err := strconv.Atoi(strings.TrimSpace(line)); err == nil {
+			pids = append(pids, n)
+		}
+	}
+	return pids
+}
+
+// launchDesktop ensures the proxy is up, optionally restarts Claude Desktop
+// (prompting first if it's already running, since Desktop reads the gateway
+// config only at launch), and launches the Store app. Triggered by
+// `claude2kiro desktop`.
+func launchDesktop() {
+	if runtime.GOOS != "windows" {
+		fmt.Fprintf(os.Stderr, "`desktop` currently supports Windows (Claude Desktop Store app) only.\n")
+		os.Exit(1)
+	}
+
+	// 1. Require a valid token (same gate as `run`).
+	if _, err := getToken(); err != nil {
+		fmt.Fprintf(os.Stderr, "No token found. Run 'claude2kiro login' first.\n")
+		os.Exit(1)
+	}
+
+	// 2. Ensure the proxy is reachable; Desktop's gateway config points at it.
+	base := proxyBaseURL()
+	if proxyReachable(base) {
+		fmt.Printf("Proxy already running at %s.\n", base)
+	} else {
+		fmt.Printf("Proxy not running — starting it in the background...\n")
+		exe, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Could not locate own binary: %v\n", err)
+			os.Exit(1)
+		}
+		srv := exec.Command(exe, "server")
+		srv.Stdout, srv.Stderr = nil, nil
+		if err := srv.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start proxy: %v\n", err)
+			os.Exit(1)
+		}
+		// Wait briefly for /health to come up.
+		ok := false
+		for range 20 {
+			if proxyReachable(base) {
+				ok = true
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Proxy did not become healthy at %s in time.\n", base)
+			os.Exit(1)
+		}
+		fmt.Printf("Proxy is up at %s (PID %d).\n", base, srv.Process.Pid)
+	}
+
+	// 3. If Claude Desktop is already running, prompt before killing it.
+	//    A restart is how Desktop picks up gateway/model/config changes.
+	if pids := claudeDesktopPIDs(); len(pids) > 0 {
+		fmt.Printf("Claude Desktop is already running (PID %s).\n", joinInts(pids))
+		fmt.Print("Restart it so config changes take effect? [y/N]: ")
+		reader := bufio.NewReader(os.Stdin)
+		ans, _ := reader.ReadString('\n')
+		ans = strings.ToLower(strings.TrimSpace(ans))
+		if ans == "y" || ans == "yes" {
+			for _, pid := range pids {
+				_ = exec.Command("powershell", "-NoProfile", "-Command",
+					fmt.Sprintf("Stop-Process -Id %d -Force", pid)).Run()
+			}
+			fmt.Println("Stopped existing Claude Desktop. Relaunching...")
+			time.Sleep(1 * time.Second)
+		} else {
+			fmt.Println("Leaving the running instance as-is. Nothing launched.")
+			return
+		}
+	}
+
+	// 4. Launch the Claude Desktop Store app via its AppUserModelId.
+	const appID = `Claude_pzs8sxrjxfjjc!Claude`
+	launch := exec.Command("explorer.exe", `shell:AppsFolder\`+appID)
+	if err := launch.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to launch Claude Desktop: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Launched Claude Desktop.")
+}
+
+// joinInts formats a slice of ints as a comma-separated string.
+func joinInts(ns []int) string {
+	parts := make([]string, len(ns))
+	for i, n := range ns {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // loginSocial performs browser-based OAuth login with GitHub or Google

@@ -248,6 +248,8 @@ func TestRenderModelsAPI(t *testing.T) {
 	opus.ModelID = "claude-opus-4.8"
 	opus.ModelName = "Claude Opus 4.8"
 	opus.Description = "experimental preview"
+	opus.TokenLimits.MaxInputTokens = 1000000
+	opus.TokenLimits.MaxOutputTokens = 128000
 	var sonnet KiroModel
 	sonnet.ModelID = "claude-sonnet-4.6"
 	sonnet.ModelName = "Claude Sonnet 4.6"
@@ -267,6 +269,19 @@ func TestRenderModelsAPI(t *testing.T) {
 	if parsed.Data[0].ID != "claude-opus-4.8" {
 		t.Errorf("Data[0].ID = %q, want the exact Kiro backend ID", parsed.Data[0].ID)
 	}
+	// Context window must be carried through so Claude Desktop shows the real
+	// 1M window instead of its 200K default.
+	if parsed.Data[0].MaxInputTokens != 1000000 {
+		t.Errorf("Data[0].MaxInputTokens = %d, want 1000000", parsed.Data[0].MaxInputTokens)
+	}
+	if parsed.Data[0].MaxTokens != 128000 {
+		t.Errorf("Data[0].MaxTokens = %d, want 128000", parsed.Data[0].MaxTokens)
+	}
+	// A model with no token limits omits the fields (omitempty) rather than
+	// asserting a wrong 0.
+	if parsed.Data[1].MaxInputTokens != 0 {
+		t.Errorf("Data[1].MaxInputTokens = %d, want 0 (omitted)", parsed.Data[1].MaxInputTokens)
+	}
 	// Preview models get a marker in the display name (not the id).
 	if !strings.Contains(parsed.Data[0].DisplayName, "preview") {
 		t.Errorf("Data[0].DisplayName = %q, want a preview marker", parsed.Data[0].DisplayName)
@@ -279,6 +294,12 @@ func TestRenderModelsAPI(t *testing.T) {
 	}
 	if parsed.LastID == nil || *parsed.LastID != "claude-sonnet-4.6" {
 		t.Errorf("LastID = %v, want claude-sonnet-4.6", parsed.LastID)
+	}
+
+	// The omitted field must genuinely be absent from the JSON, not serialized
+	// as max_input_tokens:0 (which Desktop would read as a 0-token window).
+	if strings.Count(out, "max_input_tokens") != 1 {
+		t.Errorf("expected max_input_tokens to appear exactly once (omitempty), got:\n%s", out)
 	}
 }
 
