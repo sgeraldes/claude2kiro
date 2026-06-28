@@ -191,8 +191,10 @@ func (m Model) Init() tea.Cmd {
 	// Auto-start server on app launch if configured and user has a token
 	cfg := config.Get()
 	if cfg.Server.AutoStart && m.commands.HasToken != nil && m.commands.HasToken() && m.commands.StartServer != nil {
-		m.autoStartAttempted = true
-		m.serverStarting = true
+		// NOTE: Init has a value receiver, so mutating m here is discarded by
+		// Bubble Tea. The auto-start guard flags (autoStartAttempted,
+		// serverStarting) are set on the WindowSizeMsg path in Update, which
+		// can persist model state. Setting them here was a silent no-op.
 		serverFunc := m.commands.StartServer(m.serverPort, m.logger)
 		return tea.Batch(initCmd, func() tea.Msg { return serverFunc() })
 	}

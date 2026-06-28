@@ -126,6 +126,13 @@ It also installs the local **kiro-proxy** plugin, which gives you slash commands
 - `/kiro-proxy:models`
 - `/kiro-proxy:config`
 
+> [!TIP]
+> Claude Code's `/model` dialog only lists the models built into your Claude Code
+> version — it does not know about Kiro. Any Kiro model works anyway: type
+> `/model <id>` (e.g. `/model claude-opus-4-8`), or launch with
+> `claude2kiro run --model <id>`. See `/kiro-proxy:models` for the live list,
+> or [Choosing a model](docs/USAGE.md#choosing-a-model).
+
 ### `claude2kiro remote`
 
 ```bash

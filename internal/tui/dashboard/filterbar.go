@@ -255,7 +255,7 @@ func (m FilterBarModel) View() string {
 	typeSection := strings.Join(checkboxes, " ")
 
 	// Search field with selection highlighting
-	searchPrefix := "/ "
+	var searchPrefix string
 	if m.focused && m.selectedElement == 4 && !m.searchFocused {
 		searchPrefix = selectedStyle.Render("/ ")
 	} else {

@@ -77,6 +77,63 @@ It also installs the local **kiro-proxy** plugin so you can use these slash comm
 - `/kiro-proxy:models`
 - `/kiro-proxy:config`
 
+### Choosing a model
+
+Claude Code's `/model` dialog only lists the models built into your Claude Code
+binary — it does not query the proxy. On an older Claude Code build the newest
+models are simply missing from that dialog (Homebrew in particular lags behind;
+prefer the native installer from <https://claude.ai/install.sh> and keep Claude
+Code updated).
+
+Every model Kiro exposes works regardless of what the dialog shows:
+
+- **in-session**: type `/model claude-opus-4-8` (any id from `/kiro-proxy:models`,
+  Anthropic-style `claude-opus-4-8` or Kiro-style `claude-opus-4.8`)
+- **at launch**: `claude2kiro run --model claude-opus-4-8`
+- **via env**: `ANTHROPIC_MODEL=claude-opus-4-8 claude2kiro run`
+- **as default**: set `"model": "claude-opus-4-8"` in `~/.claude/settings.json`
+
+Run `claude2kiro models` (CLI) or `/kiro-proxy:models` (inside Claude Code) to
+see the live list with credit multipliers.
+
+Being logged into claude.ai when you **launch** `claude2kiro run` is fine: with
+the proxy environment set, requests go through the proxy and are served by
+Kiro. Login state at launch only changes which entries the `/model` dialog
+shows.
+
+What you must **not** do is run `/login` (or log out and back in) *inside* a
+claude2kiro session. Choosing "Claude account with subscription" there switches
+the session out of API mode — from that point requests go directly to Anthropic
+on your subscription, bypassing Kiro entirely. If that happens, exit Claude
+Code and relaunch with `claude2kiro run` to get back on Kiro billing.
+
+#### No Claude account needed — but Kiro model lists are per-account
+
+claude2kiro does **not** require a Claude/Anthropic account or subscription:
+Claude Code runs in API mode against the local proxy. Without a claude.ai
+login the `/model` dialog just shows fewer entries — switching by id
+(`/model <id>`) works the same.
+
+Kiro, however, exposes models **per account and plan**: `claude2kiro models`
+(or `/kiro-proxy:models`) shows the list for *your* account, and a model
+missing from that list is rejected by Kiro even though the proxy forwards it.
+When the proxy has to resolve a generic model id (like a bare `opus` alias),
+it picks the highest version *your* account offers — which is why an account
+without preview models lands on Opus 4.6.
+
+Quick checks:
+
+- **Which model is the session on?** The statusline shows the id Claude Code
+  sends; `curl -s "$ANTHROPIC_BASE_URL/resolve?model=<id>"` (inside a session)
+  or `claude2kiro resolve <id>` shows the Kiro model that serves it and
+  whether your account has it (`in_live_catalog`).
+- **Does it actually respond?** `claude2kiro test "Reply with OK" <kiro-id>`
+  sends a real request (uses a fraction of a credit).
+
+If Claude Code's input freezes after `/model <id>` (Esc once or twice
+recovers), update Claude Code — Homebrew lags several versions behind; use
+the native installer from <https://claude.ai/install.sh>.
+
 ### `claude2kiro update`
 
 Downloads the latest release and switches the launcher to the new version.

@@ -95,10 +95,10 @@ func (m SessionModel) View() string {
 			expiryValue = fmt.Sprintf("%s (expiring soon!)", remaining.Round(time.Second))
 			expiryStyle = errorStyle
 		} else if remaining < 30*time.Minute {
-			expiryValue = fmt.Sprintf("%s", remaining.Round(time.Second))
+			expiryValue = remaining.Round(time.Second).String()
 			expiryStyle = warnStyle
 		} else {
-			expiryValue = fmt.Sprintf("%s", remaining.Round(time.Minute))
+			expiryValue = remaining.Round(time.Minute).String()
 			expiryStyle = goodStyle
 		}
 	}

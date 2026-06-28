@@ -26,76 +26,10 @@ func TestParseCodeWhispererEvents(t *testing.T) {
 	}
 }
 
-func TestMultiToolIndexing(t *testing.T) {
-	// Test that multiple tools get different indices
-	toolIndices := make(map[string]int)
-	nextToolIndex := 0
-
-	// Simulate first tool
-	toolId1 := "tool_1"
-	if _, exists := toolIndices[toolId1]; !exists {
-		toolIndices[toolId1] = nextToolIndex
-		nextToolIndex++
-	}
-
-	// Simulate second tool
-	toolId2 := "tool_2"
-	if _, exists := toolIndices[toolId2]; !exists {
-		toolIndices[toolId2] = nextToolIndex
-		nextToolIndex++
-	}
-
-	if toolIndices[toolId1] != 0 {
-		t.Errorf("Expected tool_1 to have index 0, got %d", toolIndices[toolId1])
-	}
-	if toolIndices[toolId2] != 1 {
-		t.Errorf("Expected tool_2 to have index 1, got %d", toolIndices[toolId2])
-	}
-}
-
-func TestTextThenToolIndexing(t *testing.T) {
-	// Test that when text content is present, tools start at index 1
-	toolIndices := make(map[string]int)
-	nextToolIndex := 0
-	hasTextContent := false
-
-	// Simulate text content arriving first
-	hasTextContent = true
-	if len(toolIndices) == 0 && nextToolIndex == 0 {
-		nextToolIndex = 1 // Bump to 1 so tools don't conflict with text at index 0
-	}
-
-	// Simulate first tool after text
-	toolId1 := "tool_1"
-	if _, exists := toolIndices[toolId1]; !exists {
-		toolIndices[toolId1] = nextToolIndex
-		nextToolIndex++
-	}
-
-	if !hasTextContent {
-		t.Error("Expected hasTextContent to be true")
-	}
-	if toolIndices[toolId1] != 1 {
-		t.Errorf("Expected tool_1 to have index 1 (after text at 0), got %d", toolIndices[toolId1])
-	}
-}
-
-func TestToolOnlyIndexing(t *testing.T) {
-	// Test that tool-only responses start at index 0
-	toolIndices := make(map[string]int)
-	nextToolIndex := 0
-
-	// No text content - tools should start at 0
-	toolId1 := "tool_1"
-	if _, exists := toolIndices[toolId1]; !exists {
-		toolIndices[toolId1] = nextToolIndex
-		nextToolIndex++
-	}
-
-	if toolIndices[toolId1] != 0 {
-		t.Errorf("Expected tool_1 to have index 0 for tool-only response, got %d", toolIndices[toolId1])
-	}
-}
+// NOTE: the multi-tool / text-then-tool / tool-only indexing cases are covered
+// for real by parse_events_test.go, which drives ParseEvents end-to-end. The
+// earlier inline tests here reimplemented the indexing logic in the test body
+// (testing a copy, not the code) and were removed.
 
 func TestTextOnlyResponseGetsEndTurn(t *testing.T) {
 	// Create a minimal binary frame with text content only

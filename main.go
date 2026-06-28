@@ -684,9 +684,86 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 	)
 }
 
+// refreshTokenIfStale refreshes the saved token when it is expired or expiring
+// within 5 minutes, mirroring what `claude2kiro run` does at startup. Returns
+// an error only when a refresh was needed and failed; a missing token is not
+// an error here (the caller's API call will report it with context).
+func refreshTokenIfStale() error {
+	token, err := getToken()
+	if err != nil || token.ExpiresAt == "" {
+		return nil
+	}
+	expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
+	if err != nil || time.Until(expiresAt) >= 5*time.Minute {
+		return nil
+	}
+	return tryRefreshToken()
+}
+
+// modelResolveInfo describes how an Anthropic-style model id routes to Kiro
+// and whether the resolved model exists in this account's live catalog.
+type modelResolveInfo struct {
+	Requested  string  `json:"requested"`
+	KiroModel  string  `json:"kiro_model"`
+	InCatalog  bool    `json:"in_live_catalog"`
+	Multiplier float64 `json:"credit_multiplier,omitempty"`
+	MaxInput   int     `json:"max_input_tokens,omitempty"`
+	MaxOutput  int     `json:"max_output_tokens,omitempty"`
+	Note       string  `json:"note,omitempty"`
+}
+
+// resolveModelInfo resolves a model id exactly like the request path does and
+// annotates it with this account's live-catalog data. Model availability is
+// per Kiro account/plan, so in_live_catalog=false means Kiro will likely
+// reject the model for this user even though the proxy forwards it.
+func resolveModelInfo(requested string) modelResolveInfo {
+	info := modelResolveInfo{Requested: requested, KiroModel: getKiroModelID(requested)}
+	for _, m := range modelCatalog.Models() {
+		if m.ModelID == info.KiroModel {
+			info.InCatalog = true
+			info.Multiplier = m.RateMultiplier
+			info.MaxInput = m.TokenLimits.MaxInputTokens
+			info.MaxOutput = m.TokenLimits.MaxOutputTokens
+			break
+		}
+	}
+	if !info.InCatalog {
+		info.Note = "resolved model is not in this account's live Kiro model list; Kiro may reject it (availability varies by account/plan)"
+	}
+	return info
+}
+
+// printResolve shows how a model id routes to Kiro and whether this account
+// can use it. Usage: claude2kiro resolve <model-id>
+func printResolve() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "Usage: claude2kiro resolve <model-id>")
+		os.Exit(1)
+	}
+	if err := refreshTokenIfStale(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: token refresh failed (%v); answering from the static map only.\n", err)
+	}
+	info := resolveModelInfo(os.Args[2])
+	fmt.Printf("%s -> %s\n", info.Requested, info.KiroModel)
+	if info.InCatalog {
+		fmt.Printf("available on this account: yes (%gx credits, %d in / %d out)\n",
+			info.Multiplier, info.MaxInput, info.MaxOutput)
+	} else {
+		fmt.Println("available on this account: NO — not in the live model list; Kiro will likely reject it")
+		fmt.Println("run 'claude2kiro models' to see the models this account can use")
+	}
+}
+
 // printModels fetches the live model list from Kiro and prints it. This is the
 // user-facing view of the dynamic model catalog.
 func printModels() {
+	// Refresh an expired (or about-to-expire) token first, same as `run` does,
+	// so the command works without a running proxy session.
+	if err := refreshTokenIfStale(); err != nil {
+		fmt.Fprintf(os.Stderr, "Token refresh failed: %v\nRun 'claude2kiro login' to re-authenticate.\n", err)
+		os.Exit(1)
+	}
+
 	list, err := fetchKiroModels()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching models: %v\n", err)
@@ -1033,9 +1110,9 @@ func kiroProfileFilePaths() []string {
 	}
 	rel := filepath.Join("Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json")
 	return []string{
-		filepath.Join(home, "AppData", "Roaming", rel),                  // Windows
-		filepath.Join(home, "Library", "Application Support", rel),       // macOS
-		filepath.Join(home, ".config", rel),                             // Linux
+		filepath.Join(home, "AppData", "Roaming", rel),             // Windows
+		filepath.Join(home, "Library", "Application Support", rel), // macOS
+		filepath.Join(home, ".config", rel),                        // Linux
 	}
 }
 
@@ -1479,6 +1556,8 @@ func main() {
 		testProxy()
 	case "models":
 		printModels()
+	case "resolve":
+		printResolve()
 	case "update":
 		selfUpdate()
 	case "logout":
@@ -2157,6 +2236,13 @@ func testProxy() {
 	fmt.Printf("=== claude2kiro test ===\n")
 	fmt.Printf("Message: %s\n", message)
 	fmt.Printf("Model:   %s -> %s\n", model, getKiroModelID(model))
+
+	// Refresh an expired (or about-to-expire) token first, same as `run` does,
+	// so a stale token doesn't masquerade as a backend failure.
+	if err := refreshTokenIfStale(); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Token refresh failed: %v\nRun 'claude2kiro login' to re-authenticate.\n", err)
+		os.Exit(1)
+	}
 
 	// Get token
 	token, err := getToken()
@@ -2846,6 +2932,27 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 		io.Copy(w, strings.NewReader("OK"))
 	})
 
+	// Resolve endpoint: shows how a model id routes to Kiro and whether the
+	// resolved model is in this account's live catalog. Used by the kiro-proxy
+	// plugin to answer "which model am I actually on, and can I use it?".
+	mux.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		model := r.URL.Query().Get("model")
+		if model == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			io.Copy(w, strings.NewReader(`{"error":"missing ?model=<id> query parameter"}`))
+			return
+		}
+		data, err := json.Marshal(resolveModelInfo(model))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.Copy(w, strings.NewReader(`{"error":"failed to serialize resolve info"}`))
+			return
+		}
+		w.Write(data)
+	})
+
 	// Add 404 handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		lg.LogInfo("Unknown endpoint accessed: " + r.URL.Path)
@@ -3011,7 +3118,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		}
 		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
 
-		if resp.StatusCode == 403 {
+		if resp.StatusCode == 403 && isInvalidBearerToken(body) {
 			if err := tryRefreshToken(); err != nil {
 				lg.LogError(fmt.Sprintf("Token refresh failed: %v", err))
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token expired, refresh failed: %v. Please re-login", err))
@@ -3019,6 +3126,13 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				lg.LogInfo("Token refreshed successfully")
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
 			}
+		} else if resp.StatusCode == 403 {
+			// 403 with a valid token is access denial — most commonly a model
+			// this Kiro account/plan does not expose. Send a non-retryable
+			// error so Claude Code surfaces it instead of retrying forever.
+			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
+				"Kiro rejected model %q (resolved to %q): %s — this usually means the model is not available on your Kiro account/plan. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
+				anthropicReq.Model, getKiroModelID(anthropicReq.Model), strings.TrimSpace(string(body))))
 		} else {
 			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: %s", string(body)))
 		}
@@ -4762,6 +4876,34 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 }
 
 // sendErrorEvent sends an error event
+// isInvalidBearerToken reports whether a CodeWhisperer 403 body indicates an
+// expired/invalid bearer token. Kiro also answers 403 (AccessDeniedException)
+// for models an account cannot use, so a 403 alone must not trigger the
+// token-refresh path — that misdiagnosis made unavailable models look like an
+// endless "Token refreshed, please retry" loop.
+func isInvalidBearerToken(body []byte) bool {
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "bearer token") ||
+		strings.Contains(s, "token is invalid") ||
+		strings.Contains(s, "token expired") ||
+		strings.Contains(s, "invalid_token")
+}
+
+// sendNonRetryableErrorEvent emits an Anthropic error event typed
+// invalid_request_error so the client shows it to the user. sendErrorEvent
+// uses overloaded_error, which the Anthropic SDK auto-retries — correct for
+// transient failures, wrong for permanent ones like an unavailable model.
+func sendNonRetryableErrorEvent(w http.ResponseWriter, flusher http.Flusher, message string) {
+	errorResp := map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"message": message,
+		},
+	}
+	sendSSEEvent(w, flusher, "error", errorResp, nil)
+}
+
 func sendErrorEvent(w http.ResponseWriter, flusher http.Flusher, message string, err error) {
 	// Include error details in the message
 	fullMessage := message
