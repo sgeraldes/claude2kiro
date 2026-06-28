@@ -2803,6 +2803,13 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Answer CORS preflight: Claude Desktop is an Electron/Chromium app and
+		// may preflight the cross-origin discovery fetch before the real GET.
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			io.Copy(w, strings.NewReader(`{"type":"error","error":{"type":"invalid_request_error","message":"Only GET is supported"}}`))
