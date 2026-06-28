@@ -3791,10 +3791,13 @@ func claudeDesktopPIDs() []int {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
-	// CSV: "Name","PID",... — filter to the GUI exe by image path via WMIC-free
-	// tasklist, then exclude the claude-code CLI by its distinct path.
+	// Match the Store GUI exe by its package path and explicitly exclude the
+	// embedded claude-code CLI. The `-like '*WindowsApps*Claude*'` requires a
+	// real path, so a null/inaccessible Path (which `-notlike` alone would let
+	// through, since $null -notlike '*x*' is $true) can never land in the kill
+	// list — we only ever target processes we've positively identified.
 	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		`Get-Process claude -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*claude-code*' } | Select-Object -ExpandProperty Id`).Output()
+		`Get-Process claude -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsApps*Claude*' -and $_.Path -notlike '*claude-code*' } | Select-Object -ExpandProperty Id`).Output()
 	if err != nil {
 		return nil
 	}
@@ -3834,7 +3837,13 @@ func launchDesktop() {
 			fmt.Fprintf(os.Stderr, "Could not locate own binary: %v\n", err)
 			os.Exit(1)
 		}
-		srv := exec.Command(exe, "server")
+		// Start the proxy on the same port proxyBaseURL()/the health check use,
+		// so a non-default configured port doesn't cause a silent mismatch.
+		port := config.Get().Server.Port
+		if port == "" {
+			port = "8080"
+		}
+		srv := exec.Command(exe, "server", port)
 		srv.Stdout, srv.Stderr = nil, nil
 		if err := srv.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to start proxy: %v\n", err)
