@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -233,5 +234,58 @@ func TestListModelsURL(t *testing.T) {
 	want := "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableModels"
 	if got != want {
 		t.Errorf("ListModelsURL = %q, want %q", got, want)
+	}
+}
+
+func TestRenderModelsAPI(t *testing.T) {
+	var opus KiroModel
+	opus.ModelID = "claude-opus-4.8"
+	opus.ModelName = "Claude Opus 4.8"
+	opus.Description = "experimental preview"
+	var sonnet KiroModel
+	sonnet.ModelID = "claude-sonnet-4.6"
+	sonnet.ModelName = "Claude Sonnet 4.6"
+
+	out := RenderModelsAPI([]KiroModel{opus, sonnet})
+
+	var parsed apiModelList
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("RenderModelsAPI produced invalid JSON: %v\n%s", err, out)
+	}
+	if len(parsed.Data) != 2 {
+		t.Fatalf("got %d models, want 2", len(parsed.Data))
+	}
+	if parsed.Data[0].Type != "model" {
+		t.Errorf("Data[0].Type = %q, want %q", parsed.Data[0].Type, "model")
+	}
+	if parsed.Data[0].ID != "claude-opus-4.8" {
+		t.Errorf("Data[0].ID = %q, want the exact Kiro backend ID", parsed.Data[0].ID)
+	}
+	// Preview models get a marker in the display name (not the id).
+	if !strings.Contains(parsed.Data[0].DisplayName, "preview") {
+		t.Errorf("Data[0].DisplayName = %q, want a preview marker", parsed.Data[0].DisplayName)
+	}
+	if parsed.HasMore {
+		t.Error("HasMore = true, want false (no pagination)")
+	}
+	if parsed.FirstID == nil || *parsed.FirstID != "claude-opus-4.8" {
+		t.Errorf("FirstID = %v, want claude-opus-4.8", parsed.FirstID)
+	}
+	if parsed.LastID == nil || *parsed.LastID != "claude-sonnet-4.6" {
+		t.Errorf("LastID = %v, want claude-sonnet-4.6", parsed.LastID)
+	}
+}
+
+func TestRenderModelsAPIEmpty(t *testing.T) {
+	out := RenderModelsAPI(nil)
+	var parsed apiModelList
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("RenderModelsAPI(nil) produced invalid JSON: %v\n%s", err, out)
+	}
+	if len(parsed.Data) != 0 {
+		t.Errorf("got %d models, want 0", len(parsed.Data))
+	}
+	if parsed.FirstID != nil || parsed.LastID != nil {
+		t.Error("empty list should have null first_id/last_id")
 	}
 }

@@ -630,6 +630,37 @@ func getKiroModelID(anthropicModel string) string {
 	return anthropicModel
 }
 
+// staticModelList returns a curated list of Kiro models built from the static
+// ModelMap, for model discovery when the live catalog is unreachable (offline
+// or not yet warmed). It returns the distinct Kiro backend IDs the map targets,
+// preferring Claude models, so Claude Desktop's picker still gets valid IDs.
+func staticModelList() []models.KiroModel {
+	// Curated order: newest Claude first, then non-Claude, matching the doc.
+	ordered := []struct{ id, name string }{
+		{"claude-opus-4.8", "Claude Opus 4.8"},
+		{"claude-opus-4.7", "Claude Opus 4.7"},
+		{"claude-opus-4.6", "Claude Opus 4.6"},
+		{"claude-opus-4.5", "Claude Opus 4.5"},
+		{"claude-sonnet-4.6", "Claude Sonnet 4.6"},
+		{"claude-sonnet-4.5", "Claude Sonnet 4.5"},
+		{"claude-sonnet-4", "Claude Sonnet 4"},
+		{"claude-haiku-4.5", "Claude Haiku 4.5"},
+		{"deepseek-3.2", "DeepSeek 3.2"},
+		{"minimax-m2.5", "MiniMax M2.5"},
+		{"minimax-m2.1", "MiniMax M2.1"},
+		{"qwen3-coder-next", "Qwen3 Coder Next"},
+		{"glm-5", "GLM 5"},
+	}
+	list := make([]models.KiroModel, 0, len(ordered))
+	for _, m := range ordered {
+		var km models.KiroModel
+		km.ModelID = m.id
+		km.ModelName = m.name
+		list = append(list, km)
+	}
+	return list
+}
+
 // modelCatalog is the dynamic layer over ListAvailableModels. It caches the live
 // model list (10-minute TTL) and serves stale data on fetch failure so model
 // resolution on the request path never breaks.
@@ -2762,6 +2793,28 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 				lg.LogComparison(sessionID, reqResult.RequestID, fmt.Sprintf("Kiro: %d events (%d bytes)", len(capturedKiroEvents), sseBuffer.Len()))
 			}
 		}
+	})
+
+	// Model discovery endpoint (used by Claude Desktop's gateway model picker,
+	// which GETs /v1/models at launch to auto-populate the model list). Serves
+	// the live Kiro catalog in Anthropic Models API shape. The `id` of each
+	// entry is the Kiro backend model ID, so a model the picker sends back on a
+	// request round-trips through getKiroModelID unchanged.
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			io.Copy(w, strings.NewReader(`{"type":"error","error":{"type":"invalid_request_error","message":"Only GET is supported"}}`))
+			return
+		}
+		list := modelCatalog.Models()
+		if len(list) == 0 {
+			// Catalog unreachable (e.g. offline / not yet warmed). Fall back to
+			// the curated static map so discovery still returns Claude IDs.
+			list = staticModelList()
+		}
+		io.Copy(w, strings.NewReader(models.RenderModelsAPI(list)))
 	})
 
 	// Add credits endpoint (used by statusline scripts)

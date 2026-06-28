@@ -447,3 +447,57 @@ When Claude Code sends a model ID, the proxy resolves it as follows:
 func trimRate(r float64) string {
 	return strconv.FormatFloat(r, 'g', -1, 64)
 }
+
+// apiModel is one entry in the Anthropic Models API response shape
+// (GET /v1/models). Claude Desktop's gateway model discovery hits this endpoint
+// at launch and auto-populates its model picker from it.
+type apiModel struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+// apiModelList is the Anthropic Models API list envelope.
+type apiModelList struct {
+	Data    []apiModel `json:"data"`
+	HasMore bool       `json:"has_more"`
+	FirstID *string    `json:"first_id"`
+	LastID  *string    `json:"last_id"`
+}
+
+// RenderModelsAPI renders the live Kiro model list as an Anthropic Models API
+// (GET /v1/models) JSON response. Each entry's `id` is the Kiro model ID the
+// CodeWhisperer backend accepts (e.g. "claude-opus-4.8"), so a model the picker
+// sends back round-trips through getKiroModelID unchanged.
+//
+// `id` is what Claude Desktop sends on each request and is also what the user
+// must put in the `inferenceModels` config if they disable discovery — so it
+// must be the exact backend ID, not a friendly alias.
+func RenderModelsAPI(list []KiroModel) string {
+	out := apiModelList{Data: make([]apiModel, 0, len(list))}
+	for _, m := range list {
+		name := m.ModelName
+		if name == "" {
+			name = m.ModelID
+		}
+		if isPreview(m) {
+			name += " (preview)"
+		}
+		out.Data = append(out.Data, apiModel{
+			Type:        "model",
+			ID:          m.ModelID,
+			DisplayName: name,
+		})
+	}
+	if len(out.Data) > 0 {
+		first := out.Data[0].ID
+		last := out.Data[len(out.Data)-1].ID
+		out.FirstID = &first
+		out.LastID = &last
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return `{"data":[],"has_more":false,"first_id":null,"last_id":null}`
+	}
+	return string(b)
+}
