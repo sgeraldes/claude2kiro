@@ -2175,6 +2175,14 @@ func runClaudeWithProxy() {
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	fmt.Printf("Proxy listening on %s\n", baseURL)
 
+	// Advertise the chosen (random) port so slash commands like /credits and
+	// /status can find this proxy. `run` picks an ephemeral port, so without
+	// this the port file would hold a stale value from a previous server run.
+	// Note: this function ends in os.Exit on error paths, which skips defers,
+	// so the file is also removed explicitly before each os.Exit below.
+	writeProxyPortFile(fmt.Sprintf("%d", port))
+	defer removeProxyPortFile()
+
 	// 6. Build claude command with remaining args
 	claudeArgs := os.Args[2:] // everything after "run"
 
@@ -2224,6 +2232,7 @@ func runClaudeWithProxy() {
 	fmt.Println("Proxy stopped.")
 
 	if runErr != nil {
+		removeProxyPortFile() // os.Exit skips the deferred cleanup
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
