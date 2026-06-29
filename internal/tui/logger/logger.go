@@ -2,6 +2,7 @@ package logger
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,6 +90,7 @@ type LogEntry struct {
 	Duration  time.Duration // Request duration (for responses), or parse time (for requests)
 	Preview   string        // Truncated body preview for list
 	Body      string        // Full body content for detail view
+	FileBody  string        // If set, written to the file instead of Body (e.g. a history-collapsed delta). Memory keeps full Body.
 	SessionID string        // Short session identifier (last 8 chars of UUID)
 	FullUUID  string        // Full session UUID from metadata (for --resume)
 	RequestID string        // Unique request ID for correlation (6 chars)
@@ -279,8 +282,10 @@ type Logger struct {
 	program           *tea.Program
 	fileWriter        *os.File
 	filePath          string
-	requestCount      uint64         // Counter for generating unique request IDs
-	seqNumMap         map[string]int // Maps session ID to current sequential number
+	requestCount      uint64            // Counter for generating unique request IDs
+	seqNumMap         map[string]int    // Maps session ID to current sequential number
+	lastReqBody       map[string]string // Last request body per session, for delta logging
+	lastReqID         map[string]string // Last request ID per session, referenced by deltas
 	attachmentCounter AttachmentCounter
 	attachmentStore   *attachments.Store // Store for deduplicating attachments
 }
@@ -288,9 +293,11 @@ type Logger struct {
 // NewLogger creates a new logger with a maximum number of entries
 func NewLogger(maxEntries int) *Logger {
 	return &Logger{
-		entries:    make([]LogEntry, 0, maxEntries),
-		maxEntries: maxEntries,
-		seqNumMap:  make(map[string]int),
+		entries:     make([]LogEntry, 0, maxEntries),
+		maxEntries:  maxEntries,
+		seqNumMap:   make(map[string]int),
+		lastReqBody: make(map[string]string),
+		lastReqID:   make(map[string]string),
 	}
 }
 
@@ -354,7 +361,209 @@ func (l *Logger) EnableFileLogging(logDir string) error {
 	}
 
 	l.fileWriter = file
+
+	// Best-effort housekeeping: compress old day-files and enforce retention/size
+	// caps. Runs once at startup; failures here never block logging.
+	maintainLogDir(logDir, l.filePath)
 	return nil
+}
+
+// maintainLogDir performs startup housekeeping on the log directory:
+//  1. gzip any non-current .log file to .log.gz (CompressRotated),
+//  2. delete files older than FileRetention,
+//  3. delete oldest files until total size is under MaxLogSizeMB.
+//
+// activePath is today's open log file, which is never compressed or deleted.
+// All operations are best-effort; errors are ignored so logging is never
+// disrupted by housekeeping.
+func maintainLogDir(logDir, activePath string) {
+	cfg := config.Get().Logging
+	active := filepath.Base(activePath)
+
+	// 1. Compress rotated (non-active) plain .log files.
+	if cfg.CompressRotated {
+		if entries, err := os.ReadDir(logDir); err == nil {
+			for _, e := range entries {
+				name := e.Name()
+				if e.IsDir() || name == active || !strings.HasSuffix(name, ".log") {
+					continue
+				}
+				gzipFile(filepath.Join(logDir, name))
+			}
+		}
+	}
+
+	// 2. Retention by age (FileRetention like "7d"/"30d"/"90d"; "unlimited" skips).
+	if days := parseRetentionDays(cfg.FileRetention); days > 0 {
+		cutoff := time.Now().AddDate(0, 0, -days)
+		if entries, err := os.ReadDir(logDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() || e.Name() == active || !isLogFile(e.Name()) {
+					continue
+				}
+				if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+					os.Remove(filepath.Join(logDir, e.Name()))
+				}
+			}
+		}
+	}
+
+	// 3. Total-size cap (MaxLogSizeMB; 0 = unlimited): delete oldest first.
+	if cfg.MaxLogSizeMB > 0 {
+		enforceSizeCap(logDir, active, int64(cfg.MaxLogSizeMB)*1024*1024)
+	}
+}
+
+// gzipFile compresses src to src+".gz" and removes the original on success.
+func gzipFile(src string) {
+	in, err := os.Open(src)
+	if err != nil {
+		return
+	}
+	defer in.Close()
+
+	dst := src + ".gz"
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	gw := gzip.NewWriter(out)
+	if _, err := io.Copy(gw, in); err != nil {
+		gw.Close()
+		out.Close()
+		os.Remove(dst)
+		return
+	}
+	if err := gw.Close(); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return
+	}
+	in.Close()
+	os.Remove(src)
+}
+
+// enforceSizeCap deletes the oldest log files (by mod time) until the total
+// size of all log files in dir is at or below maxBytes. The active file is
+// never deleted (but counts toward the total).
+func enforceSizeCap(dir, active string, maxBytes int64) {
+	type logFile struct {
+		path    string
+		size    int64
+		modTime time.Time
+		active  bool
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var files []logFile
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || !isLogFile(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		total += info.Size()
+		files = append(files, logFile{
+			path:    filepath.Join(dir, e.Name()),
+			size:    info.Size(),
+			modTime: info.ModTime(),
+			active:  e.Name() == active,
+		})
+	}
+	if total <= maxBytes {
+		return
+	}
+	// Oldest first.
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	for _, f := range files {
+		if total <= maxBytes {
+			break
+		}
+		if f.active {
+			continue // never delete the file we're writing to
+		}
+		if os.Remove(f.path) == nil {
+			total -= f.size
+		}
+	}
+}
+
+// isLogFile reports whether name is one of our log files (.log or .log.gz).
+func isLogFile(name string) bool {
+	return strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz")
+}
+
+// gzipReadCloser bundles the gzip reader with the underlying file so both are
+// closed together.
+type gzipReadCloser struct {
+	gz   *gzip.Reader
+	file *os.File
+}
+
+func (g *gzipReadCloser) Read(p []byte) (int, error) { return g.gz.Read(p) }
+func (g *gzipReadCloser) Close() error {
+	err := g.gz.Close()
+	if ferr := g.file.Close(); err == nil {
+		err = ferr
+	}
+	return err
+}
+
+// openLogForRead opens a log file for reading, transparently handling the
+// compressed variant: it tries filePath as-is, and if that's missing (and the
+// path isn't already .gz) falls back to filePath+".gz", decompressing on the
+// fly. The returned ReadCloser must be closed by the caller.
+func openLogForRead(filePath string) (io.ReadCloser, error) {
+	if strings.HasSuffix(filePath, ".gz") {
+		return openGzip(filePath)
+	}
+	if f, err := os.Open(filePath); err == nil {
+		return f, nil
+	}
+	// Plain file missing — try the compressed sibling.
+	if rc, err := openGzip(filePath + ".gz"); err == nil {
+		return rc, nil
+	}
+	// Return the original (plain) open error for a faithful "not found".
+	return os.Open(filePath)
+}
+
+func openGzip(path string) (io.ReadCloser, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &gzipReadCloser{gz: gz, file: f}, nil
+}
+
+// parseRetentionDays converts a FileRetention setting ("7d", "30d", "90d",
+// "unlimited", or a bare number of days) to a day count. Returns 0 for
+// unlimited/unparseable (meaning "no age-based pruning").
+func parseRetentionDays(s string) int {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" || s == "unlimited" || s == "0" {
+		return 0
+	}
+	s = strings.TrimSuffix(s, "d")
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // DisableFileLogging closes the log file
@@ -420,9 +629,16 @@ func (l *Logger) Log(entry LogEntry) {
 		}
 	}
 
-	// Create a copy of entry for file logging with processed body
+	// Create a copy of entry for file logging with processed body.
+	// A FileBody override (e.g. a history-collapsed request delta) takes
+	// precedence — it already excludes the bulky re-sent content, so it is
+	// written verbatim rather than re-running attachment processing on it.
 	fileEntry := entry
-	fileEntry.Body = bodyForFile
+	if entry.FileBody != "" {
+		fileEntry.Body = entry.FileBody
+	} else {
+		fileEntry.Body = bodyForFile
+	}
 
 	// Write to file with processed body
 	if l.fileWriter != nil {
@@ -1093,6 +1309,22 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID strin
 	// Get or create sequential number for this session
 	seqNum := l.seqNumMap[sessionID] + 1
 	l.seqNumMap[sessionID] = seqNum
+
+	// Delta logging: each request re-sends the whole growing conversation
+	// history, so writing the full body every turn is O(n^2). When enabled,
+	// write only the new tail vs the previous request in this session (the
+	// shared prefix is the already-logged history) plus a back-reference, so
+	// the full body stays reconstructable while the file stays small.
+	var fileBody string
+	if config.Get().Logging.RequestDeltas && sessionID != "" {
+		prev := l.lastReqBody[sessionID]
+		prevID := l.lastReqID[sessionID]
+		if prev != "" {
+			fileBody = requestDelta(prev, prevID, body)
+		}
+		l.lastReqBody[sessionID] = body
+		l.lastReqID[sessionID] = requestID
+	}
 	l.mu.Unlock()
 
 	cfg := config.Get()
@@ -1105,7 +1337,8 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID strin
 		Status:    status,
 		Duration:  parseDuration,
 		Preview:   generateRequestPreview(body, cfg.Logging.PreviewLength),
-		Body:      body, // Full body - truncation happens in Log() for memory only
+		Body:      body,     // Full body kept in memory for the TUI viewer
+		FileBody:  fileBody, // If set, the collapsed delta written to the file instead
 		SessionID: sessionID,
 		FullUUID:  fullUUID,
 		RequestID: requestID,
@@ -1113,6 +1346,35 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID strin
 		SeqNum:    seqNum,
 	})
 	return LogRequestResult{RequestID: requestID, SeqNum: seqNum}
+}
+
+// requestDelta returns a compact file representation of body given the previous
+// request body (prev) and its request ID (prevID) in the same session. It
+// finds the longest common prefix (the re-sent conversation history) and emits
+// only the differing tail, prefixed with a marker that records the shared
+// length and the prior request ID — so the full body can be reconstructed by
+// concatenating prev[:shared] with the logged tail. Returns "" (meaning "log
+// the full body") when collapsing wouldn't save enough to be worth it.
+func requestDelta(prev, prevID, body string) string {
+	shared := commonPrefixLen(prev, body)
+	// Only collapse when the shared prefix is substantial; otherwise the
+	// full body is cheap and clearer.
+	if shared < 256 || shared <= len(body)/2 {
+		return ""
+	}
+	tail := body[shared:]
+	return fmt.Sprintf("@delta prev=%s shared=%d tail=%d@%s", prevID, shared, len(tail), tail)
+}
+
+// commonPrefixLen returns the length (in bytes) of the longest common prefix
+// of a and b.
+func commonPrefixLen(a, b string) int {
+	n := min(len(a), len(b))
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return i
 }
 
 // LogResponse is a convenience method for logging responses
@@ -1207,6 +1469,8 @@ func (l *Logger) Clear() {
 	defer l.mu.Unlock()
 	l.entries = l.entries[:0]
 	l.seqNumMap = make(map[string]int)
+	l.lastReqBody = make(map[string]string)
+	l.lastReqID = make(map[string]string)
 }
 
 // Count returns the number of log entries
@@ -1238,17 +1502,19 @@ func (l *Logger) FilePath() string {
 // LoadFromFile loads log entries from a file into the logger
 // This is used to restore logs from previous sessions on startup
 func (l *Logger) LoadFromFile(filePath string) (int, error) {
-	file, err := os.Open(filePath)
+	// Transparently read a gzipped log: if the plain file is missing, fall
+	// back to filePath+".gz" (written by startup compression).
+	rc, err := openLogForRead(filePath)
 	if err != nil {
 		return 0, err
 	}
-	defer file.Close()
+	defer rc.Close()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	// Use a reader that can handle very long lines
-	reader := bufio.NewReader(file)
+	reader := bufio.NewReader(rc)
 	count := 0
 
 	for {

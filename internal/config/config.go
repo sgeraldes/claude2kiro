@@ -40,6 +40,8 @@ type LoggingConfig struct {
 	MaxBodySizeKB      int    `yaml:"max_body_size_kb"`    // Max body size to store in memory per entry in KB (0 = unlimited, default 1024)
 	PreviewLength      int    `yaml:"preview_length"`      // Preview length in list view
 	AttachmentMode     string `yaml:"attachment_mode"`     // "full", "placeholder", "separate" - how to handle base64 attachments
+	RequestDeltas      bool   `yaml:"request_deltas"`      // Log only the NEW tail of each request body vs the previous request in the same session (avoids O(n^2) re-logging of conversation history). Default true.
+	CompressRotated    bool   `yaml:"compress_rotated"`    // Gzip rotated (non-today) .log files to .log.gz on startup. Default true.
 }
 
 // DisplayConfig holds UI display settings
@@ -118,6 +120,8 @@ func Default() *Config {
 			MaxBodySizeKB:      1024,       // 1MB default limit for in-memory body storage
 			PreviewLength:      10000,      // 0 = unlimited, max 200000
 			AttachmentMode:     "separate", // "full", "placeholder", "separate"
+			RequestDeltas:      true,       // collapse re-sent conversation history in request logs
+			CompressRotated:    true,       // gzip old day-files on startup
 		},
 		Display: DisplayConfig{
 			ShowStatusInList:   true,
