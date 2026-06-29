@@ -142,9 +142,10 @@ type RefreshResponse struct {
 
 // AnthropicTool represents the Anthropic API tool structure
 type AnthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"input_schema"`
+	CacheControl map[string]any `json:"cache_control,omitempty"`
 }
 
 // InputSchema represents the tool input schema structure
@@ -161,7 +162,15 @@ type ToolSpecification struct {
 
 // CodeWhispererTool represents the CodeWhisperer API tool structure
 type CodeWhispererTool struct {
-	ToolSpecification ToolSpecification `json:"toolSpecification"`
+	ToolSpecification *ToolSpecification `json:"toolSpecification,omitempty"`
+	CachePoint        *CachePoint        `json:"cachePoint,omitempty"`
+}
+
+// CachePoint is the Kiro/CodeWhisperer equivalent of an Anthropic cache_control
+// breakpoint. Placed as its own entry in the tools array after a tool, it marks a
+// caching boundary so the backend can reuse the preceding tool definitions.
+type CachePoint struct {
+	Type string `json:"type"`
 }
 
 // HistoryUserMessage represents a user message in conversation history
@@ -870,6 +879,37 @@ func generateUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
+// uuidFromBytes formats 16 bytes as a canonical, well-formed UUID string
+// (deterministic) with version/variant nibbles set.
+func uuidFromBytes(b []byte) string {
+	if len(b) < 16 {
+		return generateUUID()
+	}
+	out := make([]byte, 16)
+	copy(out, b[:16])
+	out[6] = (out[6] & 0x0f) | 0x50 // Version 5 (name-based)
+	out[8] = (out[8] & 0x3f) | 0x80 // Variant bits
+	return fmt.Sprintf("%x-%x-%x-%x-%x", out[0:4], out[4:6], out[6:8], out[8:10], out[10:])
+}
+
+// stableConversationID returns a conversationId that is STABLE across all turns
+// of the same client session, mirroring the real Kiro/Amazon Q IDE (which reuses
+// the server-assigned conversationId for the lifetime of a chat session).
+//
+// Claude Code sends a per-session UUID inside metadata.user_id
+// (".._session_<uuid>"); we hash it to a deterministic, well-formed UUID so the
+// same session always maps to the same conversationId, letting the Kiro backend
+// reuse server-side context keyed by conversationId instead of treating every
+// turn as a new conversation. With no session key (non-Claude-Code clients,
+// missing metadata) it falls back to a fresh random UUID — preserving prior behavior.
+func stableConversationID(sessionKey string) string {
+	if sessionKey == "" {
+		return generateUUID()
+	}
+	sum := sha256.Sum256([]byte("claude2kiro-conv:" + sessionKey))
+	return uuidFromBytes(sum[:])
+}
+
 // extractImagesFromContent extracts images from Anthropic message content
 func extractImagesFromContent(content any) []ImageBlock {
 	var images []ImageBlock
@@ -1251,15 +1291,33 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		// doesn't yet require a profile for).
 		cwReq.ProfileArn = ""
 	}
+	cfg := config.Get()
 	cwReq.ConversationState.ChatTriggerType = "MANUAL"
-	cwReq.ConversationState.ConversationId = generateUUID()
+	// conversationId selection.
+	//
+	// By DEFAULT we send a fresh random UUID per request (original behavior): the
+	// proxy always re-sends the full history array, so each request is fully
+	// self-contained.
+	//
+	// OPT-IN (cfg.Advanced.StableConversationID): derive a STABLE conversationId
+	// from the client session (Claude Code sends a per-session UUID in
+	// metadata.user_id) so a backend that retains context server-side per
+	// conversationId can reuse it across turns. This is off by default because the
+	// backend's server-side retention is unverified — if it DOES retain, pairing it
+	// with our full-history sending would double the ingested context (more credits,
+	// not fewer), and Claude Code's /clear reuses the same session UUID, so two
+	// logical conversations could collapse onto one conversationId.
+	if _, sessionKey := extractSessionID(anthropicReq.Metadata); cfg.Advanced.StableConversationID && sessionKey != "" {
+		cwReq.ConversationState.ConversationId = stableConversationID(sessionKey)
+	} else {
+		cwReq.ConversationState.ConversationId = generateUUID()
+	}
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = getMessageContent(anthropicReq.Messages[len(anthropicReq.Messages)-1].Content)
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "AI_EDITOR"
 	// Process tools information
 	// CodeWhisperer has limits: ~10KB per tool description, ~90 tools max (~260KB body limit)
 	const maxToolDescLength = 10000
-	cfg := config.Get()
 	maxTools := cfg.Network.MaxToolsPerRequest
 	if maxTools < 1 {
 		maxTools = 85
@@ -1272,25 +1330,40 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			toolsToProcess = toolsToProcess[:maxTools]
 		}
 		for _, tool := range toolsToProcess {
-			cwTool := CodeWhispererTool{}
-			// CodeWhisperer rejects tool names longer than 64 chars; sanitize
-			// (deterministically) so long MCP names don't break the whole request.
-			cwTool.ToolSpecification.Name = sanitizeToolName(tool.Name)
 			// Truncate long descriptions to avoid 400 errors
 			desc := tool.Description
 			if len(desc) > maxToolDescLength {
 				desc = desc[:maxToolDescLength] + "...(truncated)"
 			}
-			cwTool.ToolSpecification.Description = desc
 			// Clean the input schema: remove fields that Kiro/CodeWhisperer rejects
 			// ($schema, title, $defs are JSON Schema meta-fields not supported by CW)
 			// First resolve $ref references by inlining $defs, then clean meta-fields
 			resolvedSchema := resolveSchemaRefs(tool.InputSchema)
 			cleanedSchema := cleanToolSchema(resolvedSchema)
-			cwTool.ToolSpecification.InputSchema = InputSchema{
-				Json: cleanedSchema,
+			cwTool := CodeWhispererTool{
+				ToolSpecification: &ToolSpecification{
+					// CodeWhisperer rejects tool names longer than 64 chars; sanitize
+					// (deterministically) so long MCP names don't break the whole request.
+					Name:        sanitizeToolName(tool.Name),
+					Description: desc,
+					InputSchema: InputSchema{Json: cleanedSchema},
+				},
 			}
 			tools = append(tools, cwTool)
+			// Enforce the backend tool-array limit on TOTAL emitted entries. The
+			// up-front truncation only counts source tools; cachePoint entries are
+			// added here, so without this the array (tools + cachePoints) could
+			// exceed maxTools (~90 max / ~260KB body limit).
+			if len(tools) >= maxTools {
+				break
+			}
+			// Mirror Anthropic cache_control: emit a Kiro cachePoint entry right
+			// after a tool that carried a cache breakpoint, so the backend can
+			// cache the preceding tool definitions instead of re-ingesting them.
+			// Only add it if there's still room under the limit.
+			if tool.CacheControl != nil && len(tools) < maxTools {
+				tools = append(tools, CodeWhispererTool{CachePoint: &CachePoint{Type: "default"}})
+			}
 		}
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools = tools
 	}
