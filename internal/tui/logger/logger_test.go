@@ -2,8 +2,12 @@ package logger
 
 import (
 	"encoding/base64"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReplaceBase64WithPlaceholders(t *testing.T) {
@@ -180,5 +184,175 @@ func TestReplaceBase64InvalidBase64Ignored(t *testing.T) {
 	// The original string should be preserved or truncated normally
 	if !strings.Contains(result, "!!!!") && !strings.Contains(result, "TRUNCATED") {
 		t.Error("Expected invalid base64 to be kept or truncated normally")
+	}
+}
+
+func TestCommonPrefixLen(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"", "", 0},
+		{"abc", "abc", 3},
+		{"abcXYZ", "abcDEF", 3},
+		{"abc", "abcdef", 3},
+		{"x", "y", 0},
+	}
+	for _, c := range cases {
+		if got := commonPrefixLen(c.a, c.b); got != c.want {
+			t.Errorf("commonPrefixLen(%q,%q)=%d want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestRequestDelta(t *testing.T) {
+	// Build a long shared history so collapsing is worthwhile.
+	hist := strings.Repeat("conversation-history-message ", 50) // ~1450 bytes
+	prev := `{"messages":[` + hist + `]}`
+	// Next request appends a new turn (shares the long prefix).
+	body := `{"messages":[` + hist + `new-user-turn]}`
+
+	d := requestDelta(prev, "abc123", body)
+	if d == "" {
+		t.Fatalf("expected a delta for a long shared prefix, got full-body sentinel")
+	}
+	if !strings.HasPrefix(d, "@delta prev=abc123 shared=") {
+		t.Errorf("delta missing marker: %.60s", d)
+	}
+	// The delta must be much smaller than the full body.
+	if len(d) >= len(body) {
+		t.Errorf("delta (%d) not smaller than body (%d)", len(d), len(body))
+	}
+	// Reconstruct: prev[:shared] + tail == body. The tail follows the second
+	// '@' in the marker.
+	at := strings.IndexByte(d[1:], '@') // first '@' after the leading one
+	tail := d[at+2:]
+	sh := commonPrefixLen(prev, body)
+	if prev[:sh]+tail != body {
+		t.Errorf("reconstruction failed: prev[:%d]+tail != body", sh)
+	}
+}
+
+func TestRequestDeltaShortPrefixReturnsFull(t *testing.T) {
+	// Tiny / low-overlap bodies should NOT be collapsed (return "").
+	if d := requestDelta(`{"a":1}`, "id", `{"b":2}`); d != "" {
+		t.Errorf("expected full-body sentinel for short prefix, got %q", d)
+	}
+}
+
+func TestParseRetentionDays(t *testing.T) {
+	cases := map[string]int{
+		"7d": 7, "30d": 30, "90d": 90, "14": 14,
+		"unlimited": 0, "": 0, "0": 0, "garbage": 0, "-5d": 0,
+	}
+	for in, want := range cases {
+		if got := parseRetentionDays(in); got != want {
+			t.Errorf("parseRetentionDays(%q)=%d want %d", in, got, want)
+		}
+	}
+}
+
+func TestGzipRoundtripLoadFromFile(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "2026-01-01.log")
+	// Write a couple of real log lines via FormatPlain so the parser accepts them.
+	e1 := LogEntry{Timestamp: time.Now(), Type: LogTypeInf, Preview: "hello one"}
+	e2 := LogEntry{Timestamp: time.Now(), Type: LogTypeInf, Preview: "hello two"}
+	content := e1.FormatPlain() + "\n" + e2.FormatPlain() + "\n"
+	if err := os.WriteFile(plain, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Compress it (simulating startup rotation) and confirm the plain file is gone.
+	gzipFile(plain)
+	if _, err := os.Stat(plain); !os.IsNotExist(err) {
+		t.Fatalf("plain file should be removed after gzip, stat err=%v", err)
+	}
+	if _, err := os.Stat(plain + ".gz"); err != nil {
+		t.Fatalf("gz file should exist: %v", err)
+	}
+
+	// LoadFromFile given the PLAIN path must transparently read the .gz.
+	lg := NewLogger(100)
+	n, err := lg.LoadFromFile(plain)
+	if err != nil {
+		t.Fatalf("LoadFromFile(plain) should fall back to .gz: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("loaded %d entries from gz, want 2", n)
+	}
+}
+
+func TestEnforceSizeCapKeepsActive(t *testing.T) {
+	dir := t.TempDir()
+	// Three files; make the "active" one newest and oversized to prove it's kept.
+	write := func(name string, size int, age time.Duration) string {
+		p := filepath.Join(dir, name)
+		os.WriteFile(p, make([]byte, size), 0644)
+		mt := time.Now().Add(-age)
+		os.Chtimes(p, mt, mt)
+		return p
+	}
+	write("2026-01-01.log", 1000, 72*time.Hour) // oldest
+	write("2026-01-02.log", 1000, 48*time.Hour)
+	active := write("2026-01-03.log", 5000, 0) // newest + largest = active
+
+	// Cap below total; only non-active oldest files may be deleted.
+	enforceSizeCap(dir, filepath.Base(active), 5000)
+
+	if _, err := os.Stat(active); err != nil {
+		t.Errorf("active file must never be deleted: %v", err)
+	}
+}
+
+func TestReconstructDeltaRoundtrip(t *testing.T) {
+	hist := strings.Repeat("history ", 200) // long shared prefix
+	prevBody := `{"messages":[` + hist + `]}`
+	newBody := `{"messages":[` + hist + `tail-with-@-and-stuff]}`
+
+	// Produce the delta the writer would emit.
+	d := requestDelta(prevBody, "REQ1", newBody)
+	if d == "" {
+		t.Fatal("expected a delta")
+	}
+
+	// Reconstruct using the prior-body cache (prev REQ1 -> prevBody).
+	prior := map[string]string{"REQ1": prevBody}
+	got, ok := reconstructDelta(d, prior)
+	if !ok {
+		t.Fatal("reconstructDelta should recognize the marker")
+	}
+	if got != newBody {
+		t.Errorf("reconstruction mismatch:\n got=%q\nwant=%q", got, newBody)
+	}
+
+	// A plain (non-delta) body is returned unchanged with ok=false.
+	if out, ok := reconstructDelta(prevBody, prior); ok || out != prevBody {
+		t.Errorf("plain body should pass through unchanged")
+	}
+
+	// Missing prior reference -> unchanged, ok=false (no crash).
+	if out, ok := reconstructDelta(d, map[string]string{}); ok || out != d {
+		t.Errorf("missing prior should return input unchanged")
+	}
+}
+
+func TestDeltaSessionMapBounded(t *testing.T) {
+	lg := NewLogger(10000)
+	// Drive more sessions than the cap; each session's first request adds a key.
+	hist := strings.Repeat("x", 600)
+	for i := 0; i < maxDeltaSessions+50; i++ {
+		sid := fmt.Sprintf("sess%05d", i)
+		lg.LogRequest("m", "POST", "/v1/messages", `{"h":"`+hist+`"}`, sid, "", 0, 0)
+	}
+	lg.mu.RLock()
+	n := len(lg.lastReqBody)
+	order := len(lg.deltaSessOrder)
+	lg.mu.RUnlock()
+	if n > maxDeltaSessions {
+		t.Errorf("lastReqBody holds %d sessions, want <= %d", n, maxDeltaSessions)
+	}
+	if order > maxDeltaSessions {
+		t.Errorf("deltaSessOrder holds %d, want <= %d", order, maxDeltaSessions)
 	}
 }
