@@ -2178,6 +2178,8 @@ func runClaudeWithProxy() {
 	// Advertise the chosen (random) port so slash commands like /credits and
 	// /status can find this proxy. `run` picks an ephemeral port, so without
 	// this the port file would hold a stale value from a previous server run.
+	// Note: this function ends in os.Exit on error paths, which skips defers,
+	// so the file is also removed explicitly before each os.Exit below.
 	writeProxyPortFile(fmt.Sprintf("%d", port))
 	defer removeProxyPortFile()
 
@@ -2230,6 +2232,7 @@ func runClaudeWithProxy() {
 	fmt.Println("Proxy stopped.")
 
 	if runErr != nil {
+		removeProxyPortFile() // os.Exit skips the deferred cleanup
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
