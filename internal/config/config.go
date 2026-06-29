@@ -80,12 +80,13 @@ type AdvancedConfig struct {
 	KiroRefreshEndpoint   string `yaml:"kiro_refresh_endpoint"`
 	KiroUsageURL          string `yaml:"kiro_usage_url"`
 	AWSRegion             string `yaml:"aws_region"`
-	ComparisonMode        bool   `yaml:"comparison_mode"`     // Debug: send to both Anthropic and Kiro
-	AnthropicDirect       bool   `yaml:"anthropic_direct"`    // Bypass: send only to Anthropic
-	AnthropicApiKey       string `yaml:"anthropic_api_key"`   // API key for Anthropic (required for comparison/direct modes)
-	UseNewSSEBuilder      bool   `yaml:"use_new_sse_builder"` // Feature flag: use new sse.EventBuilder (default: false)
-	SkipPermissions       bool   `yaml:"skip_permissions"`    // Pass --dangerously-skip-permissions to claude (default: true)
-	DebugMode             bool   `yaml:"debug_mode"`          // Write debug files per request
+	ComparisonMode        bool   `yaml:"comparison_mode"`        // Debug: send to both Anthropic and Kiro
+	AnthropicDirect       bool   `yaml:"anthropic_direct"`       // Bypass: send only to Anthropic
+	AnthropicApiKey       string `yaml:"anthropic_api_key"`      // API key for Anthropic (required for comparison/direct modes)
+	UseNewSSEBuilder      bool   `yaml:"use_new_sse_builder"`    // Feature flag: use new sse.EventBuilder (default: false)
+	SkipPermissions       bool   `yaml:"skip_permissions"`       // Pass --dangerously-skip-permissions to claude (default: true)
+	DebugMode             bool   `yaml:"debug_mode"`             // Write debug files per request
+	StableConversationID  bool   `yaml:"stable_conversation_id"` // Reuse a session-derived conversationId across turns instead of a fresh UUID per request (default: false; backend server-side retention is unverified and could double context when paired with full-history sending)
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -156,6 +157,7 @@ func Default() *Config {
 			AWSRegion:             "us-east-1",
 			SkipPermissions:       true,
 			DebugMode:             false,
+			StableConversationID:  false, // Opt-in: backend retention unverified; pairing with full-history sending could double context
 		},
 	}
 }

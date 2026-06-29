@@ -624,6 +624,19 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "When enabled, the proxy writes raw request and response payloads to disk in ~/.claude2kiro/debug/ for troubleshooting. Can impact performance.",
 			},
 		},
+		{
+			Key:         "advanced.stable_conversation_id",
+			Label:       "Stable Conversation ID",
+			Description: "Reuse a session-derived conversationId across turns",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.StableConversationID),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "false",
+				RecommendedValue: "false",
+				Sensitive:        false,
+				DetailedDesc:     "EXPERIMENTAL. When enabled, all turns of a Claude Code session reuse one conversationId derived from its session UUID, instead of a fresh random UUID per request. This could let the backend reuse server-side context, but that retention is unverified: if the backend DOES retain context, pairing it with the proxy's full-history sending would double the ingested context (more credits, not fewer), and Claude Code's /clear reuses the same session UUID so two logical conversations could share one id. Leave off unless you are testing this behavior.",
+			},
+		},
 	}
 }
 
@@ -748,6 +761,8 @@ func (m *Model) applySetting(s Setting) {
 		}
 	case "advanced.debug_mode":
 		m.config.Advanced.DebugMode = stringToBool(s.Value)
+	case "advanced.stable_conversation_id":
+		m.config.Advanced.StableConversationID = stringToBool(s.Value)
 	}
 }
 

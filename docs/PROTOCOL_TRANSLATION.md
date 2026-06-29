@@ -117,6 +117,33 @@ data: {"type": "message_stop"}
 4. Generate proper indices for each content block
 5. Add single `message_delta` at the end
 
+## Credit-Efficiency Optimizations
+
+Credits scale with how many tokens the backend ingests, so the proxy mirrors two
+behaviors of the real Kiro/Amazon Q IDE to avoid re-billing context every turn:
+
+- **Stable conversationId per session (OPT-IN, default OFF).** The real IDE reuses a
+  single server-assigned `conversationId` for the lifetime of a chat session, letting
+  the backend retain context server-side. When enabled via
+  `advanced.stable_conversation_id`, `buildCodeWhispererRequest` hashes the per-session
+  UUID Claude Code sends in `metadata.user_id` (`..._session_<uuid>`) into a
+  deterministic, well-formed `conversationId` (`stableConversationID`), so all turns of
+  one session map to the same id. **It is off by default** because the proxy still sends
+  the full history array on every request and the backend's server-side retention is
+  **unverified**: if the backend DOES retain context per `conversationId`, pairing that
+  with full-history sending would *double* the ingested context (more credits, not
+  fewer), and Claude Code's `/clear` reuses the same session UUID, so two logical
+  conversations could collapse onto one `conversationId`. With the flag off — or with no
+  session key (non-Claude-Code clients / missing metadata) even when on — it sends a
+  fresh random UUID per request, preserving the original behavior.
+- **Tool-level `cache_control` → Kiro `cachePoint`.** When Claude Code marks a tool
+  with Anthropic `cache_control`, the proxy emits a sibling `{"cachePoint":{"type":"default"}}`
+  entry in the CodeWhisperer `tools` array immediately after that tool, marking a
+  caching boundary so the backend can reuse the preceding tool definitions rather
+  than re-ingesting them. The total emitted entries (tool entries + cachePoint entries)
+  are capped at the tool-count limit (`network.max_tools_per_request`, default 85) so
+  cachePoints can't push the array past the backend's ~90-tool / ~260KB body limit.
+
 ## Why This Matters
 
 The proxy doesn't modify the semantic content - it translates the protocol. Like a translator converting between English and Japanese, the meaning stays the same but the grammar and structure change completely.
