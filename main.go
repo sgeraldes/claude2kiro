@@ -3210,8 +3210,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode == 400 && attempt < 2 {
-			// Transient 400 error - retry
+		// A context-length-exceeded 400 is not transient (a smaller request is the
+		// only fix) and must not be retried or mislabeled. Compute once, reuse below.
+		contextTooLong := resp.StatusCode == 400 && isContextLengthExceeded(body)
+
+		if resp.StatusCode == 400 && attempt < 2 && !contextTooLong {
+			// Transient 400 error - retry.
 			lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
 			continue
 		}
@@ -3230,6 +3234,14 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				lg.LogInfo("Token refreshed successfully")
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
 			}
+		} else if contextTooLong {
+			// The request exceeded Kiro's input-size limit. Retrying can't help,
+			// and the generic path below would label it overloaded_error (which
+			// the Anthropic SDK auto-retries), hiding the real cause behind a
+			// generic "API Error". Surface it as non-retryable with a clear fix.
+			sendNonRetryableErrorEvent(w, flusher, "Context too long: this conversation exceeds Kiro's input-size limit. "+
+				"Run /clear to start fresh or /compact to shrink the history, then retry. "+
+				"Trimming unused MCP servers also reduces per-request size.")
 		} else if resp.StatusCode == 403 {
 			// 403 with a valid token is access denial — most commonly a model
 			// this Kiro account/plan does not expose. Send a non-retryable
@@ -5150,6 +5162,29 @@ func isInvalidBearerToken(body []byte) bool {
 		strings.Contains(s, "token is invalid") ||
 		strings.Contains(s, "token expired") ||
 		strings.Contains(s, "invalid_token")
+}
+
+// isContextLengthExceeded reports whether a CodeWhisperer 400 body indicates the
+// request exceeded the backend's input-size limit. Retrying an oversized request
+// can never succeed, and the default error path mislabels it as overloaded_error
+// (which the Anthropic SDK auto-retries), so the client only ever sees a generic
+// "API Error" instead of the real cause.
+func isContextLengthExceeded(body []byte) bool {
+	var parsed struct {
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if strings.ToLower(parsed.Reason) == "content_length_exceeds_threshold" {
+			return true
+		}
+		// Match the message field exactly rather than scanning the whole body:
+		// AWS may echo user content (e.g. an oversized tool description) into
+		// other 400 errors, and a loose substring scan would misfire on those.
+		return strings.TrimRight(strings.ToLower(parsed.Message), ". ") == "input is too long"
+	}
+	// Non-JSON body: only trust the structured enum, never the English phrase.
+	return strings.Contains(strings.ToLower(string(body)), "content_length_exceeds_threshold")
 }
 
 // sendNonRetryableErrorEvent emits an Anthropic error event typed
