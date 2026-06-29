@@ -24,6 +24,11 @@ func TestIsContextLengthExceeded(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "reason containing enum as substring is not an exact match",
+			body: `{"reason":"NOT_content_length_exceeds_threshold_really"}`,
+			want: false,
+		},
+		{
 			name: "unrelated 400 improperly formed",
 			body: `{"message":"Improperly formed request."}`,
 			want: false,

@@ -3210,9 +3210,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode == 400 && attempt < 2 && !isContextLengthExceeded(body) {
-			// Transient 400 error - retry. A context-length-exceeded 400 is not
-			// transient (a smaller request is the only fix), so don't waste retries.
+		// A context-length-exceeded 400 is not transient (a smaller request is the
+		// only fix) and must not be retried or mislabeled. Compute once, reuse below.
+		contextTooLong := resp.StatusCode == 400 && isContextLengthExceeded(body)
+
+		if resp.StatusCode == 400 && attempt < 2 && !contextTooLong {
+			// Transient 400 error - retry.
 			lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
 			continue
 		}
@@ -3231,7 +3234,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				lg.LogInfo("Token refreshed successfully")
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
 			}
-		} else if resp.StatusCode == 400 && isContextLengthExceeded(body) {
+		} else if contextTooLong {
 			// The request exceeded Kiro's input-size limit. Retrying can't help,
 			// and the generic path below would label it overloaded_error (which
 			// the Anthropic SDK auto-retries), hiding the real cause behind a
@@ -5172,7 +5175,7 @@ func isContextLengthExceeded(body []byte) bool {
 		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(body, &parsed); err == nil {
-		if strings.Contains(strings.ToLower(parsed.Reason), "content_length_exceeds_threshold") {
+		if strings.ToLower(parsed.Reason) == "content_length_exceeds_threshold" {
 			return true
 		}
 		// Match the message field exactly rather than scanning the whole body:
