@@ -2,6 +2,7 @@ package logger
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -301,5 +302,57 @@ func TestEnforceSizeCapKeepsActive(t *testing.T) {
 
 	if _, err := os.Stat(active); err != nil {
 		t.Errorf("active file must never be deleted: %v", err)
+	}
+}
+
+func TestReconstructDeltaRoundtrip(t *testing.T) {
+	hist := strings.Repeat("history ", 200) // long shared prefix
+	prevBody := `{"messages":[` + hist + `]}`
+	newBody := `{"messages":[` + hist + `tail-with-@-and-stuff]}`
+
+	// Produce the delta the writer would emit.
+	d := requestDelta(prevBody, "REQ1", newBody)
+	if d == "" {
+		t.Fatal("expected a delta")
+	}
+
+	// Reconstruct using the prior-body cache (prev REQ1 -> prevBody).
+	prior := map[string]string{"REQ1": prevBody}
+	got, ok := reconstructDelta(d, prior)
+	if !ok {
+		t.Fatal("reconstructDelta should recognize the marker")
+	}
+	if got != newBody {
+		t.Errorf("reconstruction mismatch:\n got=%q\nwant=%q", got, newBody)
+	}
+
+	// A plain (non-delta) body is returned unchanged with ok=false.
+	if out, ok := reconstructDelta(prevBody, prior); ok || out != prevBody {
+		t.Errorf("plain body should pass through unchanged")
+	}
+
+	// Missing prior reference -> unchanged, ok=false (no crash).
+	if out, ok := reconstructDelta(d, map[string]string{}); ok || out != d {
+		t.Errorf("missing prior should return input unchanged")
+	}
+}
+
+func TestDeltaSessionMapBounded(t *testing.T) {
+	lg := NewLogger(10000)
+	// Drive more sessions than the cap; each session's first request adds a key.
+	hist := strings.Repeat("x", 600)
+	for i := 0; i < maxDeltaSessions+50; i++ {
+		sid := fmt.Sprintf("sess%05d", i)
+		lg.LogRequest("m", "POST", "/v1/messages", `{"h":"`+hist+`"}`, sid, "", 0, 0)
+	}
+	lg.mu.RLock()
+	n := len(lg.lastReqBody)
+	order := len(lg.deltaSessOrder)
+	lg.mu.RUnlock()
+	if n > maxDeltaSessions {
+		t.Errorf("lastReqBody holds %d sessions, want <= %d", n, maxDeltaSessions)
+	}
+	if order > maxDeltaSessions {
+		t.Errorf("deltaSessOrder holds %d, want <= %d", order, maxDeltaSessions)
 	}
 }

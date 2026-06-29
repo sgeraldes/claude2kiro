@@ -34,6 +34,10 @@ const (
 	LogTypeCmp
 )
 
+// maxDeltaSessions bounds the per-session delta-tracking maps so a long-lived
+// server/TUI proxy doesn't retain one full request body per session forever.
+const maxDeltaSessions = 256
+
 // Preview generation thresholds
 const (
 	// PreviewFastModeThreshold is the body size (bytes) above which we use
@@ -286,6 +290,7 @@ type Logger struct {
 	seqNumMap         map[string]int    // Maps session ID to current sequential number
 	lastReqBody       map[string]string // Last request body per session, for delta logging
 	lastReqID         map[string]string // Last request ID per session, referenced by deltas
+	deltaSessOrder    []string          // Session insertion order, to bound the delta maps (oldest evicted first)
 	attachmentCounter AttachmentCounter
 	attachmentStore   *attachments.Store // Store for deduplicating attachments
 }
@@ -1321,6 +1326,17 @@ func (l *Logger) LogRequest(model, method, path, body, sessionID, fullUUID strin
 		prevID := l.lastReqID[sessionID]
 		if prev != "" {
 			fileBody = requestDelta(prev, prevID, body)
+		} else {
+			// First request for this session: bound the maps so a long-lived
+			// server/TUI proxy doesn't retain one full request body per session
+			// forever. Evict the oldest tracked session once over the cap.
+			l.deltaSessOrder = append(l.deltaSessOrder, sessionID)
+			for len(l.deltaSessOrder) > maxDeltaSessions {
+				old := l.deltaSessOrder[0]
+				l.deltaSessOrder = l.deltaSessOrder[1:]
+				delete(l.lastReqBody, old)
+				delete(l.lastReqID, old)
+			}
 		}
 		l.lastReqBody[sessionID] = body
 		l.lastReqID[sessionID] = requestID
@@ -1471,6 +1487,7 @@ func (l *Logger) Clear() {
 	l.seqNumMap = make(map[string]int)
 	l.lastReqBody = make(map[string]string)
 	l.lastReqID = make(map[string]string)
+	l.deltaSessOrder = nil
 }
 
 // Count returns the number of log entries
@@ -1517,6 +1534,26 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 	reader := bufio.NewReader(rc)
 	count := 0
 
+	// bodyByReqID caches each REQ entry's full body during this load so a
+	// later delta entry (which references prev=<requestID>) can be rehydrated
+	// back to the full request body — keeping the TUI viewer readable.
+	bodyByReqID := make(map[string]string)
+	add := func(entry LogEntry) {
+		if entry.Type == LogTypeReq {
+			if full, ok := reconstructDelta(entry.Body, bodyByReqID); ok {
+				entry.Body = full
+			}
+			if entry.RequestID != "" {
+				bodyByReqID[entry.RequestID] = entry.Body
+			}
+		}
+		if len(l.entries) >= l.maxEntries {
+			l.entries = l.entries[1:]
+		}
+		l.entries = append(l.entries, entry)
+		count++
+	}
+
 	for {
 		// ReadString reads until delimiter, handles any line size
 		line, err := reader.ReadString('\n')
@@ -1527,11 +1564,7 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 					line = strings.TrimSuffix(line, "\n")
 					line = strings.TrimSuffix(line, "\r")
 					if entry, ok := parsePlainLogLine(line); ok {
-						if len(l.entries) >= l.maxEntries {
-							l.entries = l.entries[1:]
-						}
-						l.entries = append(l.entries, entry)
-						count++
+						add(entry)
 					}
 				}
 			}
@@ -1542,16 +1575,50 @@ func (l *Logger) LoadFromFile(filePath string) (int, error) {
 		line = strings.TrimSuffix(line, "\r") // Handle Windows line endings
 
 		if entry, ok := parsePlainLogLine(line); ok {
-			// Ring buffer: remove oldest if at capacity
-			if len(l.entries) >= l.maxEntries {
-				l.entries = l.entries[1:]
-			}
-			l.entries = append(l.entries, entry)
-			count++
+			add(entry)
 		}
 	}
 
 	return count, nil
+}
+
+// reconstructDelta rehydrates a delta-collapsed request body back to its full
+// form. body may be either a normal full body (returned unchanged, ok=false)
+// or a `@delta prev=<id> shared=N tail=M@<tail>` marker, in which case the
+// shared prefix is taken from prior[prev]'s body and concatenated with the
+// tail. Returns ok=false (and the input unchanged) when the marker is absent
+// or the referenced prior body isn't available.
+func reconstructDelta(body string, prior map[string]string) (string, bool) {
+	const pfx = "@delta prev="
+	if !strings.HasPrefix(body, pfx) {
+		return body, false
+	}
+	// Header ends at the second '@' (the first is at index 0).
+	hdrEnd := strings.IndexByte(body[1:], '@')
+	if hdrEnd < 0 {
+		return body, false
+	}
+	hdrEnd++ // adjust for the [1:] offset
+	header := body[len(pfx):hdrEnd]
+	tail := body[hdrEnd+1:]
+
+	// header is "<id> shared=<N> tail=<M>"
+	fields := strings.Fields(header)
+	if len(fields) < 2 {
+		return body, false
+	}
+	prevID := fields[0]
+	var shared int
+	for _, f := range fields[1:] {
+		if strings.HasPrefix(f, "shared=") {
+			shared, _ = strconv.Atoi(strings.TrimPrefix(f, "shared="))
+		}
+	}
+	base, ok := prior[prevID]
+	if !ok || shared < 0 || shared > len(base) {
+		return body, false
+	}
+	return base[:shared] + tail, true
 }
 
 // Regex patterns for parsing log lines
