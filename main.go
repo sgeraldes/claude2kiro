@@ -3896,7 +3896,7 @@ func claudeDesktopPIDs() []int {
 		return nil
 	}
 	var pids []int
-	for _, line := range strings.Fields(string(out)) {
+	for line := range strings.FieldsSeq(string(out)) {
 		if n, err := strconv.Atoi(strings.TrimSpace(line)); err == nil {
 			pids = append(pids, n)
 		}
