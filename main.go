@@ -1615,6 +1615,17 @@ func main() {
 		exportEnvVars()
 	case "claude":
 		setClaude()
+	case "disable", "unconfigure":
+		msg := cmd.UnconfigureCmd()
+		if status, ok := msg.(cmd.StatusMsg); ok {
+			if status.IsError {
+				fmt.Fprintln(os.Stderr, status.Message)
+				os.Exit(1)
+			}
+			fmt.Println(status.Message)
+			return
+		}
+		fmt.Println(msg)
 	case "run":
 		runClaudeWithProxy()
 	case "server":
@@ -2113,6 +2124,58 @@ func removeProxyPortFile() {
 	os.Remove(proxyPortFilePath())
 }
 
+// bedrockEnvPrefixes lists the environment variables that make Claude Code
+// bypass ANTHROPIC_BASE_URL and talk directly to AWS Bedrock / Google Vertex.
+// When any of these are present (common on machines with an AWS SSO profile),
+// Claude Code ignores the local claude2kiro proxy entirely, so the proxy never
+// sees a request (nothing logs to the dashboard) and the user hits a Bedrock
+// IAM 403. We strip them from the child environment before launching Claude.
+var bedrockEnvPrefixes = []string{
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"ANTHROPIC_VERTEX_PROJECT_ID",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"CLOUD_ML_REGION",
+}
+
+// buildClaudeEnv returns the environment for the launched Claude Code process:
+// the current environment with Bedrock/Vertex routing variables removed, plus
+// the proxy overrides appended. This guarantees Claude Code routes through the
+// claude2kiro proxy at baseURL instead of going straight to a cloud provider.
+func buildClaudeEnv(baseURL string) []string {
+	src := os.Environ()
+	env := make([]string, 0, len(src)+4)
+	for _, kv := range src {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if isBedrockRoutingVar(key) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"ANTHROPIC_BASE_URL="+baseURL,
+		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
+		"CLAUDE2KIRO=1",
+		"CLAUDE_CODE_DISABLE_THINKING=1",
+	)
+}
+
+// isBedrockRoutingVar reports whether an env var name is one of the
+// Bedrock/Vertex routing toggles that override ANTHROPIC_BASE_URL.
+func isBedrockRoutingVar(key string) bool {
+	for _, p := range bedrockEnvPrefixes {
+		if key == p {
+			return true
+		}
+	}
+	return false
+}
+
 // readProxyPort reads the port from the proxy port file.
 func readProxyPort() (string, error) {
 	data, err := os.ReadFile(proxyPortFilePath())
@@ -2174,12 +2237,7 @@ func remoteConnect() {
 	// Launch claude pointing at the proxy
 	argv := append([]string{"claude"}, claudeArgs...)
 	attr := &os.ProcAttr{
-		Env: append(os.Environ(),
-			"ANTHROPIC_BASE_URL="+baseURL,
-			"ANTHROPIC_AUTH_TOKEN=claude2kiro",
-			"CLAUDE2KIRO=1",
-			"CLAUDE_CODE_DISABLE_THINKING=1",
-		),
+		Env:   buildClaudeEnv(baseURL),
 		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
 	}
 
@@ -2311,12 +2369,9 @@ func runClaudeWithProxy() {
 	// CLAUDE2KIRO env var signals to statusline scripts that this session uses Kiro proxy.
 	// Disable thinking/adaptive thinking because Kiro doesn't return thinking blocks,
 	// which causes the Anthropic SDK to silently fail when it expects them.
-	claudeCmd.Env = append(os.Environ(),
-		"ANTHROPIC_BASE_URL="+baseURL,
-		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
-		"CLAUDE2KIRO=1",
-		"CLAUDE_CODE_DISABLE_THINKING=1",
-	)
+	// buildClaudeEnv also strips CLAUDE_CODE_USE_BEDROCK / Vertex routing vars so
+	// Claude Code can't bypass the proxy and hit a cloud provider directly.
+	claudeCmd.Env = buildClaudeEnv(baseURL)
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
 	claudeCmd.Stderr = os.Stderr
@@ -2506,6 +2561,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro refresh        - Refresh the access token")
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
 	fmt.Println("  claude2kiro export         - Export environment variables")
+	fmt.Println("  claude2kiro disable        - Remove Claude2Kiro Claude Code/Desktop integrations")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
 	fmt.Println("  claude2kiro desktop             - Ensure proxy is up + launch Claude Desktop (Windows)")
 	fmt.Println("  claude2kiro remote [args...]     - Connect to running proxy (start TUI first)")

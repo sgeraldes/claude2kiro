@@ -619,6 +619,11 @@ func ConfigureClaudeCmd() tea.Msg {
 		batScript := `@echo off
 set ANTHROPIC_BASE_URL=http://localhost:8080
 set ANTHROPIC_API_KEY=claude2kiro
+set CLAUDE_CODE_USE_BEDROCK=
+set CLAUDE_CODE_USE_VERTEX=
+set ANTHROPIC_BEDROCK_BASE_URL=
+set ANTHROPIC_VERTEX_BASE_URL=
+set AWS_BEARER_TOKEN_BEDROCK=
 claude %*
 `
 		if err := os.WriteFile(batPath, []byte(batScript), 0755); err != nil {
@@ -632,6 +637,11 @@ claude %*
 		ps1Path := filepath.Join(binDir, "claude-kiro.ps1")
 		ps1Script := `$env:ANTHROPIC_BASE_URL = "http://localhost:8080"
 $env:ANTHROPIC_API_KEY = "claude2kiro"
+$env:CLAUDE_CODE_USE_BEDROCK = $null
+$env:CLAUDE_CODE_USE_VERTEX = $null
+$env:ANTHROPIC_BEDROCK_BASE_URL = $null
+$env:ANTHROPIC_VERTEX_BASE_URL = $null
+$env:AWS_BEARER_TOKEN_BEDROCK = $null
 claude @args
 `
 		if err := os.WriteFile(ps1Path, []byte(ps1Script), 0755); err != nil {
@@ -664,6 +674,8 @@ claude @args
 		script := `#!/bin/bash
 export ANTHROPIC_BASE_URL=http://localhost:8080
 export ANTHROPIC_API_KEY=claude2kiro
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+unset ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL AWS_BEARER_TOKEN_BEDROCK
 claude "$@"
 `
 		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
@@ -682,103 +694,490 @@ claude "$@"
 	}
 }
 
-// UnconfigureCmd removes Claude2Kiro settings and restores original Claude config
-func UnconfigureCmd() tea.Msg {
+type cleanupPaths struct {
+	homeDir           string
+	appData           string
+	localAppData      string
+	exeDir            string
+	removeWindowsPath bool
+}
+
+func defaultCleanupPaths() (cleanupPaths, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return StatusMsg{
-			Message: fmt.Sprintf("Failed to get home directory: %v", err),
-			IsError: true,
-		}
+		return cleanupPaths{}, err
+	}
+	exeDir := ""
+	if exePath, err := os.Executable(); err == nil {
+		exeDir = filepath.Dir(exePath)
+	}
+	return cleanupPaths{
+		homeDir:           homeDir,
+		appData:           os.Getenv("APPDATA"),
+		localAppData:      os.Getenv("LOCALAPPDATA"),
+		exeDir:            exeDir,
+		removeWindowsPath: true,
+	}, nil
+}
+
+// CleanupClaude2KiroConfig removes persistent Claude Code/Desktop integration
+// files that make Claude continue routing through Claude2Kiro after the proxy
+// has stopped. It preserves unrelated Claude account, plugin, and MCP state.
+func CleanupClaude2KiroConfig() ([]string, error) {
+	paths, err := defaultCleanupPaths()
+	if err != nil {
+		return nil, err
+	}
+	return cleanupClaude2KiroConfig(paths)
+}
+
+func cleanupClaude2KiroConfig(paths cleanupPaths) ([]string, error) {
+	if paths.homeDir == "" {
+		return nil, fmt.Errorf("home directory is required")
 	}
 
 	var actions []string
+	var err error
+	if a, e := cleanupClaudeJSON(paths.homeDir); e != nil {
+		err = e
+	} else {
+		actions = append(actions, a...)
+	}
+	if a, e := cleanupClaudeSettings(paths.homeDir); e != nil && err == nil {
+		err = e
+	} else {
+		actions = append(actions, a...)
+	}
+	if a, e := cleanupClaudePluginRegistries(paths.homeDir); e != nil && err == nil {
+		err = e
+	} else {
+		actions = append(actions, a...)
+	}
+	if a, e := cleanupClaudePluginDirs(paths.homeDir); e != nil && err == nil {
+		err = e
+	} else {
+		actions = append(actions, a...)
+	}
+	if a, e := cleanupLaunchScripts(paths); e != nil && err == nil {
+		err = e
+	} else {
+		actions = append(actions, a...)
+	}
+	if a, e := cleanupClaudeDesktop(paths); e != nil && err == nil {
+		err = e
+	} else {
+		actions = append(actions, a...)
+	}
+	if err != nil {
+		return actions, err
+	}
+	return actions, nil
+}
 
-	// Restore ~/.claude.json from backup or remove Claude2Kiro settings
+func cleanupClaudeJSON(homeDir string) ([]string, error) {
 	claudePath := filepath.Join(homeDir, ".claude.json")
 	backupPath := claudePath + ".backup"
+	var actions []string
 
-	if _, err := os.Stat(backupPath); err == nil {
-		// Backup exists - restore it
-		if err := os.Rename(backupPath, claudePath); err != nil {
-			return StatusMsg{
-				Message: fmt.Sprintf("Failed to restore ~/.claude.json from backup: %v", err),
-				IsError: true,
+	if current, err := readJSONMap(claudePath); err == nil && claudeJSONUsesProxyAccount(current) {
+		if backupData, err := os.ReadFile(backupPath); err == nil {
+			if err := os.WriteFile(claudePath, backupData, 0600); err != nil {
+				return actions, fmt.Errorf("restore %s: %w", claudePath, err)
+			}
+			_ = os.Remove(backupPath)
+			actions = append(actions, "restored .claude.json backup")
+		}
+	}
+
+	cfg, err := readJSONMap(claudePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return actions, nil
+		}
+		return actions, err
+	}
+
+	modified := false
+	if removeKey(cfg, "claude2kiro") {
+		modified = true
+	}
+	if v, ok := cfg["primaryAccountUuid"].(string); ok && v == "claude2kiro-local" {
+		delete(cfg, "primaryAccountUuid")
+		modified = true
+	}
+	if oauth, ok := cfg["oauthAccount"].(map[string]any); ok {
+		if t, ok := oauth["type"].(string); ok && t == "api_key" {
+			delete(cfg, "oauthAccount")
+			modified = true
+		}
+	}
+	if responses, ok := cfg["customApiKeyResponses"].(map[string]any); ok {
+		if approved, ok := responses["approved"].([]any); ok {
+			filtered, changed := removeStrings(approved, "claude2kiro", "kiro2cc")
+			if changed {
+				responses["approved"] = filtered
+				modified = true
 			}
 		}
-		actions = append(actions, "restored ~/.claude.json")
-	} else if data, err := os.ReadFile(claudePath); err == nil {
-		// No backup, but config exists - remove Claude2Kiro settings
-		var config map[string]any
-		if err := json.Unmarshal(data, &config); err == nil {
-			modified := false
-			if _, ok := config["claude2kiro"]; ok {
-				delete(config, "claude2kiro")
-				modified = true
-			}
-			if _, ok := config["oauthAccount"]; ok {
-				delete(config, "oauthAccount")
-				modified = true
-			}
-			if modified {
-				configData, _ := json.MarshalIndent(config, "", "  ")
-				if err := os.WriteFile(claudePath, configData, 0600); err != nil {
-					return StatusMsg{
-						Message: fmt.Sprintf("Failed to update ~/.claude.json: %v", err),
-						IsError: true,
-					}
+	}
+
+	if modified {
+		if err := writeJSONMap(claudePath, cfg, 0600); err != nil {
+			return actions, err
+		}
+		actions = append(actions, "cleaned .claude.json")
+	}
+	return actions, nil
+}
+
+func claudeJSONUsesProxyAccount(cfg map[string]any) bool {
+	if v, ok := cfg["claude2kiro"].(bool); ok && v {
+		return true
+	}
+	if v, ok := cfg["primaryAccountUuid"].(string); ok && v == "claude2kiro-local" {
+		return true
+	}
+	if oauth, ok := cfg["oauthAccount"].(map[string]any); ok {
+		if t, ok := oauth["type"].(string); ok && t == "api_key" {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanupClaudeSettings(homeDir string) ([]string, error) {
+	settingsPath := filepath.Join(homeDir, ".claude", "settings.json")
+	settings, err := readJSONMap(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	modified := false
+	looksProxyConfigured := false
+	if envMap, ok := settings["env"].(map[string]any); ok {
+		looksProxyConfigured = envLooksClaude2Kiro(envMap)
+		if looksProxyConfigured {
+			for _, key := range []string{
+				"CLAUDE_CODE_USE_BEDROCK",
+				"CLAUDE_CODE_USE_VERTEX",
+				"ANTHROPIC_BEDROCK_BASE_URL",
+				"ANTHROPIC_VERTEX_BASE_URL",
+				"ANTHROPIC_VERTEX_PROJECT_ID",
+				"AWS_BEARER_TOKEN_BEDROCK",
+				"CLOUD_ML_REGION",
+				"ANTHROPIC_BASE_URL",
+				"ANTHROPIC_AUTH_TOKEN",
+				"ANTHROPIC_API_KEY",
+				"CLAUDE2KIRO",
+				"CLAUDE_CODE_DISABLE_THINKING",
+			} {
+				if removeKey(envMap, key) {
+					modified = true
 				}
-				actions = append(actions, "removed Claude2Kiro settings from ~/.claude.json")
 			}
+			fakeAWS := false
+			if v, ok := envMap["AWS_ACCESS_KEY_ID"].(string); ok && v == "claude2kiro" {
+				delete(envMap, "AWS_ACCESS_KEY_ID")
+				modified = true
+				fakeAWS = true
+			}
+			if v, ok := envMap["AWS_SECRET_ACCESS_KEY"].(string); ok && v == "secretkey" {
+				delete(envMap, "AWS_SECRET_ACCESS_KEY")
+				modified = true
+				fakeAWS = true
+			}
+			if fakeAWS {
+				if removeKey(envMap, "AWS_REGION") {
+					modified = true
+				}
+			}
+		}
+		if len(envMap) == 0 {
+			delete(settings, "env")
+			modified = true
 		}
 	}
 
-	// Remove launch scripts
+	pluginEnabled := false
+	if enabled, ok := settings["enabledPlugins"].(map[string]any); ok {
+		if removeKey(enabled, "kiro-proxy@claude2kiro") {
+			modified = true
+			pluginEnabled = true
+		}
+	}
+	if model, ok := settings["model"].(string); ok && (looksProxyConfigured || pluginEnabled) && isClaude2KiroModelOverride(model) {
+		delete(settings, "model")
+		modified = true
+	}
+
+	if !modified {
+		return nil, nil
+	}
+	if err := writeJSONMap(settingsPath, settings, 0600); err != nil {
+		return nil, err
+	}
+	return []string{"cleaned Claude Code settings"}, nil
+}
+
+func envLooksClaude2Kiro(envMap map[string]any) bool {
+	for key, value := range envMap {
+		s, _ := value.(string)
+		switch key {
+		case "ANTHROPIC_BASE_URL":
+			if strings.Contains(s, "localhost:8080") || strings.Contains(s, "127.0.0.1:8080") {
+				return true
+			}
+		case "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE2KIRO", "AWS_ACCESS_KEY_ID":
+			if strings.Contains(strings.ToLower(s), "claude2kiro") {
+				return true
+			}
+		case "AWS_SECRET_ACCESS_KEY":
+			if s == "secretkey" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isClaude2KiroModelOverride(model string) bool {
+	lower := strings.ToLower(model)
+	return strings.HasPrefix(lower, "us.anthropic.") ||
+		strings.Contains(lower, "claude-opus-4-8") ||
+		strings.Contains(lower, "claude-sonnet-4-6") ||
+		strings.Contains(lower, "kiro")
+}
+
+func cleanupClaudePluginRegistries(homeDir string) ([]string, error) {
+	var actions []string
+	knownPath := filepath.Join(homeDir, ".claude", "plugins", "known_marketplaces.json")
+	if known, err := readJSONMap(knownPath); err == nil {
+		if removeKey(known, "claude2kiro") {
+			if err := writeJSONMap(knownPath, known, 0600); err != nil {
+				return actions, err
+			}
+			actions = append(actions, "removed claude2kiro marketplace")
+		}
+	} else if !os.IsNotExist(err) {
+		return actions, err
+	}
+
+	installedPath := filepath.Join(homeDir, ".claude", "plugins", "installed_plugins.json")
+	if installed, err := readJSONMap(installedPath); err == nil {
+		if plugins, ok := installed["plugins"].(map[string]any); ok {
+			if removeKey(plugins, "kiro-proxy@claude2kiro") {
+				if err := writeJSONMap(installedPath, installed, 0600); err != nil {
+					return actions, err
+				}
+				actions = append(actions, "removed kiro-proxy plugin")
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return actions, err
+	}
+	return actions, nil
+}
+
+func cleanupClaudePluginDirs(homeDir string) ([]string, error) {
+	var actions []string
+	for _, path := range []string{
+		filepath.Join(homeDir, ".claude", "plugins", "marketplaces", "claude2kiro"),
+		filepath.Join(homeDir, ".claude", "plugins", "cache", "claude2kiro"),
+		filepath.Join(homeDir, ".claude", "plugins", "local", "kiro-proxy"),
+	} {
+		removed, err := removeAllIfExists(path)
+		if err != nil {
+			return actions, err
+		}
+		if removed {
+			actions = append(actions, "removed "+filepath.Base(path))
+		}
+	}
+	return actions, nil
+}
+
+func cleanupLaunchScripts(paths cleanupPaths) ([]string, error) {
+	var actions []string
 	if runtime.GOOS == "windows" {
-		// New location: ~/.claude2kiro/bin
-		binDir := filepath.Join(homeDir, ".claude2kiro", "bin")
-		batPath := filepath.Join(binDir, "claude-kiro.bat")
-		ps1Path := filepath.Join(binDir, "claude-kiro.ps1")
-
-		if err := os.Remove(batPath); err == nil {
-			actions = append(actions, "removed claude-kiro.bat")
-		}
-		if err := os.Remove(ps1Path); err == nil {
-			actions = append(actions, "removed claude-kiro.ps1")
-		}
-
-		// Also check old location (next to executable) for backward compatibility
-		if exePath, err := os.Executable(); err == nil {
-			exeDir := filepath.Dir(exePath)
-			oldBatPath := filepath.Join(exeDir, "claude-kiro.bat")
-			oldPs1Path := filepath.Join(exeDir, "claude-kiro.ps1")
-
-			if err := os.Remove(oldBatPath); err == nil {
-				actions = append(actions, "removed old claude-kiro.bat")
+		binDir := filepath.Join(paths.homeDir, ".claude2kiro", "bin")
+		for _, path := range []string{
+			filepath.Join(binDir, "claude-kiro.bat"),
+			filepath.Join(binDir, "claude-kiro.ps1"),
+			filepath.Join(paths.exeDir, "claude-kiro.bat"),
+			filepath.Join(paths.exeDir, "claude-kiro.ps1"),
+		} {
+			removed, err := removeFileIfExists(path)
+			if err != nil {
+				return actions, err
 			}
-			if err := os.Remove(oldPs1Path); err == nil {
-				actions = append(actions, "removed old claude-kiro.ps1")
+			if removed {
+				actions = append(actions, "removed "+filepath.Base(path))
 			}
 		}
-
-		// Remove binDir from PATH
-		if removed, _ := removeFromWindowsPath(binDir); removed {
-			actions = append(actions, "removed from PATH")
+		if paths.removeWindowsPath {
+			if removed, _ := removeFromWindowsPath(binDir); removed {
+				actions = append(actions, "removed claude-kiro from PATH")
+			}
 		}
-	} else {
-		scriptPath := filepath.Join(homeDir, ".local", "bin", "claude-kiro")
-		if err := os.Remove(scriptPath); err == nil {
-			actions = append(actions, "removed claude-kiro script")
-		}
+		return actions, nil
 	}
 
+	scriptPath := filepath.Join(paths.homeDir, ".local", "bin", "claude-kiro")
+	removed, err := removeFileIfExists(scriptPath)
+	if err != nil {
+		return actions, err
+	}
+	if removed {
+		actions = append(actions, "removed claude-kiro script")
+	}
+	return actions, nil
+}
+
+func cleanupClaudeDesktop(paths cleanupPaths) ([]string, error) {
+	var actions []string
+	if paths.localAppData != "" {
+		configLibrary := filepath.Join(paths.localAppData, "Claude-3p", "configLibrary")
+		if isClaude2KiroDesktopConfig(configLibrary) {
+			removed, err := removeAllIfExists(configLibrary)
+			if err != nil {
+				return actions, err
+			}
+			if removed {
+				actions = append(actions, "removed Claude Desktop gateway config")
+			}
+		}
+	}
+	if paths.appData != "" {
+		shortcut := filepath.Join(paths.appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Claude2Kiro Proxy.lnk")
+		removed, err := removeFileIfExists(shortcut)
+		if err != nil {
+			return actions, err
+		}
+		if removed {
+			actions = append(actions, "removed Claude2Kiro Startup shortcut")
+		}
+	}
+	return actions, nil
+}
+
+func isClaude2KiroDesktopConfig(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	found := false
+	_ = filepath.Walk(path, func(file string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || found {
+			return nil
+		}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil
+		}
+		text := strings.ToLower(string(data))
+		if strings.Contains(text, "claude2kiro") {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func readJSONMap(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = map[string]any{}
+	}
+	return out, nil
+}
+
+func writeJSONMap(path string, value map[string]any, perm os.FileMode) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, perm)
+}
+
+func removeKey(m map[string]any, key string) bool {
+	if _, ok := m[key]; !ok {
+		return false
+	}
+	delete(m, key)
+	return true
+}
+
+func removeStrings(values []any, targets ...string) ([]any, bool) {
+	remove := map[string]bool{}
+	for _, target := range targets {
+		remove[target] = true
+	}
+	filtered := values[:0]
+	changed := false
+	for _, value := range values {
+		if s, ok := value.(string); ok && remove[s] {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered, changed
+}
+
+func removeFileIfExists(path string) (bool, error) {
+	if path == "" {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func removeAllIfExists(path string) (bool, error) {
+	if path == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// UnconfigureCmd removes Claude2Kiro settings and restores normal Claude routing.
+func UnconfigureCmd() tea.Msg {
+	actions, err := CleanupClaude2KiroConfig()
+	if err != nil {
+		return StatusMsg{
+			Message: fmt.Sprintf("Failed to unconfigure Claude2Kiro: %v", err),
+			IsError: true,
+		}
+	}
 	if len(actions) == 0 {
 		return StatusMsg{
 			Message: "Nothing to unconfigure",
 			IsError: false,
 		}
 	}
-
 	return StatusMsg{
 		Message: "Unconfigured: " + strings.Join(actions, ", "),
 		IsError: false,
