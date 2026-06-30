@@ -98,6 +98,11 @@
       if (n >= 1000) return Math.round(n / 1000) + 'K';
       return String(n);
     }
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
 
     function setStatus(ok, msg) {
       document.getElementById('dot').style.background = ok ? 'var(--good)' : 'var(--bad)';
@@ -184,7 +189,7 @@
         var r = await fetch('/v1/models', { cache: 'no-store' });
         var d = await r.json();
         var rows = (d.data || []).map(function (m) {
-          return '<tr><td>' + (m.display_name || m.id) + '</td>' +
+          return '<tr><td>' + esc(m.display_name || m.id) + '</td>' +
                  '<td class="num">' + fmtCtx(m.max_input_tokens) + '</td>' +
                  '<td class="num">' + fmtCtx(m.max_tokens) + '</td></tr>';
         }).join('');

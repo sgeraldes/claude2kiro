@@ -62,8 +62,13 @@ func (r *Recorder) Start() {
 	}
 	r.startOnce.Do(func() {
 		r.load()
-		r.sampleOnce() // capture an immediate point so the chart isn't empty
-		go r.loop()
+		// Sample off the calling goroutine: read() is a network call, and Start
+		// runs inline in buildServerMux (TUI/server/run), so a slow Kiro API must
+		// not delay server startup. Loaded file history already fills the chart.
+		go func() {
+			r.sampleOnce()
+			r.loop()
+		}()
 	})
 }
 
@@ -179,5 +184,7 @@ func (r *Recorder) persist(snaps []Snapshot) {
 	}
 	w.Flush()
 	f.Close()
-	_ = os.Rename(tmp, r.path)
+	if err := os.Rename(tmp, r.path); err != nil {
+		os.Remove(tmp) // don't leave the temp file behind (e.g. Windows rename contention)
+	}
 }
