@@ -174,6 +174,25 @@ func TestParseEvents_TruncatedFrameDoesNotPanic(t *testing.T) {
 	_ = ParseEvents(truncated) // success = no panic
 }
 
+func TestParseMeteringEvents(t *testing.T) {
+	events := ParseMeteringEvents(frames(
+		`{"content":"Hello"}`,
+		`{"unit":"credit","unitPlural":"credits","usage":0.798734461227195}`,
+		`{"contextUsagePercentage":23.24}`,
+		`{"unit":"token","usage":12}`,
+	))
+
+	if len(events) != 1 {
+		t.Fatalf("ParseMeteringEvents returned %d events, want 1", len(events))
+	}
+	if events[0].Unit != "credit" || events[0].UnitPlural != "credits" {
+		t.Errorf("metering unit fields = %+v, want credit/credits", events[0])
+	}
+	if events[0].Usage != 0.798734461227195 {
+		t.Errorf("usage = %v, want 0.798734461227195", events[0].Usage)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

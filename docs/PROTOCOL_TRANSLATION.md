@@ -60,13 +60,24 @@ data: {"type": "message_stop"}
     "currentMessage": {
       "userInputMessage": {
         "content": "Hello",
-        "userInputMessageContext": {...}
+        "userInputMessageContext": {
+          "envState": {
+            "operatingSystem": "windows",
+            "currentWorkingDirectory": "G:\\Code\\Claude2Kiro"
+          },
+          "tools": [...]
+        }
       }
     },
     "chatTriggerType": "MANUAL",
+    "agentTaskType": "vibe",
+    "conversationId": "session-derived-uuid",
     "customizationArn": "arn:aws:codewhisperer:..."
   },
-  "profileArn": "arn:aws:codewhisperer:us-east-1:..."
+  "profileArn": "arn:aws:codewhisperer:us-east-1:...",
+  "additionalModelRequestFields": {
+    "output_config": {"effort": "medium"}
+  }
 }
 ```
 
@@ -103,7 +114,9 @@ data: {"type": "message_stop"}
 2. Convert to CodeWhisperer conversation history
 3. Map model names (e.g., `claude-sonnet-4-20250514` → `CLAUDE_SONNET_4_20250514_V1_0`)
 4. Transform tool definitions to CodeWhisperer format
-5. Add required AWS metadata (profileArn, customizationArn)
+5. Add current Kiro protocol fields (`agentTaskType`, native `output_config.effort`,
+   and `envState` when Claude Code sends an `<env>` system block)
+6. Add required AWS metadata (profileArn, customizationArn)
 
 ### Response Translation (parser/sse_parser.go)
 
@@ -119,30 +132,56 @@ data: {"type": "message_stop"}
 
 ## Credit-Efficiency Optimizations
 
-Credits scale with how many tokens the backend ingests, so the proxy mirrors two
-behaviors of the real Kiro/Amazon Q IDE to avoid re-billing context every turn:
+Credits scale with how many tokens the backend ingests, so the proxy mirrors the
+current Kiro IDE session identifier behavior and keeps protocol-level cache
+markers where Claude Code supplies them. Default behavior remains conservative:
+stable conversation IDs are on, while history/tool shrinking stays off until
+benchmarks prove the trade-off is safe.
 
-- **Stable conversationId per session (OPT-IN, default OFF).** The real IDE reuses a
-  single server-assigned `conversationId` for the lifetime of a chat session, letting
-  the backend retain context server-side. When enabled via
-  `advanced.stable_conversation_id`, `buildCodeWhispererRequest` hashes the per-session
-  UUID Claude Code sends in `metadata.user_id` (`..._session_<uuid>`) into a
-  deterministic, well-formed `conversationId` (`stableConversationID`), so all turns of
-  one session map to the same id. **It is off by default** because the proxy still sends
-  the full history array on every request and the backend's server-side retention is
-  **unverified**: if the backend DOES retain context per `conversationId`, pairing that
-  with full-history sending would *double* the ingested context (more credits, not
-  fewer), and Claude Code's `/clear` reuses the same session UUID, so two logical
-  conversations could collapse onto one `conversationId`. With the flag off — or with no
-  session key (non-Claude-Code clients / missing metadata) even when on — it sends a
-  fresh random UUID per request, preserving the original behavior.
+- **Stable conversationId per session (default ON).** Current Kiro IDE uses its
+  `chatSessionId` as the `conversationId` and reuses it across turns while still sending
+  previous turns in `history`. Claude2Kiro mirrors that by hashing the per-session UUID
+  Claude Code sends in `metadata.user_id` (current builds use a JSON string with
+  `session_id`; older builds used `..._session_<uuid>`) into a deterministic,
+  well-formed `conversationId` (`stableConversationID`), so all turns of one Claude Code
+  session map to the same backend conversation id. Disable
+  `advanced.stable_conversation_id` to restore the older proxy behavior of a fresh
+  random UUID per request, or when a client sends no session UUID metadata.
 - **Tool-level `cache_control` → Kiro `cachePoint`.** When Claude Code marks a tool
   with Anthropic `cache_control`, the proxy emits a sibling `{"cachePoint":{"type":"default"}}`
-  entry in the CodeWhisperer `tools` array immediately after that tool, marking a
-  caching boundary so the backend can reuse the preceding tool definitions rather
-  than re-ingesting them. The total emitted entries (tool entries + cachePoint entries)
-  are capped at the tool-count limit (`network.max_tools_per_request`, default 85) so
-  cachePoints can't push the array past the backend's ~90-tool / ~260KB body limit.
+  entry in the CodeWhisperer `tools` array immediately after that tool. The current Kiro
+  protocol SDK supports `cachePoint`, but installed Kiro IDE request-builder code does
+  not appear to add it in the q-developer-converse path; treat this as a compatibility
+  optimization for Claude-provided cache boundaries. The total emitted entries (tool
+  entries + cachePoint entries) are capped at the tool-count limit
+  (`network.max_tools_per_request`, default 85) so cachePoints cannot push the array past
+  the backend's ~90-tool / ~260KB body limit.
+- **Native effort passthrough.** Claude Code `output_config.effort` or enabled
+  `thinking` is translated to Kiro's
+  `additionalModelRequestFields.output_config.effort` for models that advertise an
+  effort enum. Unsupported or absent effort is omitted.
+- **Environment state passthrough.** Claude Code's `<env>` system block is parsed for
+  working directory and platform, then attached to the current message as
+  `envState`. This is protocol parity with current Kiro clients, not a direct token
+  saving feature.
+- **Metering event logging.** Kiro binary `meteringEvent` frames with `unit: credit`
+  are parsed separately from Claude-facing SSE conversion and logged as
+  `Kiro metering: ...`, so benchmark runs can compare exact per-response credit usage
+  when the backend sends it.
+- **Experimental request diet settings (default OFF).** The TUI exposes:
+  `advanced.history_mode` (`full`, `recent`, `current_only`),
+  `advanced.history_recent_turns`, `advanced.tool_mode` (`full`, `compact`,
+  `none_text`), `advanced.tool_compact_max_chars`, and
+  `advanced.aggressive_cache_points`. These can reduce request size for controlled
+  tests, but they can remove context or tools Claude Code expects, so defaults preserve
+  full history and full tools. History trimming remains protocol-aware: if a kept
+  current or historical `tool_result` references a prior assistant `tool_use`, the
+  proxy keeps the minimal matching user/assistant tool-use pair to avoid backend
+  `TOOL_USE_RESULT_MISMATCH` errors.
+- **Runtime endpoint status.** The helper `kiroRuntimeEndpoint(region)` documents the
+  current Kiro runtime host shape (`https://runtime.<region>.kiro.dev/`). The proxy
+  still defaults to the existing CodeWhisperer endpoint until local captures confirm
+  the exact current Kiro CLI header/signing requirements for the runtime endpoint.
 
 ## Why This Matters
 

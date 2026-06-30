@@ -36,6 +36,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/models"
@@ -198,14 +199,16 @@ type HistoryAssistantMessage struct {
 
 // AnthropicRequest represents the Anthropic API request structure
 type AnthropicRequest struct {
-	Model       string                    `json:"model"`
-	MaxTokens   int                       `json:"max_tokens"`
-	Messages    []AnthropicRequestMessage `json:"messages"`
-	System      []AnthropicSystemMessage  `json:"system,omitempty"`
-	Tools       []AnthropicTool           `json:"tools,omitempty"`
-	Stream      bool                      `json:"stream"`
-	Temperature *float64                  `json:"temperature,omitempty"`
-	Metadata    map[string]any            `json:"metadata,omitempty"`
+	Model        string                    `json:"model"`
+	MaxTokens    int                       `json:"max_tokens"`
+	Messages     []AnthropicRequestMessage `json:"messages"`
+	System       []AnthropicSystemMessage  `json:"system,omitempty"`
+	Tools        []AnthropicTool           `json:"tools,omitempty"`
+	Stream       bool                      `json:"stream"`
+	Temperature  *float64                  `json:"temperature,omitempty"`
+	Metadata     map[string]any            `json:"metadata,omitempty"`
+	Thinking     *AnthropicThinking        `json:"thinking,omitempty"`
+	OutputConfig *AnthropicOutputConfig    `json:"output_config,omitempty"`
 }
 
 // CapturedSSEEvent represents a captured SSE event for comparison mode
@@ -243,6 +246,19 @@ type AnthropicRequestMessage struct {
 type AnthropicSystemMessage struct {
 	Type string `json:"type"`
 	Text string `json:"text"` // Can be string or []ContentBlock
+}
+
+// AnthropicThinking captures Claude Code's optional thinking block. Kiro CLI
+// 2.5.1 forwards reasoning intent natively as output_config.effort, so the proxy
+// only needs the enabled/disabled signal and ignores token budgets.
+type AnthropicThinking struct {
+	Type         string `json:"type,omitempty"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+// AnthropicOutputConfig captures Claude Code's native reasoning effort request.
+type AnthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // ContentBlock represents the message content block structure
@@ -335,6 +351,78 @@ func getMessageContent(content any) string {
 		return strings.Join(texts, "\n")
 	default:
 		// Unknown type - return empty instead of placeholder
+		return ""
+	}
+}
+
+func getMessageContentForToolMode(content any, toolMode string) string {
+	if toolMode != "none_text" {
+		return getMessageContent(content)
+	}
+	return getMessageContentWithToolText(content)
+}
+
+func getMessageContentWithToolText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var texts []string
+		for _, block := range v {
+			m, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch blockType, _ := m["type"].(string); blockType {
+			case "text":
+				if textVal, ok := m["text"].(string); ok {
+					texts = append(texts, textVal)
+				}
+			case "tool_use":
+				name, _ := m["name"].(string)
+				id, _ := m["id"].(string)
+				input := ""
+				if raw, ok := m["input"]; ok {
+					if b, err := jsonStr.Marshal(raw); err == nil {
+						input = string(b)
+					}
+				}
+				if name != "" || id != "" {
+					if input != "" {
+						texts = append(texts, fmt.Sprintf("[Tool: %s (%s)]\n%s", name, id, input))
+					} else {
+						texts = append(texts, fmt.Sprintf("[Tool: %s (%s)]", name, id))
+					}
+				}
+			case "tool_result":
+				id, _ := m["tool_use_id"].(string)
+				resultText := toolResultText(m["content"])
+				if id != "" || resultText != "" {
+					texts = append(texts, fmt.Sprintf("[Tool Result (%s)]\n%s", id, resultText))
+				}
+			}
+		}
+		return strings.Join(texts, "\n")
+	default:
+		return ""
+	}
+}
+
+func toolResultText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var texts []string
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				if textVal, ok := m["text"].(string); ok {
+					texts = append(texts, textVal)
+				}
+			}
+		}
+		return strings.Join(texts, "\n")
+	default:
 		return ""
 	}
 }
@@ -465,6 +553,7 @@ type ImageBlock struct {
 type CodeWhispererRequest struct {
 	ConversationState struct {
 		ChatTriggerType string `json:"chatTriggerType"`
+		AgentTaskType   string `json:"agentTaskType,omitempty"`
 		ConversationId  string `json:"conversationId"`
 		CurrentMessage  struct {
 			UserInputMessage struct {
@@ -473,6 +562,7 @@ type CodeWhispererRequest struct {
 				Origin                  string       `json:"origin"`
 				Images                  []ImageBlock `json:"images,omitempty"`
 				UserInputMessageContext struct {
+					EnvState    *EnvState           `json:"envState,omitempty"`
 					ToolResults []ToolResult        `json:"toolResults,omitempty"`
 					Tools       []CodeWhispererTool `json:"tools,omitempty"`
 				} `json:"userInputMessageContext"`
@@ -480,7 +570,24 @@ type CodeWhispererRequest struct {
 		} `json:"currentMessage"`
 		History []any `json:"history"`
 	} `json:"conversationState"`
-	ProfileArn string `json:"profileArn,omitempty"`
+	ProfileArn                   string                        `json:"profileArn,omitempty"`
+	AdditionalModelRequestFields *AdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
+}
+
+// AdditionalModelRequestFields carries model-specific options in the current
+// Kiro CLI wire format. Today that is only output_config.effort.
+type AdditionalModelRequestFields struct {
+	OutputConfig *OutputConfig `json:"output_config,omitempty"`
+}
+
+type OutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// EnvState describes the client environment attached to the current message.
+type EnvState struct {
+	OperatingSystem         string `json:"operatingSystem,omitempty"`
+	CurrentWorkingDirectory string `json:"currentWorkingDirectory,omitempty"`
 }
 
 // CodeWhispererEvent represents the CodeWhisperer event response
@@ -677,6 +784,33 @@ func staticModelList() []models.KiroModel {
 // model list (10-minute TTL) and serves stale data on fetch failure so model
 // resolution on the request path never breaks.
 var modelCatalog = models.NewCatalog(10*time.Minute, fetchKiroModels)
+
+// creditHistoryFilePath returns ~/.claude2kiro/credit-history.jsonl.
+func creditHistoryFilePath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude2kiro", "credit-history.jsonl")
+}
+
+// creditRecorder samples Kiro credit usage every 15 minutes and keeps 30 days of
+// history so the web dashboard can chart usage, burn rate, and projected runout.
+var creditRecorder = creditshist.NewRecorder(
+	creditHistoryFilePath(),
+	15*time.Minute,
+	30*24*time.Hour,
+	func() creditshist.Reading {
+		info := cmd.GetCreditsInfo()
+		return creditshist.Reading{
+			Used:      info.CreditsUsed,
+			Limit:     info.CreditsLimit,
+			Remaining: info.CreditsRemaining,
+			Plan:      info.SubscriptionName,
+			Err:       info.Error,
+		}
+	},
+)
 
 // fetchKiroModels retrieves the current model list from CodeWhisperer using the
 // saved auth token and configured endpoint.
@@ -896,18 +1030,280 @@ func uuidFromBytes(b []byte) string {
 // of the same client session, mirroring the real Kiro/Amazon Q IDE (which reuses
 // the server-assigned conversationId for the lifetime of a chat session).
 //
-// Claude Code sends a per-session UUID inside metadata.user_id
-// (".._session_<uuid>"); we hash it to a deterministic, well-formed UUID so the
-// same session always maps to the same conversationId, letting the Kiro backend
-// reuse server-side context keyed by conversationId instead of treating every
-// turn as a new conversation. With no session key (non-Claude-Code clients,
-// missing metadata) it falls back to a fresh random UUID — preserving prior behavior.
+// Claude Code sends a per-session UUID inside metadata.user_id; current builds
+// use a JSON string with a session_id field, while older builds used
+// ".._session_<uuid>". We hash it to a deterministic, well-formed UUID so the
+// same session always maps to the same conversationId. With no session key
+// (non-Claude-Code clients, missing metadata) it falls back to a fresh random UUID.
 func stableConversationID(sessionKey string) string {
 	if sessionKey == "" {
 		return generateUUID()
 	}
 	sum := sha256.Sum256([]byte("claude2kiro-conv:" + sessionKey))
 	return uuidFromBytes(sum[:])
+}
+
+func kiroRuntimeEndpoint(region string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = "us-east-1"
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
+}
+
+const defaultNativeEffort = "medium"
+
+var nativeEffortRank = map[string]int{
+	"low":    0,
+	"medium": 1,
+	"high":   2,
+	"xhigh":  3,
+	"max":    4,
+}
+
+var nativeEffortEnums = map[string][]string{
+	"claude-opus-4.8":      {"low", "medium", "high", "xhigh", "max"},
+	"claude-opus-4.7":      {"low", "medium", "high", "xhigh", "max"},
+	"claude-opus-4.6":      {"low", "medium", "high", "max"},
+	"claude-sonnet-4.6":    {"low", "medium", "high", "max"},
+	"claude-opus-4.6-1m":   {"low", "medium", "high", "max"},
+	"claude-sonnet-4.6-1m": {"low", "medium", "high", "max"},
+}
+
+func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string {
+	requested := ""
+	if anthropicReq.OutputConfig != nil {
+		requested = strings.ToLower(strings.TrimSpace(anthropicReq.OutputConfig.Effort))
+	}
+	if requested == "" && isThinkingEnabled(anthropicReq) {
+		requested = defaultNativeEffort
+	}
+	if requested == "" {
+		return ""
+	}
+	if _, ok := nativeEffortRank[requested]; !ok {
+		return ""
+	}
+	allowed, ok := nativeEffortEnums[kiroModel]
+	if !ok || len(allowed) == 0 {
+		return ""
+	}
+	if slices.Contains(allowed, requested) {
+		return requested
+	}
+	return allowed[len(allowed)-1]
+}
+
+func isThinkingEnabled(anthropicReq AnthropicRequest) bool {
+	if anthropicReq.Thinking != nil && strings.EqualFold(anthropicReq.Thinking.Type, "enabled") {
+		return true
+	}
+	model := strings.ToLower(anthropicReq.Model)
+	return strings.Contains(model, "[1m]") || strings.Contains(model, "context-1m")
+}
+
+var (
+	envBlockRe      = regexp.MustCompile(`(?s)<env>(.*?)</env>`)
+	envWorkingDirRe = regexp.MustCompile(`(?m)^Working directory:\s*(.+?)\s*$`)
+	envPlatformRe   = regexp.MustCompile(`(?m)^Platform:\s*(.+?)\s*$`)
+)
+
+func parseEnvState(system []AnthropicSystemMessage) *EnvState {
+	if len(system) == 0 {
+		return nil
+	}
+	var text strings.Builder
+	for _, msg := range system {
+		if msg.Text == "" {
+			continue
+		}
+		if text.Len() > 0 {
+			text.WriteByte('\n')
+		}
+		text.WriteString(msg.Text)
+	}
+	m := envBlockRe.FindStringSubmatch(text.String())
+	if m == nil {
+		return nil
+	}
+	block := m[1]
+	env := &EnvState{}
+	if wd := envWorkingDirRe.FindStringSubmatch(block); wd != nil {
+		env.CurrentWorkingDirectory = strings.TrimSpace(wd[1])
+	}
+	if platform := envPlatformRe.FindStringSubmatch(block); platform != nil {
+		env.OperatingSystem = normalizeEnvPlatform(strings.TrimSpace(platform[1]))
+	}
+	if env.CurrentWorkingDirectory == "" && env.OperatingSystem == "" {
+		return nil
+	}
+	return env
+}
+
+func normalizeEnvPlatform(platform string) string {
+	switch platform {
+	case "darwin":
+		return "macos"
+	case "win32", "windows":
+		return "windows"
+	default:
+		return platform
+	}
+}
+
+func applyHistoryMode(history []any, advanced config.AdvancedConfig) []any {
+	return applyHistoryModeWithToolResultProtection(history, advanced, nil)
+}
+
+func applyHistoryModeWithToolResultProtection(history []any, advanced config.AdvancedConfig, currentToolResults []ToolResult) []any {
+	keep := historyKeepMask(history, advanced)
+	markToolResultHistory(keep, history, currentToolResults)
+	return historyFromKeepMask(history, keep)
+}
+
+func historyKeepMask(history []any, advanced config.AdvancedConfig) []bool {
+	keep := make([]bool, len(history))
+	switch advanced.HistoryMode {
+	case "current_only":
+		return keep
+	case "recent":
+		start := recentHistoryStartIndex(history, advanced.HistoryRecentTurns)
+		for i := start; i < len(history); i++ {
+			keep[i] = true
+		}
+	default:
+		for i := range history {
+			keep[i] = true
+		}
+	}
+	return keep
+}
+
+func recentHistoryEntries(history []any, turns int) []any {
+	start := recentHistoryStartIndex(history, turns)
+	if start >= len(history) {
+		return nil
+	}
+	return append([]any(nil), history[start:]...)
+}
+
+func recentHistoryStartIndex(history []any, turns int) int {
+	if turns <= 0 || len(history) == 0 {
+		return len(history)
+	}
+	keep := turns * 2
+	if keep >= len(history) {
+		return 0
+	}
+	start := len(history) - keep
+	for start < len(history) {
+		if _, ok := history[start].(HistoryUserMessage); ok {
+			break
+		}
+		start++
+	}
+	return start
+}
+
+func markToolResultHistory(keep []bool, history []any, currentToolResults []ToolResult) {
+	required := make(map[string]struct{})
+	addRequiredToolResultIDs(required, currentToolResults)
+
+	for {
+		before := len(required)
+		for i, entry := range history {
+			if keep[i] {
+				addRequiredToolResultIDs(required, historyUserToolResults(entry))
+			}
+		}
+		if len(required) == 0 {
+			return
+		}
+
+		changed := false
+		for i, entry := range history {
+			assistant, ok := entry.(HistoryAssistantMessage)
+			if !ok || !assistantHasRequiredToolUse(assistant, required) {
+				continue
+			}
+			start := i
+			if i > 0 {
+				if _, ok := history[i-1].(HistoryUserMessage); ok {
+					start = i - 1
+				}
+			}
+			for j := start; j <= i; j++ {
+				if !keep[j] {
+					keep[j] = true
+					changed = true
+				}
+			}
+		}
+		if !changed && len(required) == before {
+			return
+		}
+	}
+}
+
+func addRequiredToolResultIDs(required map[string]struct{}, results []ToolResult) {
+	for _, result := range results {
+		if result.ToolUseId != "" {
+			required[result.ToolUseId] = struct{}{}
+		}
+	}
+}
+
+func historyUserToolResults(entry any) []ToolResult {
+	user, ok := entry.(HistoryUserMessage)
+	if !ok || user.UserInputMessage.UserInputMessageContext == nil {
+		return nil
+	}
+	return user.UserInputMessage.UserInputMessageContext.ToolResults
+}
+
+func assistantHasRequiredToolUse(assistant HistoryAssistantMessage, required map[string]struct{}) bool {
+	for _, raw := range assistant.AssistantResponseMessage.ToolUses {
+		if _, ok := required[historyToolUseID(raw)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func historyToolUseID(raw any) string {
+	switch toolUse := raw.(type) {
+	case HistoryToolUse:
+		return toolUse.ToolUseId
+	case *HistoryToolUse:
+		if toolUse != nil {
+			return toolUse.ToolUseId
+		}
+	case map[string]any:
+		if id, ok := toolUse["toolUseId"].(string); ok {
+			return id
+		}
+		if id, ok := toolUse["tool_use_id"].(string); ok {
+			return id
+		}
+	}
+	return ""
+}
+
+func historyFromKeepMask(history []any, keep []bool) []any {
+	var selected []any
+	for i, entry := range history {
+		if keep[i] {
+			selected = append(selected, entry)
+		}
+	}
+	return selected
+}
+
+func compactToolDescription(desc string, maxChars int) string {
+	if maxChars <= 0 || len(desc) <= maxChars {
+		return desc
+	}
+	return desc[:maxChars]
 }
 
 // extractImagesFromContent extracts images from Anthropic message content
@@ -1140,6 +1536,61 @@ func restoreToolNames(events []parser.SSEEvent, nameMap map[string]string) {
 	}
 }
 
+func formatMeteringUsage(events []parser.MeteringEvent) string {
+	if len(events) == 0 {
+		return ""
+	}
+	total := 0.0
+	for _, event := range events {
+		total += event.Usage
+	}
+	if len(events) == 1 {
+		unit := events[0].UnitPlural
+		if unit == "" {
+			unit = events[0].Unit
+		}
+		return fmt.Sprintf("Kiro metering: %.6g %s", total, unit)
+	}
+	return fmt.Sprintf("Kiro metering: %.6g credits across %d events", total, len(events))
+}
+
+func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config.Config) string {
+	advanced := config.Default().Advanced
+	if cfg != nil {
+		advanced = cfg.Advanced
+	}
+	historyMode := advanced.HistoryMode
+	if historyMode == "" {
+		historyMode = "full"
+	}
+	toolMode := advanced.ToolMode
+	if toolMode == "" {
+		toolMode = "full"
+	}
+
+	current := cwReq.ConversationState.CurrentMessage.UserInputMessage
+	context := current.UserInputMessageContext
+	convID := cwReq.ConversationState.ConversationId
+	if len(convID) > 8 {
+		convID = convID[:8]
+	}
+
+	return fmt.Sprintf(
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v",
+		convID,
+		current.ModelId,
+		reqBytes,
+		reqBytes/4,
+		len(cwReq.ConversationState.History),
+		len(context.Tools),
+		len(context.ToolResults),
+		len(current.Content),
+		historyMode,
+		toolMode,
+		advanced.AggressiveCachePoints,
+	)
+}
+
 // consumerProfileArn is Kiro's shared CodeWhisperer profile for individual
 // (social-auth) subscriptions: GitHub / Google / Builder ID. IdC/Enterprise
 // users must use their own account-specific profile instead.
@@ -1292,28 +1743,40 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		cwReq.ProfileArn = ""
 	}
 	cfg := config.Get()
+	kiroModel := getKiroModelID(anthropicReq.Model)
+	historyMode := cfg.Advanced.HistoryMode
+	if historyMode == "" {
+		historyMode = "full"
+	}
+	toolMode := cfg.Advanced.ToolMode
+	if toolMode == "" {
+		toolMode = "full"
+	}
 	cwReq.ConversationState.ChatTriggerType = "MANUAL"
+	cwReq.ConversationState.AgentTaskType = "vibe"
 	// conversationId selection.
 	//
-	// By DEFAULT we send a fresh random UUID per request (original behavior): the
-	// proxy always re-sends the full history array, so each request is fully
-	// self-contained.
-	//
-	// OPT-IN (cfg.Advanced.StableConversationID): derive a STABLE conversationId
-	// from the client session (Claude Code sends a per-session UUID in
-	// metadata.user_id) so a backend that retains context server-side per
-	// conversationId can reuse it across turns. This is off by default because the
-	// backend's server-side retention is unverified — if it DOES retain, pairing it
-	// with our full-history sending would double the ingested context (more credits,
-	// not fewer), and Claude Code's /clear reuses the same session UUID, so two
-	// logical conversations could collapse onto one conversationId.
+	// By default, derive a stable conversationId from Claude Code's per-session
+	// UUID in metadata.user_id. Current Kiro IDE uses its chatSessionId as the
+	// conversationId and reuses it across turns while still sending prior turns in
+	// history. Users can disable this for the older proxy behavior of one fresh
+	// random UUID per request.
 	if _, sessionKey := extractSessionID(anthropicReq.Metadata); cfg.Advanced.StableConversationID && sessionKey != "" {
 		cwReq.ConversationState.ConversationId = stableConversationID(sessionKey)
 	} else {
 		cwReq.ConversationState.ConversationId = generateUUID()
 	}
-	cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = getMessageContent(anthropicReq.Messages[len(anthropicReq.Messages)-1].Content)
-	cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
+	if effort := resolveNativeEffort(kiroModel, anthropicReq); effort != "" {
+		cwReq.AdditionalModelRequestFields = &AdditionalModelRequestFields{
+			OutputConfig: &OutputConfig{Effort: effort},
+		}
+	}
+	if envState := parseEnvState(anthropicReq.System); envState != nil {
+		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.EnvState = envState
+	}
+
+	cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = getMessageContentForToolMode(anthropicReq.Messages[len(anthropicReq.Messages)-1].Content, toolMode)
+	cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = kiroModel
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "AI_EDITOR"
 	// Process tools information
 	// CodeWhisperer has limits: ~10KB per tool description, ~90 tools max (~260KB body limit)
@@ -1322,7 +1785,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	if maxTools < 1 {
 		maxTools = 85
 	}
-	if len(anthropicReq.Tools) > 0 {
+	if len(anthropicReq.Tools) > 0 && toolMode != "none_text" {
 		var tools []CodeWhispererTool
 		toolsToProcess := anthropicReq.Tools
 		if len(toolsToProcess) > maxTools {
@@ -1334,6 +1797,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			desc := tool.Description
 			if len(desc) > maxToolDescLength {
 				desc = desc[:maxToolDescLength] + "...(truncated)"
+			}
+			if toolMode == "compact" {
+				desc = compactToolDescription(desc, cfg.Advanced.ToolCompactMaxChars)
 			}
 			// Clean the input schema: remove fields that Kiro/CodeWhisperer rejects
 			// ($schema, title, $defs are JSON Schema meta-fields not supported by CW)
@@ -1361,7 +1827,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			// after a tool that carried a cache breakpoint, so the backend can
 			// cache the preceding tool definitions instead of re-ingesting them.
 			// Only add it if there's still room under the limit.
-			if tool.CacheControl != nil && len(tools) < maxTools {
+			if (tool.CacheControl != nil || cfg.Advanced.AggressiveCachePoints) && len(tools) < maxTools {
 				tools = append(tools, CodeWhispererTool{CachePoint: &CachePoint{Type: "default"}})
 			}
 		}
@@ -1369,6 +1835,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	}
 
 	// Extract images and tool_results from the current message
+	var currentToolResults []ToolResult
 	if len(anthropicReq.Messages) > 0 {
 		lastMsg := anthropicReq.Messages[len(anthropicReq.Messages)-1]
 		images := extractImagesFromContent(lastMsg.Content)
@@ -1376,9 +1843,12 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			cwReq.ConversationState.CurrentMessage.UserInputMessage.Images = images
 		}
 		// If the current message contains tool_result blocks, extract them
-		toolResults := getMessageToolResults(lastMsg.Content)
-		if len(toolResults) > 0 {
-			cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults = toolResults
+		if toolMode != "none_text" {
+			toolResults := getMessageToolResults(lastMsg.Content)
+			if len(toolResults) > 0 {
+				currentToolResults = toolResults
+				cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults = toolResults
+			}
 		}
 	}
 
@@ -1397,7 +1867,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 			for _, sysMsg := range anthropicReq.System {
 				userMsg := HistoryUserMessage{}
 				userMsg.UserInputMessage.Content = sysMsg.Text
-				userMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
+				userMsg.UserInputMessage.ModelId = kiroModel
 				userMsg.UserInputMessage.Origin = "AI_EDITOR"
 				history = append(history, userMsg)
 				history = append(history, assistantDefaultMsg)
@@ -1419,7 +1889,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		// adjacent, so an assistant tool_use is never dropped.
 		defaultUserMsg := HistoryUserMessage{}
 		defaultUserMsg.UserInputMessage.Content = "Continue."
-		defaultUserMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
+		defaultUserMsg.UserInputMessage.ModelId = kiroModel
 		defaultUserMsg.UserInputMessage.Origin = "AI_EDITOR"
 
 		lastRole := ""
@@ -1445,10 +1915,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 
 			if msg.Role == "assistant" {
 				assistantMsg := HistoryAssistantMessage{}
-				assistantMsg.AssistantResponseMessage.Content = sanitizeHistoryContent(getMessageContent(msg.Content))
+				assistantMsg.AssistantResponseMessage.Content = sanitizeHistoryContent(getMessageContentForToolMode(msg.Content, toolMode))
 
 				toolUses := getMessageToolUses(msg.Content)
-				if len(toolUses) > 0 {
+				if toolMode != "none_text" && len(toolUses) > 0 {
 					tuAny := make([]any, len(toolUses))
 					for j, tu := range toolUses {
 						tuAny[j] = tu
@@ -1463,19 +1933,23 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 
 			// "user", "system", or any other role -> treated as a user turn.
 			userMsg := HistoryUserMessage{}
-			userMsg.UserInputMessage.Content = sanitizeHistoryContent(getMessageContent(msg.Content))
-			userMsg.UserInputMessage.ModelId = getKiroModelID(anthropicReq.Model)
+			userMsg.UserInputMessage.Content = sanitizeHistoryContent(getMessageContentForToolMode(msg.Content, toolMode))
+			userMsg.UserInputMessage.ModelId = kiroModel
 			userMsg.UserInputMessage.Origin = "AI_EDITOR"
 
-			if toolResults := getMessageToolResults(msg.Content); len(toolResults) > 0 {
-				userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserContext{
-					ToolResults: toolResults,
+			if toolMode != "none_text" {
+				if toolResults := getMessageToolResults(msg.Content); len(toolResults) > 0 {
+					userMsg.UserInputMessage.UserInputMessageContext = &HistoryUserContext{
+						ToolResults: toolResults,
+					}
 				}
 			}
 			emit("user", userMsg)
 		}
 
-		cwReq.ConversationState.History = history
+		cfgCopy := cfg.Advanced
+		cfgCopy.HistoryMode = historyMode
+		cwReq.ConversationState.History = applyHistoryModeWithToolResultProtection(history, cfgCopy, currentToolResults)
 	}
 
 	return cwReq
@@ -1587,6 +2061,17 @@ func main() {
 		exportEnvVars()
 	case "claude":
 		setClaude()
+	case "disable", "unconfigure":
+		msg := cmd.UnconfigureCmd()
+		if status, ok := msg.(cmd.StatusMsg); ok {
+			if status.IsError {
+				fmt.Fprintln(os.Stderr, status.Message)
+				os.Exit(1)
+			}
+			fmt.Println(status.Message)
+			return
+		}
+		fmt.Println(msg)
 	case "run":
 		runClaudeWithProxy()
 	case "server":
@@ -2085,6 +2570,58 @@ func removeProxyPortFile() {
 	os.Remove(proxyPortFilePath())
 }
 
+// bedrockEnvPrefixes lists the environment variables that make Claude Code
+// bypass ANTHROPIC_BASE_URL and talk directly to AWS Bedrock / Google Vertex.
+// When any of these are present (common on machines with an AWS SSO profile),
+// Claude Code ignores the local claude2kiro proxy entirely, so the proxy never
+// sees a request (nothing logs to the dashboard) and the user hits a Bedrock
+// IAM 403. We strip them from the child environment before launching Claude.
+var bedrockEnvPrefixes = []string{
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"ANTHROPIC_VERTEX_PROJECT_ID",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"CLOUD_ML_REGION",
+}
+
+// buildClaudeEnv returns the environment for the launched Claude Code process:
+// the current environment with Bedrock/Vertex routing variables removed, plus
+// the proxy overrides appended. This guarantees Claude Code routes through the
+// claude2kiro proxy at baseURL instead of going straight to a cloud provider.
+func buildClaudeEnv(baseURL string) []string {
+	src := os.Environ()
+	env := make([]string, 0, len(src)+4)
+	for _, kv := range src {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if isBedrockRoutingVar(key) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"ANTHROPIC_BASE_URL="+baseURL,
+		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
+		"CLAUDE2KIRO=1",
+		"CLAUDE_CODE_DISABLE_THINKING=1",
+	)
+}
+
+// isBedrockRoutingVar reports whether an env var name is one of the
+// Bedrock/Vertex routing toggles that override ANTHROPIC_BASE_URL.
+func isBedrockRoutingVar(key string) bool {
+	for _, p := range bedrockEnvPrefixes {
+		if key == p {
+			return true
+		}
+	}
+	return false
+}
+
 // readProxyPort reads the port from the proxy port file.
 func readProxyPort() (string, error) {
 	data, err := os.ReadFile(proxyPortFilePath())
@@ -2146,12 +2683,7 @@ func remoteConnect() {
 	// Launch claude pointing at the proxy
 	argv := append([]string{"claude"}, claudeArgs...)
 	attr := &os.ProcAttr{
-		Env: append(os.Environ(),
-			"ANTHROPIC_BASE_URL="+baseURL,
-			"ANTHROPIC_AUTH_TOKEN=claude2kiro",
-			"CLAUDE2KIRO=1",
-			"CLAUDE_CODE_DISABLE_THINKING=1",
-		),
+		Env:   buildClaudeEnv(baseURL),
 		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
 	}
 
@@ -2283,12 +2815,9 @@ func runClaudeWithProxy() {
 	// CLAUDE2KIRO env var signals to statusline scripts that this session uses Kiro proxy.
 	// Disable thinking/adaptive thinking because Kiro doesn't return thinking blocks,
 	// which causes the Anthropic SDK to silently fail when it expects them.
-	claudeCmd.Env = append(os.Environ(),
-		"ANTHROPIC_BASE_URL="+baseURL,
-		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
-		"CLAUDE2KIRO=1",
-		"CLAUDE_CODE_DISABLE_THINKING=1",
-	)
+	// buildClaudeEnv also strips CLAUDE_CODE_USE_BEDROCK / Vertex routing vars so
+	// Claude Code can't bypass the proxy and hit a cloud provider directly.
+	claudeCmd.Env = buildClaudeEnv(baseURL)
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
 	claudeCmd.Stderr = os.Stderr
@@ -2478,6 +3007,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro refresh        - Refresh the access token")
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
 	fmt.Println("  claude2kiro export         - Export environment variables")
+	fmt.Println("  claude2kiro disable        - Remove Claude2Kiro Claude Code/Desktop integrations")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
 	fmt.Println("  claude2kiro desktop             - Ensure proxy is up + launch Claude Desktop (Windows)")
 	fmt.Println("  claude2kiro remote [args...]     - Connect to running proxy (start TUI first)")
@@ -2545,8 +3075,16 @@ func runTUI() {
 	}
 }
 
-// extractSessionID extracts session identifiers from the request metadata
-// The user_id format is like: "user_..._session_ce40736e-1347-467a-9cce-181e245edd92"
+func shortSessionID(full string) string {
+	if len(full) >= 8 {
+		return full[len(full)-8:]
+	}
+	return full
+}
+
+// extractSessionID extracts session identifiers from the request metadata.
+// Current Claude Code user_id is a JSON string with session_id; older builds used
+// "user_..._session_ce40736e-1347-467a-9cce-181e245edd92".
 // Returns (shortID, fullUUID) where shortID is the last 8 chars for display
 func extractSessionID(metadata map[string]any) (string, string) {
 	if metadata == nil {
@@ -2556,22 +3094,22 @@ func extractSessionID(metadata map[string]any) (string, string) {
 	if !ok || userID == "" {
 		return "", ""
 	}
+	if strings.HasPrefix(strings.TrimSpace(userID), "{") {
+		var payload struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal([]byte(userID), &payload); err == nil && payload.SessionID != "" {
+			return shortSessionID(payload.SessionID), payload.SessionID
+		}
+	}
 	// Extract session UUID from the end of the user_id string
 	// Format: user_..._session_<uuid>
 	if idx := strings.LastIndex(userID, "_session_"); idx != -1 {
 		fullUUID := userID[idx+9:] // Skip "_session_"
-		// Return last 8 chars for display, plus full UUID
-		if len(fullUUID) >= 8 {
-			shortID := fullUUID[len(fullUUID)-8:]
-			return shortID, fullUUID
-		}
-		return fullUUID, fullUUID
+		return shortSessionID(fullUUID), fullUUID
 	}
 	// Fallback: return last 8 chars of the whole user_id
-	if len(userID) >= 8 {
-		return userID[len(userID)-8:], ""
-	}
-	return userID, ""
+	return shortSessionID(userID), ""
 }
 
 // decompressResponse handles gzip/deflate decompression for non-streaming responses
@@ -2732,6 +3270,10 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	// the ListAvailableModels fetch latency. This also fires the OnChange hook,
 	// which refreshes the installed /models slash command if the model set changed.
 	go modelCatalog.Warm()
+
+	// Start sampling credit usage so /credits/history and the dashboard chart
+	// have data. Idempotent across TUI/server/run modes.
+	creditRecorder.Start()
 
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -2946,7 +3488,7 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			}
 			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, token, lg, sessionID, reqResult.RequestID, capture)
 		} else {
-			handleNonStreamRequest(w, anthropicReq, token)
+			handleNonStreamRequest(w, anthropicReq, token, lg, sessionID, reqResult.RequestID)
 		}
 
 		// Log response
@@ -3018,6 +3560,21 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 		io.Copy(w, strings.NewReader(fmt.Sprintf(
 			`{"used":%.1f,"limit":%.0f,"remaining":%.1f,"days_until_reset":%d,"plan":"%s"}`,
 			info.CreditsUsed, info.CreditsLimit, info.CreditsRemaining, info.DaysUntilReset, info.SubscriptionName)))
+	})
+
+	// Credit usage history: recorded snapshots over time, for charting burn rate
+	// and projected runout on the web dashboard.
+	mux.HandleFunc("/credits/history", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		hist := creditRecorder.History()
+		data, err := json.Marshal(hist)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.Copy(w, strings.NewReader(`{"error":"failed to serialize history"}`))
+			return
+		}
+		w.Write(data)
 	})
 
 	// Add health check endpoint
@@ -3149,8 +3706,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		debug.WriteDebugFileWithScrub("cw-request", cwReqBody)
 	}
 
-	// Log the conversationId for tracing
-	lg.LogInfo(fmt.Sprintf("Request convId=%s model=%s historyLen=%d", cwReq.ConversationState.ConversationId[:8], anthropicReq.Model, len(cwReq.ConversationState.History)))
+	// Log request metrics for benchmark comparisons.
+	lg.LogInfo(requestMetricsSummary(cwReq, len(cwReqBody), cfg))
 
 	// Create streaming request
 	proxyReq, err := http.NewRequest(
@@ -3275,6 +3832,13 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 	// Use CodeWhisperer parser
 	events := parser.ParseEvents(respBody)
+	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(respBody)); usageMsg != "" {
+		if cfg.Advanced.ComparisonMode {
+			lg.LogComparison(sessionID, requestID, usageMsg)
+		} else {
+			lg.LogInfo(usageMsg)
+		}
+	}
 
 	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit)
 	// so Claude Code recognizes its tools.
@@ -4905,7 +5469,7 @@ func getToken() (TokenData, error) {
 }
 
 // handleNonStreamRequest handles non-streaming requests
-func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData) {
+func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string) {
 	// Build CodeWhisperer request
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
 
@@ -4914,6 +5478,9 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to serialize request: %v", err), http.StatusInternalServerError)
 		return
+	}
+	if lg != nil {
+		lg.LogInfo(requestMetricsSummary(cwReq, len(cwReqBody), config.Get()))
 	}
 
 	// Create request
@@ -4960,6 +5527,9 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	respBodyStr := string(cwRespBody)
 
 	events := parser.ParseEvents(cwRespBody)
+	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
+		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
+	}
 
 	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
 	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
