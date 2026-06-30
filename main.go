@@ -40,7 +40,7 @@ import (
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/models"
-	"github.com/sgeraldes/claude2kiro/internal/sse"
+
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -3333,12 +3333,6 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", len(respBody)))
 	}
 
-	// Use new SSE builder if feature flag is enabled
-	if cfg.Advanced.UseNewSSEBuilder {
-		return handleStreamRequestWithLoggerNewBuilder(w, flusher, events, anthropicReq, messageId, cfg, lg, sessionID, requestID, capturedEvents, len(respBody))
-	}
-
-	// --- Old code path (fallback) ---
 	if len(events) > 0 {
 		// Check if this is a tool-only response (no text content events)
 		hasTextContent := false
@@ -3522,69 +3516,6 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	if len(result) > 0 && len(result) < 10 {
 		trimmed := strings.TrimSpace(result)
 		// Check for responses that look like truncated JSON/code
-		if trimmed == "{" || trimmed == "[" || trimmed == "```" ||
-			strings.HasPrefix(trimmed, "{") && !strings.HasSuffix(trimmed, "}") {
-			lg.LogError(fmt.Sprintf("WARNING: Suspiciously short/truncated response detected: %q", result))
-		}
-	}
-
-	return result
-}
-
-// capturedSSEEventCapture wraps CapturedSSEEvent slice to implement sse.EventCapture interface
-type capturedSSEEventCapture struct {
-	events *[]CapturedSSEEvent
-}
-
-func (c *capturedSSEEventCapture) Append(event, data string) {
-	if c.events != nil {
-		*c.events = append(*c.events, CapturedSSEEvent{Event: event, Data: data})
-	}
-}
-
-// handleStreamRequestWithLoggerNewBuilder handles SSE streaming using the new sse.StreamWriter.
-// This is used when config.Advanced.UseNewSSEBuilder is true.
-func handleStreamRequestWithLoggerNewBuilder(w http.ResponseWriter, flusher http.Flusher, events []parser.SSEEvent, anthropicReq AnthropicRequest, messageId string, cfg *config.Config, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent, respBodyLen int) string {
-	streamCfg := sse.StreamConfig{
-		MessageID:         messageId,
-		Model:             anthropicReq.Model,
-		InputTokens:       respBodyLen / 4, // Approximate from response body size
-		StreamingDelayMax: cfg.Network.StreamingDelayMax,
-	}
-
-	delayFn := func() {
-		time.Sleep(time.Duration(cryptoRandIntn(int(cfg.Network.StreamingDelayMax.Milliseconds()))) * time.Millisecond)
-	}
-
-	// Analyze events for logging
-	analysis := sse.AnalyzeEvents(events)
-
-	// Log event analysis results
-	if cfg.Advanced.ComparisonMode {
-		lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events (%d bytes), tools=%d",
-			len(events), respBodyLen, analysis.ToolBlockCount))
-	} else {
-		lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
-			len(events), analysis.HasTextContent, analysis.HasToolUse, analysis.ToolBlockCount, analysis.ParserSentMessageDelta))
-	}
-
-	// Create capture wrapper if needed
-	var capture sse.EventCapture
-	if capturedEvents != nil {
-		capture = &capturedSSEEventCapture{events: capturedEvents}
-	}
-
-	var result string
-	if len(events) > 0 {
-		result = sse.StreamEventsWithCapture(w, flusher, events, streamCfg, capture, delayFn)
-	} else {
-		lg.LogError("Sending empty response due to no parsed events")
-		result = sse.StreamEmptyResponseWithCapture(w, flusher, streamCfg, capture, "[Error: No response received from backend]")
-	}
-
-	// Validate response - warn on suspiciously short/malformed responses
-	if len(result) > 0 && len(result) < 10 {
-		trimmed := strings.TrimSpace(result)
 		if trimmed == "{" || trimmed == "[" || trimmed == "```" ||
 			strings.HasPrefix(trimmed, "{") && !strings.HasSuffix(trimmed, "}") {
 			lg.LogError(fmt.Sprintf("WARNING: Suspiciously short/truncated response detected: %q", result))
