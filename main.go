@@ -36,6 +36,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/models"
@@ -677,6 +678,33 @@ func staticModelList() []models.KiroModel {
 // model list (10-minute TTL) and serves stale data on fetch failure so model
 // resolution on the request path never breaks.
 var modelCatalog = models.NewCatalog(10*time.Minute, fetchKiroModels)
+
+// creditHistoryFilePath returns ~/.claude2kiro/credit-history.jsonl.
+func creditHistoryFilePath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude2kiro", "credit-history.jsonl")
+}
+
+// creditRecorder samples Kiro credit usage every 15 minutes and keeps 30 days of
+// history so the web dashboard can chart usage, burn rate, and projected runout.
+var creditRecorder = creditshist.NewRecorder(
+	creditHistoryFilePath(),
+	15*time.Minute,
+	30*24*time.Hour,
+	func() creditshist.Reading {
+		info := cmd.GetCreditsInfo()
+		return creditshist.Reading{
+			Used:      info.CreditsUsed,
+			Limit:     info.CreditsLimit,
+			Remaining: info.CreditsRemaining,
+			Plan:      info.SubscriptionName,
+			Err:       info.Error,
+		}
+	},
+)
 
 // fetchKiroModels retrieves the current model list from CodeWhisperer using the
 // saved auth token and configured endpoint.
@@ -2733,6 +2761,10 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	// which refreshes the installed /models slash command if the model set changed.
 	go modelCatalog.Warm()
 
+	// Start sampling credit usage so /credits/history and the dashboard chart
+	// have data. Idempotent across TUI/server/run modes.
+	creditRecorder.Start()
+
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
 
@@ -3018,6 +3050,21 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 		io.Copy(w, strings.NewReader(fmt.Sprintf(
 			`{"used":%.1f,"limit":%.0f,"remaining":%.1f,"days_until_reset":%d,"plan":"%s"}`,
 			info.CreditsUsed, info.CreditsLimit, info.CreditsRemaining, info.DaysUntilReset, info.SubscriptionName)))
+	})
+
+	// Credit usage history: recorded snapshots over time, for charting burn rate
+	// and projected runout on the web dashboard.
+	mux.HandleFunc("/credits/history", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		hist := creditRecorder.History()
+		data, err := json.Marshal(hist)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.Copy(w, strings.NewReader(`{"error":"failed to serialize history"}`))
+			return
+		}
+		w.Write(data)
 	})
 
 	// Add health check endpoint
