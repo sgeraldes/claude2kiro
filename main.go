@@ -1678,10 +1678,19 @@ func main() {
 //
 // Non-destructive: existing values (a real oauthAccount, other approved keys)
 // are never overwritten, and the file is created when missing.
+//
+// ensureClaudeConfig is the best-effort wrapper used on launch paths;
+// setClaude surfaces the error to the user instead.
 func ensureClaudeConfig() {
+	if err := seedClaudeConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not update ~/.claude.json: %v\n", err)
+	}
+}
+
+func seedClaudeConfig() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return
+		return err
 	}
 
 	claudePath := filepath.Join(homeDir, ".claude.json")
@@ -1691,8 +1700,7 @@ func ensureClaudeConfig() {
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			// An existing but unparseable file must not be treated as a virgin
 			// machine — rewriting it could destroy a real claude.ai login.
-			fmt.Fprintf(os.Stderr, "Warning: ~/.claude.json exists but can't be parsed (%v) — leaving it untouched.\n", err)
-			return
+			return fmt.Errorf("~/.claude.json exists but can't be parsed (%v) — leaving it untouched", err)
 		}
 	}
 	if cfg == nil {
@@ -1750,14 +1758,14 @@ func ensureClaudeConfig() {
 	}
 
 	if !changed {
-		return
+		return nil
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	os.WriteFile(claudePath, data, 0600)
+	return os.WriteFile(claudePath, data, 0600)
 }
 
 // promptYesNo asks a [Y/n] question on stdin; pressing Enter means yes. With
@@ -4052,11 +4060,15 @@ func ensureDesktopGatewayConfig(baseURL string) error {
 
 	if data, err := os.ReadFile(metaPath); err == nil {
 		var meta map[string]any
-		if json.Unmarshal(data, &meta) == nil {
-			if applied, _ := meta["appliedId"].(string); applied != "" && applied != desktopGatewayConfigID {
-				fmt.Fprintf(os.Stderr, "Warning: Claude Desktop already has a different managed config applied (%s) — leaving it untouched.\n", applied)
-				return nil
-			}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			// Fail closed: an unreadable managed config might be someone
+			// else's — overwriting it is not ours to do.
+			return fmt.Errorf("existing Desktop managed config %s can't be parsed (%v) — not overwriting", metaPath, err)
+		}
+		if applied, _ := meta["appliedId"].(string); applied != "" && applied != desktopGatewayConfigID {
+			// Error (not warning): launching Desktop anyway would silently
+			// route traffic somewhere other than the local proxy.
+			return fmt.Errorf("Claude Desktop already has a different managed config applied (%s) — leaving it untouched", applied)
 		}
 	}
 
@@ -5071,59 +5083,16 @@ func exportEnvVars() {
 	}
 }
 
-// setClaude configures Claude Code settings. On a machine that has never run
-// Claude Code the config file doesn't exist yet — it is created from scratch
-// so first launch skips the onboarding/login wizard.
+// setClaude configures Claude Code settings via the same non-destructive
+// seeding as run/remote: the file is created on a machine that has never run
+// Claude Code, onboarding is marked complete, the proxy key approved, and an
+// API-key account stubbed — without clobbering a real claude.ai login.
 func setClaude() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Printf("Failed to get user home directory: %v\n", err)
+	if err := seedClaudeConfig(); err != nil {
+		fmt.Printf("Failed to configure Claude Code: %v\n", err)
 		os.Exit(1)
 	}
-
-	claudeJsonPath := filepath.Join(homeDir, ".claude.json")
-	jsonData := make(map[string]any)
-
-	if ok, _ := FileExists(claudeJsonPath); ok {
-		data, err := os.ReadFile(claudeJsonPath)
-		if err != nil {
-			fmt.Printf("Failed to read Claude config file: %v\n", err)
-			os.Exit(1)
-		}
-		if err := jsonStr.Unmarshal(data, &jsonData); err != nil {
-			fmt.Printf("Failed to parse JSON file: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		fmt.Println("Claude config file not found — creating it (fresh machine).")
-	}
-
-	jsonData["hasCompletedOnboarding"] = true
-	jsonData["claude2kiro"] = true
-	jsonData["oauthAccount"] = map[string]any{
-		"type":                "api_key",
-		"isMaxSubscription":   false,
-		"isApiKeyPrimaryAuth": true,
-	}
-	jsonData["primaryAccountUuid"] = "claude2kiro-local"
-	jsonData["hasSeenApiKeyPrompt"] = true
-
-	newJson, err := json.MarshalIndent(jsonData, "", "  ")
-
-	if err != nil {
-		fmt.Printf("Failed to generate JSON file: %v\n", err)
-		os.Exit(1)
-	}
-
-	err = os.WriteFile(claudeJsonPath, newJson, 0600)
-
-	if err != nil {
-		fmt.Printf("Failed to write JSON file: %v\n", err)
-		os.Exit(1)
-	}
-
 	fmt.Println("Claude config file updated successfully")
-
 }
 
 // getToken retrieves the current token

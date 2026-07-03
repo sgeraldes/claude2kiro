@@ -223,8 +223,8 @@ func TestEnsureDesktopGatewayConfigLeavesForeignConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ensureDesktopGatewayConfig("http://localhost:8080"); err != nil {
-		t.Fatal(err)
+	if err := ensureDesktopGatewayConfig("http://localhost:8080"); err == nil {
+		t.Fatal("expected an error for a foreign managed config so the caller aborts the launch")
 	}
 
 	data, err := os.ReadFile(metaPath)
