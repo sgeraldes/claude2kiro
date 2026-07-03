@@ -107,6 +107,27 @@ func TestEnsureClaudeConfigPreservesExistingLogin(t *testing.T) {
 	}
 }
 
+func TestEnsureClaudeConfigLeavesCorruptFile(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	corrupt := `{"oauthAccount": {"accountUuid": "real-acc` // truncated JSON
+	path := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(path, []byte(corrupt), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ensureClaudeConfig()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != corrupt {
+		t.Errorf("corrupt .claude.json was rewritten: %s", data)
+	}
+}
+
 func TestEnsureClaudeConfigIdempotent(t *testing.T) {
 	home := t.TempDir()
 	setTestHome(t, home)

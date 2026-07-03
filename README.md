@@ -69,7 +69,7 @@ Download binaries from:
 Claude2Kiro bootstraps a machine that has never had Claude Code or Claude Desktop on it:
 
 - `claude2kiro run` detects a missing `claude` CLI and offers to install it (Windows: winget's native `Anthropic.ClaudeCode` build — no Node.js needed — falling back to Anthropic's install script or npm; Linux/macOS: install script, then npm). It also seeds `~/.claude.json` so Claude Code skips its first-run onboarding/login wizard entirely — **no Anthropic account is needed for the CLI**.
-- `claude2kiro desktop` (Windows) detects a missing Claude Desktop, offers to install it via winget, and writes the gateway config that routes all Desktop surfaces (Chat, Cowork, Code) through the proxy. Claude Desktop itself does require a one-time claude.ai sign-in on first launch — a **free** account with any email is enough; it is identity only, and model traffic still goes to your Kiro subscription.
+- `claude2kiro desktop` (Windows) detects a missing Claude Desktop, offers to install it via winget, and writes the gateway config that routes all Desktop surfaces (Chat, Cowork, Code) through the proxy. Claude Desktop itself does require a one-time claude.ai sign-in on first launch. Model traffic still bills to your Kiro subscription, but note that Desktop gates its tabs by plan **client-side**: Chat works on a free account, while the Code and Cowork tabs only unlock with a paid claude.ai seat (Pro/Team/Enterprise) — the proxy cannot bypass that entitlement check.
 
 ## Usage
 
@@ -172,7 +172,7 @@ Ensures Claude Desktop is installed (offers a winget install when missing), make
 Desktop reads the gateway config only at launch, so if it is already running you'll be asked whether to restart it.
 
 > [!NOTE]
-> On first launch Claude Desktop asks for a claude.ai sign-in. This is identity only — a free account is enough, and no Anthropic usage is billed: model traffic goes through the local proxy to Kiro.
+> On first launch Claude Desktop asks for a claude.ai sign-in, and no Anthropic usage is billed — model traffic goes through the local proxy to Kiro. However, Desktop's plan gating is client-side: a free account only unlocks the Chat tab; the Code and Cowork tabs require a paid claude.ai seat (Pro/Team/Enterprise) regardless of where traffic routes.
 
 ### `claude2kiro update`
 

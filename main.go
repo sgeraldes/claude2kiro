@@ -1688,7 +1688,12 @@ func ensureClaudeConfig() {
 	var cfg map[string]any
 
 	if data, err := os.ReadFile(claudePath); err == nil {
-		json.Unmarshal(data, &cfg)
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			// An existing but unparseable file must not be treated as a virgin
+			// machine — rewriting it could destroy a real claude.ai login.
+			fmt.Fprintf(os.Stderr, "Warning: ~/.claude.json exists but can't be parsed (%v) — leaving it untouched.\n", err)
+			return
+		}
 	}
 	if cfg == nil {
 		cfg = make(map[string]any)
@@ -1755,12 +1760,21 @@ func ensureClaudeConfig() {
 	os.WriteFile(claudePath, data, 0600)
 }
 
-// promptYesNo asks a [Y/n] question on stdin; empty answer means yes.
+// promptYesNo asks a [Y/n] question on stdin; pressing Enter means yes. With
+// no human attached (piped/closed stdin, CI) it declines — install prompts
+// gate remote-script execution and must never auto-approve unattended.
 func promptYesNo(question string) bool {
+	if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		fmt.Fprintf(os.Stderr, "%s — declined (non-interactive session).\n", question)
+		return false
+	}
 	fmt.Print(question + " [Y/n]: ")
 	reader := bufio.NewReader(os.Stdin)
-	ans, _ := reader.ReadString('\n')
+	ans, err := reader.ReadString('\n')
 	ans = strings.ToLower(strings.TrimSpace(ans))
+	if err != nil && ans == "" {
+		return false
+	}
 	return ans != "n" && ans != "no"
 }
 
@@ -1777,10 +1791,14 @@ func findClaudeBinary() (string, error) {
 	}
 	var candidates []string
 	if runtime.GOOS == "windows" {
-		candidates = []string{
-			filepath.Join(homeDir, ".local", "bin", "claude.exe"),
-			filepath.Join(os.Getenv("LOCALAPPDATA"), "Microsoft", "WindowsApps", "claude.exe"),
-			filepath.Join(os.Getenv("APPDATA"), "npm", "claude.cmd"),
+		candidates = []string{filepath.Join(homeDir, ".local", "bin", "claude.exe")}
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			candidates = append(candidates, filepath.Join(v, "Microsoft", "WindowsApps", "claude.exe"))
+		}
+		if v := os.Getenv("APPDATA"); v != "" {
+			// npm shim — a batch file; launch sites use exec.Command, which
+			// runs .cmd via cmd.exe (os.StartProcess could not).
+			candidates = append(candidates, filepath.Join(v, "npm", "claude.cmd"))
 		}
 	} else {
 		candidates = []string{
@@ -2270,32 +2288,32 @@ func remoteConnect() {
 		}
 	}
 
-	// Launch claude pointing at the proxy
-	argv := append([]string{"claude"}, claudeArgs...)
-	attr := &os.ProcAttr{
-		Env: append(os.Environ(),
-			"ANTHROPIC_BASE_URL="+baseURL,
-			"ANTHROPIC_AUTH_TOKEN=claude2kiro",
-			"CLAUDE2KIRO=1",
-			"CLAUDE_CODE_DISABLE_THINKING=1",
-		),
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	}
-
 	claudePath, err := ensureClaudeCodeInstalled()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
+	// Launch claude pointing at the proxy. exec.Command (not os.StartProcess)
+	// so Windows batch shims like npm's claude.cmd are runnable too.
+	claudeCmd := exec.Command(claudePath, claudeArgs...)
+	claudeCmd.Env = append(os.Environ(),
+		"ANTHROPIC_BASE_URL="+baseURL,
+		"ANTHROPIC_AUTH_TOKEN=claude2kiro",
+		"CLAUDE2KIRO=1",
+		"CLAUDE_CODE_DISABLE_THINKING=1",
+	)
+	claudeCmd.Stdin, claudeCmd.Stdout, claudeCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+
 	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
-	proc, err := os.StartProcess(claudePath, argv, attr)
-	if err != nil {
+	if err := claudeCmd.Run(); err != nil {
+		if claudeCmd.ProcessState != nil {
+			os.Exit(claudeCmd.ProcessState.ExitCode())
+		}
 		fmt.Fprintf(os.Stderr, "Failed to start claude: %v\n", err)
 		os.Exit(1)
 	}
-	state, _ := proc.Wait()
-	os.Exit(state.ExitCode())
+	os.Exit(0)
 }
 
 // runClaudeWithProxy starts the proxy in-process, launches claude with env vars, and shuts down when claude exits.
@@ -4167,9 +4185,10 @@ func launchDesktop() {
 	fmt.Println("Launched Claude Desktop.")
 	if freshInstall {
 		fmt.Println()
-		fmt.Println("First launch asks for a claude.ai sign-in — this is identity only; a free")
-		fmt.Println("account with your work email is enough. Model traffic routes through the")
-		fmt.Println("local proxy to your Kiro subscription, not to the signed-in account.")
+		fmt.Println("First launch asks for a claude.ai sign-in. Model traffic routes through the")
+		fmt.Println("local proxy to your Kiro subscription, not to the signed-in account — but")
+		fmt.Println("Desktop gates its surfaces by plan client-side: Chat works on a free account;")
+		fmt.Println("the Code and Cowork tabs need a paid seat (Pro/Team) to unlock.")
 	}
 }
 
@@ -5096,7 +5115,7 @@ func setClaude() {
 		os.Exit(1)
 	}
 
-	err = os.WriteFile(claudeJsonPath, newJson, 0644)
+	err = os.WriteFile(claudeJsonPath, newJson, 0600)
 
 	if err != nil {
 		fmt.Printf("Failed to write JSON file: %v\n", err)
