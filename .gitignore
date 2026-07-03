@@ -15,6 +15,7 @@ build_output.txt
 
 # Local/dev-only files
 .claude/
+.worktrees/
 .vscode/
 CLAUDE.md
 

@@ -80,12 +80,17 @@ type AdvancedConfig struct {
 	KiroRefreshEndpoint   string `yaml:"kiro_refresh_endpoint"`
 	KiroUsageURL          string `yaml:"kiro_usage_url"`
 	AWSRegion             string `yaml:"aws_region"`
-	ComparisonMode        bool   `yaml:"comparison_mode"`        // Debug: send to both Anthropic and Kiro
-	AnthropicDirect       bool   `yaml:"anthropic_direct"`       // Bypass: send only to Anthropic
-	AnthropicApiKey       string `yaml:"anthropic_api_key"`      // API key for Anthropic (required for comparison/direct modes)
-	SkipPermissions       bool   `yaml:"skip_permissions"`       // Pass --dangerously-skip-permissions to claude (default: true)
-	DebugMode             bool   `yaml:"debug_mode"`             // Write debug files per request
-	StableConversationID  bool   `yaml:"stable_conversation_id"` // Reuse a session-derived conversationId across turns instead of a fresh UUID per request (default: false; backend server-side retention is unverified and could double context when paired with full-history sending)
+	ComparisonMode        bool   `yaml:"comparison_mode"`         // Debug: send to both Anthropic and Kiro
+	AnthropicDirect       bool   `yaml:"anthropic_direct"`        // Bypass: send only to Anthropic
+	AnthropicApiKey       string `yaml:"anthropic_api_key"`       // API key for Anthropic (required for comparison/direct modes)
+	SkipPermissions       bool   `yaml:"skip_permissions"`        // Pass --dangerously-skip-permissions to claude (default: true)
+	DebugMode             bool   `yaml:"debug_mode"`              // Write debug files per request
+	StableConversationID  bool   `yaml:"stable_conversation_id"`  // Reuse a session-derived conversationId across turns instead of a fresh UUID per request (default: true, matching Kiro IDE behavior)
+	HistoryMode           string `yaml:"history_mode"`            // Request diet history mode: full, recent, current_only (default: full)
+	HistoryRecentTurns    int    `yaml:"history_recent_turns"`    // Number of recent user/assistant turns kept when history_mode=recent
+	ToolMode              string `yaml:"tool_mode"`               // Request diet tool mode: full, compact, none_text (default: full)
+	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
+	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -156,7 +161,12 @@ func Default() *Config {
 			AWSRegion:             "us-east-1",
 			SkipPermissions:       true,
 			DebugMode:             false,
-			StableConversationID:  false, // Opt-in: backend retention unverified; pairing with full-history sending could double context
+			StableConversationID:  true, // Match Kiro IDE: reuse one conversationId for all turns in a Claude Code session
+			HistoryMode:           "full",
+			HistoryRecentTurns:    4,
+			ToolMode:              "full",
+			ToolCompactMaxChars:   1024,
+			AggressiveCachePoints: false,
 		},
 	}
 }

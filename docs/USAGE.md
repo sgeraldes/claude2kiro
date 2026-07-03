@@ -150,8 +150,11 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro refresh` | Refresh the current token |
 | `claude2kiro export` | Print environment variables for manual proxy usage |
 | `claude2kiro claude` | Configure Claude Code globally |
-| `claude2kiro run [args...]` | Start proxy and launch Claude Code |
+| `claude2kiro run [args...]` | Start proxy and launch Claude Code (installs Claude Code if missing) |
+| `claude2kiro remote [args...]` | Launch Claude Code against an already-running proxy |
+| `claude2kiro desktop` | Windows: install/configure/launch Claude Desktop routed through the proxy |
 | `claude2kiro server [port]` | Run the proxy without launching Claude Code |
+| `claude2kiro credits [--web]` | Show credit usage (`--web` opens the live dashboard) |
 | `claude2kiro update` | Download the latest release |
 | `claude2kiro logout` | Remove saved credentials |
 
@@ -173,6 +176,28 @@ Some useful settings:
 - **Auto-Start Server**: automatically start the proxy server when the app is launched.
 - **Debug Mode**: save raw request and response data to `~/.claude2kiro/debug/` for troubleshooting.
 
+### Experimental credit controls
+
+These reduce the tokens Kiro ingests per request. Defaults are conservative
+(full history, full tools) — change them only after reading
+`docs/benchmarks/2026-06-30-credit-reduction.md`, since aggressive modes can
+change model behavior:
+
+| Setting | Values | Effect |
+|---|---|---|
+| `advanced.history_mode` | `full` (default), `recent`, `current_only` | How much conversation history is resent. `recent` keeps the last `history_recent_turns` turns; `current_only` relies on the stable `conversationId` session. Required tool-use/tool-result pairs are always preserved. |
+| `advanced.history_recent_turns` | int (default 4) | Turns kept when `history_mode=recent`. |
+| `advanced.tool_mode` | `full` (default), `compact`, `none_text` | `compact` trims long tool descriptions to `tool_compact_max_chars`; `none_text` removes tool definitions and converts past tool calls to text. |
+| `advanced.tool_compact_max_chars` | int (default 1024) | Description cap for `tool_mode=compact`. |
+| `advanced.aggressive_cache_points` | bool (default false) | Insert a `cachePoint` after tool definitions even when Claude Code sent no `cache_control`. |
+
+Benchmarked locally (see the benchmark doc): `none_text` cut credits ~68% on
+no-tool suites; `aggressive_cache_points` cut ~34-36% on both suites.
+
+The live web dashboard (`claude2kiro credits --web`) charts credit history,
+burn rate, and projected runout from samples recorded every 15 minutes while
+the proxy runs.
+
 ## Troubleshooting
 
 ### Token file not found
@@ -193,7 +218,10 @@ claude2kiro refresh
 
 ### Claude Code not found
 
-Install Claude Code first, then run:
+`claude2kiro run` offers to install Claude Code automatically (winget on
+Windows, Anthropic's install script elsewhere, npm as fallback). If the
+install just finished and `claude` still isn't visible, open a new terminal
+and re-run:
 
 ```bash
 claude2kiro run

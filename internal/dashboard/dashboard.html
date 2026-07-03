@@ -63,6 +63,21 @@
   </div>
 
   <div class="card">
+    <div class="row">
+      <span class="label">Usage over time</span>
+      <span class="pill" id="histrange">—</span>
+    </div>
+    <svg id="chart" viewBox="0 0 600 140" preserveAspectRatio="none" style="width:100%;height:140px;margin-top:12px;display:block">
+      <polyline id="chartline" fill="none" stroke="var(--accent)" stroke-width="2" points=""></polyline>
+      <polygon id="chartarea" fill="var(--accent)" opacity="0.12" points=""></polygon>
+    </svg>
+    <div class="meta" style="margin-top:12px">
+      <span>Burn rate <b id="burn">—</b></span>
+      <span>Projected runout <b id="runout">—</b></span>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="label" style="margin-bottom:10px">Available models</div>
     <table>
       <thead><tr><th>Model</th><th class="num">Context</th><th class="num">Max out</th></tr></thead>
@@ -82,6 +97,11 @@
       if (n >= 1000000) return (n / 1000000) + 'M';
       if (n >= 1000) return Math.round(n / 1000) + 'K';
       return String(n);
+    }
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
     function setStatus(ok, msg) {
@@ -111,12 +131,77 @@
       }
     }
 
+    function fmtDuration(hours) {
+      if (hours == null || !isFinite(hours) || hours <= 0) return '—';
+      if (hours < 1) return Math.round(hours * 60) + 'm';
+      if (hours < 48) return Math.round(hours) + 'h';
+      return Math.round(hours / 24) + 'd';
+    }
+
+    async function loadHistory() {
+      try {
+        var r = await fetch('/credits/history', { cache: 'no-store' });
+        var d = await r.json();
+        if (!Array.isArray(d) || d.length === 0) {
+          document.getElementById('histrange').textContent = 'no data yet';
+          return;
+        }
+
+        // Sparkline of "used" over the recorded window.
+        var W = 600, H = 140, pad = 6;
+        var vals = d.map(function (s) { return s.used; });
+        var t0 = d[0].t, t1 = d[d.length - 1].t;
+        var span = Math.max(1, t1 - t0);
+        var vmin = Math.min.apply(null, vals);
+        var vmax = Math.max.apply(null, vals);
+        var vspan = Math.max(1, vmax - vmin);
+        var pts = d.map(function (s) {
+          var x = pad + (s.t - t0) / span * (W - 2 * pad);
+          var y = H - pad - (s.used - vmin) / vspan * (H - 2 * pad);
+          return x.toFixed(1) + ',' + y.toFixed(1);
+        });
+        document.getElementById('chartline').setAttribute('points', pts.join(' '));
+        document.getElementById('chartarea').setAttribute('points',
+          pad + ',' + (H - pad) + ' ' + pts.join(' ') + ' ' + (W - pad) + ',' + (H - pad));
+
+        var hours = span / 3600;
+        document.getElementById('histrange').textContent =
+          d.length + ' pts · ' + fmtDuration(hours);
+
+        // Burn rate: a drop in "used" marks a monthly credit reset, so
+        // measure only from the most recent reset forward (a whole-window
+        // delta straddling a reset would be negative and kill the stat).
+        // Within that segment prefer the last 24h so days-old samples
+        // don't dilute the current pace.
+        var seg = d;
+        for (var i = d.length - 1; i > 0; i--) {
+          if (d[i].used < d[i - 1].used) { seg = d.slice(i); break; }
+        }
+        var dayAgo = seg[seg.length - 1].t - 24 * 3600;
+        var recent = seg.filter(function (s) { return s.t >= dayAgo; });
+        if (recent.length >= 2) seg = recent;
+        var segHours = (seg[seg.length - 1].t - seg[0].t) / 3600;
+        var usedDelta = seg[seg.length - 1].used - seg[0].used;
+        if (segHours > 0.05 && usedDelta > 0) {
+          var perHour = usedDelta / segHours;
+          document.getElementById('burn').textContent = fmt(Math.round(perHour)) + '/hr';
+          var last = d[d.length - 1];
+          var remaining = (last.limit || 0) - (last.used || 0);
+          var runoutH = remaining > 0 ? remaining / perHour : 0;
+          document.getElementById('runout').textContent = fmtDuration(runoutH);
+        } else {
+          document.getElementById('burn').textContent = '—';
+          document.getElementById('runout').textContent = '—';
+        }
+      } catch (e) { /* leave previous content */ }
+    }
+
     async function loadModels() {
       try {
         var r = await fetch('/v1/models', { cache: 'no-store' });
         var d = await r.json();
         var rows = (d.data || []).map(function (m) {
-          return '<tr><td>' + (m.display_name || m.id) + '</td>' +
+          return '<tr><td>' + esc(m.display_name || m.id) + '</td>' +
                  '<td class="num">' + fmtCtx(m.max_input_tokens) + '</td>' +
                  '<td class="num">' + fmtCtx(m.max_tokens) + '</td></tr>';
         }).join('');
@@ -127,6 +212,7 @@
 
     function tick() {
       loadCredits();
+      loadHistory();
       loadModels();
       document.getElementById('ts').textContent = new Date().toLocaleTimeString();
     }

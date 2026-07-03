@@ -631,10 +631,77 @@ func (m *Model) loadSettings() {
 			Type:        TypeToggle,
 			Value:       boolToString(m.config.Advanced.StableConversationID),
 			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "true",
+				RecommendedValue: "true",
+				Sensitive:        false,
+				DetailedDesc:     "When enabled, all turns of a Claude Code session reuse one conversationId derived from its session UUID, matching current Kiro IDE request behavior. Disable this only if you need the older behavior where every request gets a fresh random conversationId.",
+			},
+		},
+		{
+			Key:         "advanced.history_mode",
+			Label:       "History Mode",
+			Description: "Experimental request history sent to Kiro",
+			Type:        TypeSelect,
+			Value:       m.config.Advanced.HistoryMode,
+			Options:     []string{"full", "recent", "current_only"},
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "full",
+				RecommendedValue: "full",
+				Sensitive:        false,
+				DetailedDesc:     "EXPERIMENTAL. full preserves current behavior. recent keeps only the last configured turns. current_only sends only the current prompt with the stable conversationId. Use reduced modes only for credit testing because they can remove context the backend still needs.",
+			},
+		},
+		{
+			Key:         "advanced.history_recent_turns",
+			Label:       "Recent History Turns",
+			Description: "Turns kept when History Mode is recent",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.HistoryRecentTurns),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "4",
+				RecommendedValue: "4",
+				Sensitive:        false,
+				DetailedDesc:     "Number of recent user/assistant history turns to send when history_mode is recent. Lower values reduce request size but can remove important context.",
+			},
+		},
+		{
+			Key:         "advanced.tool_mode",
+			Label:       "Tool Mode",
+			Description: "Experimental tool payload sent to Kiro",
+			Type:        TypeSelect,
+			Value:       m.config.Advanced.ToolMode,
+			Options:     []string{"full", "compact", "none_text"},
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "full",
+				RecommendedValue: "full",
+				Sensitive:        false,
+				DetailedDesc:     "EXPERIMENTAL. full preserves tools. compact trims long tool descriptions. none_text removes tools and converts historical tool calls/results to plain text, which saves credits but disables tool use.",
+			},
+		},
+		{
+			Key:         "advanced.tool_compact_max_chars",
+			Label:       "Tool Compact Chars",
+			Description: "Max description chars in compact tool mode",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.ToolCompactMaxChars),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "1024",
+				RecommendedValue: "1024",
+				Sensitive:        false,
+				DetailedDesc:     "Maximum tool description length when tool_mode is compact. Schemas are still cleaned normally; this only trims verbose descriptions.",
+			},
+		},
+		{
+			Key:         "advanced.aggressive_cache_points",
+			Label:       "Aggressive CachePoints",
+			Description: "Add cachePoint boundaries after tools",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.AggressiveCachePoints),
+			ExtendedHelp: ExtendedHelp{
 				DefaultValue:     "false",
 				RecommendedValue: "false",
 				Sensitive:        false,
-				DetailedDesc:     "EXPERIMENTAL. When enabled, all turns of a Claude Code session reuse one conversationId derived from its session UUID, instead of a fresh random UUID per request. This could let the backend reuse server-side context, but that retention is unverified: if the backend DOES retain context, pairing it with the proxy's full-history sending would double the ingested context (more credits, not fewer), and Claude Code's /clear reuses the same session UUID so two logical conversations could share one id. Leave off unless you are testing this behavior.",
+				DetailedDesc:     "EXPERIMENTAL. Adds Kiro cachePoint entries after tools even when Claude Code did not send Anthropic cache_control. Only enable while measuring whether Kiro credits drop.",
 			},
 		},
 	}
@@ -763,6 +830,20 @@ func (m *Model) applySetting(s Setting) {
 		m.config.Advanced.DebugMode = stringToBool(s.Value)
 	case "advanced.stable_conversation_id":
 		m.config.Advanced.StableConversationID = stringToBool(s.Value)
+	case "advanced.history_mode":
+		m.config.Advanced.HistoryMode = s.Value
+	case "advanced.history_recent_turns":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.HistoryRecentTurns = v
+		}
+	case "advanced.tool_mode":
+		m.config.Advanced.ToolMode = s.Value
+	case "advanced.tool_compact_max_chars":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.ToolCompactMaxChars = v
+		}
+	case "advanced.aggressive_cache_points":
+		m.config.Advanced.AggressiveCachePoints = stringToBool(s.Value)
 	}
 }
 
