@@ -64,6 +64,13 @@ Download binaries from:
 
 - <https://github.com/sgeraldes/claude2kiro/releases>
 
+### Fresh machine? Nothing else to install first
+
+Claude2Kiro bootstraps a machine that has never had Claude Code or Claude Desktop on it:
+
+- `claude2kiro run` detects a missing `claude` CLI and offers to install it (Windows: winget's native `Anthropic.ClaudeCode` build — no Node.js needed — falling back to Anthropic's install script or npm; Linux/macOS: install script, then npm). It also seeds `~/.claude.json` so Claude Code skips its first-run onboarding/login wizard entirely — **no Anthropic account is needed for the CLI**.
+- `claude2kiro desktop` (Windows) detects a missing Claude Desktop, offers to install it via winget, and writes the gateway config that routes all Desktop surfaces (Chat, Cowork, Code) through the proxy. Claude Desktop itself does require a one-time claude.ai sign-in on first launch — a **free** account with any email is enough; it is identity only, and model traffic still goes to your Kiro subscription.
+
 ## Usage
 
 ### `claude2kiro`
@@ -154,6 +161,19 @@ claude2kiro remote
 claude2kiro remote --resume
 ```
 
+### `claude2kiro desktop` (Windows)
+
+```powershell
+claude2kiro desktop
+```
+
+Ensures Claude Desktop is installed (offers a winget install when missing), makes sure the proxy is running, points Desktop's gateway config at it, and launches the app. All Desktop surfaces — Chat, Cowork, and the Code tab — then route through your Kiro subscription.
+
+Desktop reads the gateway config only at launch, so if it is already running you'll be asked whether to restart it.
+
+> [!NOTE]
+> On first launch Claude Desktop asks for a claude.ai sign-in. This is identity only — a free account is enough, and no Anthropic usage is billed: model traffic goes through the local proxy to Kiro.
+
 ### `claude2kiro update`
 
 ```bash
@@ -172,6 +192,7 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro login` | Authenticate with Kiro and save credentials locally |
 | `claude2kiro run` | Start an embedded proxy and launch Claude Code (self-contained) |
 | `claude2kiro remote` | Launch Claude Code connected to an already-running proxy (TUI or server) |
+| `claude2kiro desktop` | Install/configure/launch Claude Desktop routed through the proxy (Windows) |
 | `claude2kiro update` | Download and switch to the latest released version |
 | `claude2kiro logout` | Remove saved credentials |
 | `claude2kiro server [port]` | Run only the headless proxy for advanced/manual setups |

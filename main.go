@@ -1669,10 +1669,16 @@ func main() {
 	}
 }
 
-// ensureApiKeyApproved adds the proxy's API key to Claude Code's approved list in ~/.claude.json
-// so the "Detected a custom API key" prompt is skipped. This is a minimal, non-destructive change:
-// it only appends to the customApiKeyResponses.approved array if not already present.
-func ensureApiKeyApproved() {
+// ensureClaudeConfig seeds ~/.claude.json so Claude Code works through the
+// proxy without an Anthropic account or first-run wizard:
+//   - approves the proxy API key (skips the "Detected a custom API key" prompt)
+//   - marks onboarding as completed (skips the theme/login wizard on machines
+//     that have never run Claude Code)
+//   - stubs an API-key-primary account when no real claude.ai login exists
+//
+// Non-destructive: existing values (a real oauthAccount, other approved keys)
+// are never overwritten, and the file is created when missing.
+func ensureClaudeConfig() {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return
@@ -1688,6 +1694,8 @@ func ensureApiKeyApproved() {
 		cfg = make(map[string]any)
 	}
 
+	changed := false
+
 	// Claude Code uses the last 20 chars of ANTHROPIC_API_KEY to identify it
 	const proxyKeyTail = "claude2kiro" // our ANTHROPIC_API_KEY value (< 20 chars, used as-is)
 
@@ -1698,21 +1706,140 @@ func ensureApiKeyApproved() {
 	}
 
 	approved, _ := responses["approved"].([]any)
+	hasKey := false
 	for _, v := range approved {
 		if s, ok := v.(string); ok && s == proxyKeyTail {
-			return // already approved
+			hasKey = true
+			break
 		}
 	}
+	if !hasKey {
+		responses["approved"] = append(approved, proxyKeyTail)
+		cfg["customApiKeyResponses"] = responses
+		changed = true
+	}
 
-	approved = append(approved, proxyKeyTail)
-	responses["approved"] = approved
-	cfg["customApiKeyResponses"] = responses
+	// Virgin machine: skip the first-run onboarding/login wizard entirely.
+	if v, _ := cfg["hasCompletedOnboarding"].(bool); !v {
+		cfg["hasCompletedOnboarding"] = true
+		changed = true
+	}
+	if v, _ := cfg["hasSeenApiKeyPrompt"].(bool); !v {
+		cfg["hasSeenApiKeyPrompt"] = true
+		changed = true
+	}
+	// Stub an API-key-primary account only when there is no account at all, so
+	// a real claude.ai login is never clobbered. The claude2kiro marker lets
+	// `claude2kiro disable` identify and undo exactly this.
+	if _, ok := cfg["oauthAccount"]; !ok {
+		cfg["oauthAccount"] = map[string]any{
+			"type":                "api_key",
+			"isMaxSubscription":   false,
+			"isApiKeyPrimaryAuth": true,
+		}
+		cfg["claude2kiro"] = true
+		if _, ok := cfg["primaryAccountUuid"]; !ok {
+			cfg["primaryAccountUuid"] = "claude2kiro-local"
+		}
+		changed = true
+	}
+
+	if !changed {
+		return
+	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return
 	}
 	os.WriteFile(claudePath, data, 0600)
+}
+
+// promptYesNo asks a [Y/n] question on stdin; empty answer means yes.
+func promptYesNo(question string) bool {
+	fmt.Print(question + " [Y/n]: ")
+	reader := bufio.NewReader(os.Stdin)
+	ans, _ := reader.ReadString('\n')
+	ans = strings.ToLower(strings.TrimSpace(ans))
+	return ans != "n" && ans != "no"
+}
+
+// findClaudeBinary locates the Claude Code executable: PATH first, then the
+// locations the official installers use. The extra candidates matter right
+// after an install, when this process's PATH is still stale.
+func findClaudeBinary() (string, error) {
+	if p, err := exec.LookPath("claude"); err == nil {
+		return p, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("'claude' not found in PATH")
+	}
+	var candidates []string
+	if runtime.GOOS == "windows" {
+		candidates = []string{
+			filepath.Join(homeDir, ".local", "bin", "claude.exe"),
+			filepath.Join(os.Getenv("LOCALAPPDATA"), "Microsoft", "WindowsApps", "claude.exe"),
+			filepath.Join(os.Getenv("APPDATA"), "npm", "claude.cmd"),
+		}
+	} else {
+		candidates = []string{
+			filepath.Join(homeDir, ".local", "bin", "claude"),
+			"/usr/local/bin/claude",
+		}
+	}
+	for _, c := range candidates {
+		if ok, _ := FileExists(c); ok {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("'claude' not found in PATH")
+}
+
+// ensureClaudeCodeInstalled returns the path to the Claude Code CLI, offering
+// to install it when missing. Windows prefers winget (Anthropic.ClaudeCode is
+// a native build — no Node.js needed), then Anthropic's install script, then
+// npm. Unix uses the install script, then npm.
+func ensureClaudeCodeInstalled() (string, error) {
+	if p, err := findClaudeBinary(); err == nil {
+		return p, nil
+	}
+
+	fmt.Println("Claude Code ('claude') is not installed on this machine.")
+	if !promptYesNo("Install it now?") {
+		return "", fmt.Errorf("'claude' not found and install declined — install it from https://claude.com/claude-code")
+	}
+
+	var installers []*exec.Cmd
+	if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("winget"); err == nil {
+			installers = append(installers, exec.Command("winget", "install", "--id", "Anthropic.ClaudeCode",
+				"-e", "--accept-package-agreements", "--accept-source-agreements"))
+		}
+		installers = append(installers, exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+			"-Command", "irm https://claude.ai/install.ps1 | iex"))
+	} else {
+		installers = append(installers, exec.Command("sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"))
+	}
+	if _, err := exec.LookPath("npm"); err == nil {
+		installers = append(installers, exec.Command("npm", "install", "-g", "@anthropic-ai/claude-code"))
+	}
+
+	for _, install := range installers {
+		fmt.Printf("Installing Claude Code: %s\n", strings.Join(install.Args, " "))
+		install.Stdin, install.Stdout, install.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := install.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Installer failed: %v — trying next method.\n", err)
+			continue
+		}
+		if p, err := findClaudeBinary(); err == nil {
+			fmt.Printf("Claude Code installed: %s\n", p)
+			return p, nil
+		}
+		// Installed somewhere this process can't see (stale PATH).
+		return "", fmt.Errorf("Claude Code was installed but isn't visible in this terminal yet — open a new terminal and re-run")
+	}
+	return "", fmt.Errorf("could not install Claude Code automatically — install it from https://claude.com/claude-code and re-run")
 }
 
 // injectKiroChangelog writes Kiro proxy info to Claude Code's changelog cache.
@@ -2121,8 +2248,8 @@ func remoteConnect() {
 
 	fmt.Printf("Connecting to proxy at %s\n", baseURL)
 
-	// Pre-approve API key, install plugin, optimize hooks
-	ensureApiKeyApproved()
+	// Seed ~/.claude.json (key approval + onboarding), install plugin, optimize hooks
+	ensureClaudeConfig()
 	installPlugin()
 	patchSemgrepHooks()
 
@@ -2155,9 +2282,9 @@ func remoteConnect() {
 		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
 	}
 
-	claudePath, err := exec.LookPath("claude")
+	claudePath, err := ensureClaudeCodeInstalled()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: 'claude' not found in PATH\n")
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -2175,6 +2302,14 @@ func remoteConnect() {
 // Usage: claude2kiro run [claude args...]
 // Only minimal change to ~/.claude.json: pre-approves the proxy API key to skip the confirmation prompt.
 func runClaudeWithProxy() {
+	// 0. Make sure the Claude Code CLI exists (offer to install on a fresh
+	// machine) before booting the proxy.
+	claudePath, err := ensureClaudeCodeInstalled()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 1. Verify we have a valid token, refresh if expired
 	token, err := getToken()
 	if err != nil {
@@ -2202,8 +2337,9 @@ func runClaudeWithProxy() {
 		}
 	}
 
-	// 1b. Pre-approve the proxy API key so Claude doesn't show the confirmation prompt
-	ensureApiKeyApproved()
+	// 1b. Seed ~/.claude.json: approve the proxy API key and mark onboarding
+	// complete so a machine that has never run Claude Code skips its wizard
+	ensureClaudeConfig()
 
 	// 1c. Install/update kiro-proxy Claude Code plugin and optimize hooks
 	installPlugin()
@@ -2274,7 +2410,7 @@ func runClaudeWithProxy() {
 		}
 	}
 
-	claudeCmd := exec.Command("claude", claudeArgs...)
+	claudeCmd := exec.Command(claudePath, claudeArgs...)
 
 	// Inherit current env + override API vars for this session only.
 	// Use ANTHROPIC_AUTH_TOKEN (not ANTHROPIC_API_KEY) to avoid the
@@ -3835,10 +3971,106 @@ func claudeDesktopPIDs() []int {
 	return pids
 }
 
-// launchDesktop ensures the proxy is up, optionally restarts Claude Desktop
-// (prompting first if it's already running, since Desktop reads the gateway
-// config only at launch), and launches the Store app. Triggered by
-// `claude2kiro desktop`.
+// claudeDesktopInstalled reports whether the Claude Desktop package is
+// installed for the current user (matched by the package family the launch
+// AppUserModelId belongs to).
+func claudeDesktopInstalled() bool {
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		`(Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue).PackageFamilyName`).Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "Claude_pzs8sxrjxfjjc")
+}
+
+// ensureClaudeDesktopInstalled installs Claude Desktop via winget when the
+// package is missing, prompting first. Returns whether this call performed
+// the install (so the caller can show first-run guidance).
+func ensureClaudeDesktopInstalled() (bool, error) {
+	if claudeDesktopInstalled() {
+		return false, nil
+	}
+	fmt.Println("Claude Desktop is not installed on this machine.")
+	if !promptYesNo("Install it now?") {
+		return false, fmt.Errorf("Claude Desktop is required — install it from https://claude.ai/download and re-run 'claude2kiro desktop'")
+	}
+	if _, err := exec.LookPath("winget"); err == nil {
+		install := exec.Command("winget", "install", "--id", "Anthropic.Claude",
+			"-e", "--accept-package-agreements", "--accept-source-agreements")
+		install.Stdin, install.Stdout, install.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := install.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "winget install failed: %v\n", err)
+		} else if claudeDesktopInstalled() {
+			fmt.Println("Claude Desktop installed.")
+			return true, nil
+		}
+	}
+	// Fallback: hand off to the download page.
+	_ = openBrowser("https://claude.ai/download")
+	return false, fmt.Errorf("could not install automatically — install Claude Desktop from https://claude.ai/download, then re-run 'claude2kiro desktop'")
+}
+
+// desktopGatewayConfigID is the stable configLibrary entry id claude2kiro
+// writes into Claude Desktop. Fixed so re-runs update in place and cleanup
+// (`claude2kiro disable`) can identify what we wrote.
+const desktopGatewayConfigID = "c14211b2-08e2-4c99-9c7b-e3d5e2b442fa"
+
+// ensureDesktopGatewayConfig writes Claude Desktop's managed gateway config
+// (%LOCALAPPDATA%\Claude-3p\configLibrary) pointing every Desktop surface
+// (Chat, Cowork, Code) at the local proxy. Desktop reads this only at launch,
+// so callers must (re)start Desktop afterwards. A managed config that isn't
+// ours is left untouched.
+func ensureDesktopGatewayConfig(baseURL string) error {
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		localAppData = filepath.Join(homeDir, "AppData", "Local")
+	}
+	dir := filepath.Join(localAppData, "Claude-3p", "configLibrary")
+	metaPath := filepath.Join(dir, "_meta.json")
+
+	if data, err := os.ReadFile(metaPath); err == nil {
+		var meta map[string]any
+		if json.Unmarshal(data, &meta) == nil {
+			if applied, _ := meta["appliedId"].(string); applied != "" && applied != desktopGatewayConfigID {
+				fmt.Fprintf(os.Stderr, "Warning: Claude Desktop already has a different managed config applied (%s) — leaving it untouched.\n", applied)
+				return nil
+			}
+		}
+	}
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	writeJSON := func(path string, v map[string]any) error {
+		data, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(path, data, 0644)
+	}
+	if err := writeJSON(metaPath, map[string]any{
+		"appliedId": desktopGatewayConfigID,
+		"entries": []any{map[string]any{
+			"id":   desktopGatewayConfigID,
+			"name": "Claude2Kiro (local proxy)",
+		}},
+	}); err != nil {
+		return err
+	}
+	return writeJSON(filepath.Join(dir, desktopGatewayConfigID+".json"), map[string]any{
+		"inferenceProvider":       "gateway",
+		"inferenceGatewayBaseUrl": baseURL,
+	})
+}
+
+// launchDesktop ensures Claude Desktop is installed, the proxy is up, and the
+// gateway config points at it; optionally restarts Claude Desktop (prompting
+// first if it's already running, since Desktop reads the gateway config only
+// at launch), then launches the app. Triggered by `claude2kiro desktop`.
 func launchDesktop() {
 	if runtime.GOOS != "windows" {
 		fmt.Fprintf(os.Stderr, "`desktop` currently supports Windows (Claude Desktop Store app) only.\n")
@@ -3848,6 +4080,13 @@ func launchDesktop() {
 	// 1. Require a valid token (same gate as `run`).
 	if _, err := getToken(); err != nil {
 		fmt.Fprintf(os.Stderr, "No token found. Run 'claude2kiro login' first.\n")
+		os.Exit(1)
+	}
+
+	// 1b. Make sure Claude Desktop itself is installed (fresh machine).
+	freshInstall, err := ensureClaudeDesktopInstalled()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
@@ -3890,6 +4129,13 @@ func launchDesktop() {
 		fmt.Printf("Proxy is up at %s (PID %d).\n", base, srv.Process.Pid)
 	}
 
+	// 2b. Point Desktop's managed gateway config at the proxy. Without this,
+	// a fresh machine would launch Desktop routed straight to Anthropic.
+	if err := ensureDesktopGatewayConfig(base); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write Claude Desktop gateway config: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 3. If Claude Desktop is already running, prompt before killing it.
 	//    A restart is how Desktop picks up gateway/model/config changes.
 	if pids := claudeDesktopPIDs(); len(pids) > 0 {
@@ -3919,6 +4165,12 @@ func launchDesktop() {
 		os.Exit(1)
 	}
 	fmt.Println("Launched Claude Desktop.")
+	if freshInstall {
+		fmt.Println()
+		fmt.Println("First launch asks for a claude.ai sign-in — this is identity only; a free")
+		fmt.Println("account with your work email is enough. Model traffic routes through the")
+		fmt.Println("local proxy to your Kiro subscription, not to the signed-in account.")
+	}
 }
 
 // joinInts formats a slice of ints as a comma-separated string.
@@ -4800,7 +5052,9 @@ func exportEnvVars() {
 	}
 }
 
-// setClaude configures Claude Code settings
+// setClaude configures Claude Code settings. On a machine that has never run
+// Claude Code the config file doesn't exist yet — it is created from scratch
+// so first launch skips the onboarding/login wizard.
 func setClaude() {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -4809,26 +5063,20 @@ func setClaude() {
 	}
 
 	claudeJsonPath := filepath.Join(homeDir, ".claude.json")
-	ok, _ := FileExists(claudeJsonPath)
-	if !ok {
-		fmt.Println("Claude config file not found. Please confirm Claude Code is installed.")
-		fmt.Println("npm install -g @anthropic-ai/claude-code")
-		os.Exit(1)
-	}
+	jsonData := make(map[string]any)
 
-	data, err := os.ReadFile(claudeJsonPath)
-	if err != nil {
-		fmt.Printf("Failed to read Claude config file: %v\n", err)
-		os.Exit(1)
-	}
-
-	var jsonData map[string]any
-
-	err = jsonStr.Unmarshal(data, &jsonData)
-
-	if err != nil {
-		fmt.Printf("Failed to parse JSON file: %v\n", err)
-		os.Exit(1)
+	if ok, _ := FileExists(claudeJsonPath); ok {
+		data, err := os.ReadFile(claudeJsonPath)
+		if err != nil {
+			fmt.Printf("Failed to read Claude config file: %v\n", err)
+			os.Exit(1)
+		}
+		if err := jsonStr.Unmarshal(data, &jsonData); err != nil {
+			fmt.Printf("Failed to parse JSON file: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Println("Claude config file not found — creating it (fresh machine).")
 	}
 
 	jsonData["hasCompletedOnboarding"] = true
