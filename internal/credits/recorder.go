@@ -94,14 +94,19 @@ func (r *Recorder) sampleOnce() {
 		Plan:      rd.Plan,
 	}
 
-	r.mu.Lock()
-	r.snap = append(r.snap, s)
-	r.prune()
-	snapshot := make([]Snapshot, len(r.snap))
-	copy(snapshot, r.snap)
-	r.mu.Unlock()
+	r.appendLine(s)
 
-	r.persist(snapshot)
+	// Refresh memory from the file rather than only appending to our own
+	// slice: several proxies (a persistent server plus `run` instances) may
+	// sample to the same file, and re-reading makes each process's
+	// /credits/history converge on the union of everyone's samples.
+	if !r.reload() {
+		// File unreadable — keep the sample in memory so History still works.
+		r.mu.Lock()
+		r.snap = append(r.snap, s)
+		r.prune()
+		r.mu.Unlock()
+	}
 }
 
 // prune drops snapshots older than maxAge. Caller holds the write lock.
@@ -131,12 +136,48 @@ func (r *Recorder) History() []Snapshot {
 	return out
 }
 
-// load reads the JSONL file into memory, skipping malformed lines and pruning
-// stale points. Best-effort.
+// load reads the JSONL file into memory at startup, pruning stale points. If
+// pruning dropped lines, the file is compacted once. This is the only full
+// rewrite: steady-state persistence is append-only (see appendLine), so
+// concurrent proxies sampling to the same file can't clobber each other.
 func (r *Recorder) load() {
+	snaps, ok := r.readFile()
+	if !ok {
+		return
+	}
+
+	r.mu.Lock()
+	r.snap = snaps
+	r.prune()
+	pruned := len(snaps) - len(r.snap)
+	kept := make([]Snapshot, len(r.snap))
+	copy(kept, r.snap)
+	r.mu.Unlock()
+
+	if pruned > 0 {
+		r.rewrite(kept)
+	}
+}
+
+// reload refreshes the in-memory history from the file without rewriting it.
+// Returns false when the file can't be read.
+func (r *Recorder) reload() bool {
+	snaps, ok := r.readFile()
+	if !ok {
+		return false
+	}
+	r.mu.Lock()
+	r.snap = snaps
+	r.prune()
+	r.mu.Unlock()
+	return true
+}
+
+// readFile parses the JSONL file, skipping malformed lines, oldest first.
+func (r *Recorder) readFile() ([]Snapshot, bool) {
 	f, err := os.Open(r.path)
 	if err != nil {
-		return
+		return nil, false
 	}
 	defer f.Close()
 
@@ -154,16 +195,35 @@ func (r *Recorder) load() {
 		}
 	}
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].T < snaps[j].T })
-
-	r.mu.Lock()
-	r.snap = snaps
-	r.prune()
-	r.mu.Unlock()
+	return snaps, true
 }
 
-// persist atomically rewrites the JSONL file with the given snapshots. Rewriting
-// (rather than appending) keeps the file pruned to maxAge. Best-effort.
-func (r *Recorder) persist(snaps []Snapshot) {
+// appendLine appends one snapshot as a JSONL line. O_APPEND lands each line
+// atomically, so multiple proxies writing to the same file interleave instead
+// of overwriting each other (the previous whole-file rewrite dropped every
+// sample the other process had recorded). Best-effort.
+func (r *Recorder) appendLine(s Snapshot) {
+	if r.path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(r.path), 0755); err != nil {
+		return
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Write(append(data, '\n'))
+}
+
+// rewrite atomically replaces the JSONL file with the given snapshots. Only
+// used by load() to compact stale lines at startup. Best-effort.
+func (r *Recorder) rewrite(snaps []Snapshot) {
 	if r.path == "" {
 		return
 	}

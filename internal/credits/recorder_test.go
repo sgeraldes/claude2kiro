@@ -74,6 +74,52 @@ func TestRecorderPrunesOld(t *testing.T) {
 	}
 }
 
+func TestRecorderConcurrentWritersDoNotClobber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	rd1 := Reading{Used: 10, Limit: 1000, Remaining: 990, Plan: "A"}
+	rd2 := Reading{Used: 20, Limit: 1000, Remaining: 980, Plan: "B"}
+	r1 := NewRecorder(path, time.Hour, 24*time.Hour, func() Reading { return rd1 })
+	r2 := NewRecorder(path, time.Hour, 24*time.Hour, func() Reading { return rd2 })
+
+	// Interleaved samples from two independent recorders over the same file —
+	// the old whole-file rewrite made the last writer win; append-only must
+	// keep everything, and each recorder's view converges on the union.
+	r1.sampleOnce()
+	r2.sampleOnce()
+	r1.sampleOnce()
+
+	if got := len(r1.History()); got != 3 {
+		t.Fatalf("r1 sees %d snapshots, want 3 (union of both writers)", got)
+	}
+	r2.reload()
+	if got := len(r2.History()); got != 3 {
+		t.Fatalf("r2 sees %d snapshots after reload, want 3", got)
+	}
+}
+
+func TestRecorderLoadCompactsStaleLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	old := NewRecorder(path, time.Hour, 0, func() Reading { return Reading{} })
+	now := time.Now().Unix()
+	old.appendLine(Snapshot{T: now - 7200, Used: 1, Limit: 1000})
+	old.appendLine(Snapshot{T: now - 60, Used: 2, Limit: 1000})
+
+	r := NewRecorder(path, time.Hour, time.Hour, func() Reading { return Reading{} })
+	r.load()
+	if got := len(r.History()); got != 1 {
+		t.Fatalf("loaded %d snapshots, want 1 after pruning", got)
+	}
+
+	// The stale line must be compacted out of the file itself, not just memory.
+	snaps, ok := r.readFile()
+	if !ok {
+		t.Fatal("readFile failed after compaction")
+	}
+	if len(snaps) != 1 || snaps[0].Used != 2 {
+		t.Fatalf("file after compaction = %+v, want only the fresh snapshot", snaps)
+	}
+}
+
 var errTest = testErr("boom")
 
 type testErr string

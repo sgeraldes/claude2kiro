@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/manifoldco/promptui"
@@ -1297,7 +1298,14 @@ func compactToolDescription(desc string, maxChars int) string {
 	if maxChars <= 0 || len(desc) <= maxChars {
 		return desc
 	}
-	return desc[:maxChars]
+	// Truncate on a rune boundary so a multi-byte UTF-8 character is never
+	// split in half (desc[maxChars] is the first dropped byte; back up while
+	// it sits inside a rune).
+	cut := maxChars
+	for cut > 0 && !utf8.RuneStart(desc[cut]) {
+		cut--
+	}
+	return desc[:cut]
 }
 
 // extractImagesFromContent extracts images from Anthropic message content
