@@ -247,7 +247,7 @@ func TestBuildCodeWhispererRequestCachePointRespectsToolLimit(t *testing.T) {
 	// would inflate the array if not capped.
 	n := maxTools + 50
 	tools := make([]AnthropicTool, 0, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		tools = append(tools, AnthropicTool{
 			Name:         "tool",
 			Description:  "d",
@@ -340,11 +340,60 @@ func TestBuildCodeWhispererRequestHistoryModeCurrentOnly(t *testing.T) {
 	}
 
 	cw := buildCodeWhispererRequest(req, TokenData{})
-	if got := len(cw.ConversationState.History); got != 0 {
-		t.Fatalf("history length = %d, want 0 in current_only mode", got)
+	// current_only drops conversation turns but must keep the synthesized
+	// system-prompt pair — the model needs its instructions on every request.
+	if got := len(cw.ConversationState.History); got != 2 {
+		t.Fatalf("history length = %d, want 2 (system pair) in current_only mode", got)
+	}
+	first, ok := cw.ConversationState.History[0].(HistoryUserMessage)
+	if !ok {
+		t.Fatalf("first history entry type = %T, want HistoryUserMessage", cw.ConversationState.History[0])
+	}
+	if got, want := first.UserInputMessage.Content, "system instructions"; got != want {
+		t.Fatalf("kept history content = %q, want system prompt %q", got, want)
 	}
 	if got, want := cw.ConversationState.CurrentMessage.UserInputMessage.Content, "third"; got != want {
 		t.Fatalf("current content = %q, want %q", got, want)
+	}
+}
+
+func TestBuildCodeWhispererRequestHistoryModeRecentKeepsSystemPrompt(t *testing.T) {
+	cfg := config.Default()
+	cfg.Advanced.HistoryMode = "recent"
+	cfg.Advanced.HistoryRecentTurns = 1
+	withConfig(t, cfg)
+
+	req := AnthropicRequest{
+		Model:     "claude-sonnet-4-20250514",
+		MaxTokens: 64,
+		System:    []AnthropicSystemMessage{{Type: "text", Text: "system instructions"}},
+		Messages: []AnthropicRequestMessage{
+			{Role: "user", Content: "old user"},
+			{Role: "assistant", Content: "old assistant"},
+			{Role: "user", Content: "recent user"},
+			{Role: "assistant", Content: "recent assistant"},
+			{Role: "user", Content: "current"},
+		},
+	}
+
+	cw := buildCodeWhispererRequest(req, TokenData{})
+	// 2 system-pair entries + the last user/assistant turn.
+	if got := len(cw.ConversationState.History); got != 4 {
+		t.Fatalf("history length = %d, want 4 (system pair + recent turn)", got)
+	}
+	first, ok := cw.ConversationState.History[0].(HistoryUserMessage)
+	if !ok {
+		t.Fatalf("first history entry type = %T, want HistoryUserMessage", cw.ConversationState.History[0])
+	}
+	if got, want := first.UserInputMessage.Content, "system instructions"; got != want {
+		t.Fatalf("first history content = %q, want system prompt %q", got, want)
+	}
+	third, ok := cw.ConversationState.History[2].(HistoryUserMessage)
+	if !ok {
+		t.Fatalf("third history entry type = %T, want HistoryUserMessage", cw.ConversationState.History[2])
+	}
+	if got, want := third.UserInputMessage.Content, "recent user"; got != want {
+		t.Fatalf("first kept turn content = %q, want %q", got, want)
 	}
 }
 

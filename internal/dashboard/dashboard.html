@@ -168,10 +168,22 @@
         document.getElementById('histrange').textContent =
           d.length + ' pts · ' + fmtDuration(hours);
 
-        // Burn rate from the recorded window: credits used per hour.
-        var usedDelta = vals[vals.length - 1] - vals[0];
-        if (hours > 0.05 && usedDelta > 0) {
-          var perHour = usedDelta / hours;
+        // Burn rate: a drop in "used" marks a monthly credit reset, so
+        // measure only from the most recent reset forward (a whole-window
+        // delta straddling a reset would be negative and kill the stat).
+        // Within that segment prefer the last 24h so days-old samples
+        // don't dilute the current pace.
+        var seg = d;
+        for (var i = d.length - 1; i > 0; i--) {
+          if (d[i].used < d[i - 1].used) { seg = d.slice(i); break; }
+        }
+        var dayAgo = seg[seg.length - 1].t - 24 * 3600;
+        var recent = seg.filter(function (s) { return s.t >= dayAgo; });
+        if (recent.length >= 2) seg = recent;
+        var segHours = (seg[seg.length - 1].t - seg[0].t) / 3600;
+        var usedDelta = seg[seg.length - 1].used - seg[0].used;
+        if (segHours > 0.05 && usedDelta > 0) {
+          var perHour = usedDelta / segHours;
           document.getElementById('burn').textContent = fmt(Math.round(perHour)) + '/hr';
           var last = d[d.length - 1];
           var remaining = (last.limit || 0) - (last.used || 0);

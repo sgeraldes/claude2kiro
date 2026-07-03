@@ -1151,8 +1151,14 @@ func normalizeEnvPlatform(platform string) string {
 	}
 }
 
-func applyHistoryModeWithToolResultProtection(history []any, advanced config.AdvancedConfig, currentToolResults []ToolResult) []any {
+func applyHistoryModeWithToolResultProtection(history []any, advanced config.AdvancedConfig, currentToolResults []ToolResult, keepPrefix int) []any {
 	keep := historyKeepMask(history, advanced)
+	// The leading keepPrefix entries are the synthesized system-prompt pairs.
+	// Diet modes must never drop them: the system prompt carries the tool
+	// protocol and instructions the model needs on every request.
+	for i := 0; i < keepPrefix && i < len(keep); i++ {
+		keep[i] = true
+	}
 	markToolResultHistory(keep, history, currentToolResults)
 	return historyFromKeepMask(history, keep)
 }
@@ -1937,7 +1943,8 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 
 		cfgCopy := cfg.Advanced
 		cfgCopy.HistoryMode = historyMode
-		cwReq.ConversationState.History = applyHistoryModeWithToolResultProtection(history, cfgCopy, currentToolResults)
+		systemPrefix := 2 * len(anthropicReq.System) // user+assistant pair per system message
+		cwReq.ConversationState.History = applyHistoryModeWithToolResultProtection(history, cfgCopy, currentToolResults, systemPrefix)
 	}
 
 	return cwReq
