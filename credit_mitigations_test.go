@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/sgeraldes/claude2kiro/internal/config"
 )
@@ -603,6 +604,24 @@ func TestBuildCodeWhispererRequestToolModeCompact(t *testing.T) {
 	tool := cw.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification
 	if got := len(tool.Description); got > 12 {
 		t.Fatalf("compact description length = %d, want <= 12", got)
+	}
+}
+
+func TestCompactToolDescriptionRuneSafe(t *testing.T) {
+	// "descripción útil" — truncation limits that land inside the two-byte
+	// "ó"/"ú" runes must back up to the rune boundary, never split it.
+	desc := "descripción útil"
+	for maxChars := 1; maxChars < len(desc); maxChars++ {
+		got := compactToolDescription(desc, maxChars)
+		if len(got) > maxChars {
+			t.Fatalf("maxChars=%d: result %d bytes, want <= %d", maxChars, len(got), maxChars)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("maxChars=%d: result %q is not valid UTF-8", maxChars, got)
+		}
+	}
+	if got := compactToolDescription(desc, len(desc)); got != desc {
+		t.Fatalf("maxChars=len(desc) should return unchanged, got %q", got)
 	}
 }
 
