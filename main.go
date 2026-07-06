@@ -1044,6 +1044,62 @@ func stableConversationID(sessionKey string) string {
 	return uuidFromBytes(sum[:])
 }
 
+// conversationTracker guards against concurrent requests colliding on one stable
+// conversationId. Claude Code sends the SAME session id (metadata.user_id) for a
+// parent session AND all of its Task subagents, so the session-derived stable
+// conversationId is identical across every concurrently-running subagent. The
+// Kiro/CodeWhisperer backend serializes (or rejects) concurrent requests that
+// share a conversationId, which stalls parallel agents and makes them fail
+// together. We let one in-flight request own the stable id (preserving prefix
+// cache reuse for sequential turns) and hand every concurrent request its own
+// fresh conversation.
+type conversationTracker struct {
+	mu     sync.Mutex
+	active map[string]struct{}
+}
+
+var convTracker = &conversationTracker{active: make(map[string]struct{})}
+
+// tryClaim marks id as in-flight, returning false if another request already
+// holds it.
+func (t *conversationTracker) tryClaim(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, held := t.active[id]; held {
+		return false
+	}
+	t.active[id] = struct{}{}
+	return true
+}
+
+// release frees a previously claimed id.
+func (t *conversationTracker) release(id string) {
+	t.mu.Lock()
+	delete(t.active, id)
+	t.mu.Unlock()
+}
+
+// claimStableConversation makes cwReq's conversationId safe for concurrent use
+// and returns a release function to call when the request completes. When the
+// stable conversationId (already set on cwReq by buildCodeWhispererRequest from
+// the session key) is in flight for another request, it swaps in a fresh
+// per-request UUID so concurrent Task subagents don't collide on one backend
+// conversation. Must be called BEFORE the request body is marshaled.
+func claimStableConversation(cwReq *CodeWhispererRequest, sessionKey string) func() {
+	if !config.Get().Advanced.StableConversationID || sessionKey == "" {
+		// buildCodeWhispererRequest already used a fresh per-request UUID.
+		return func() {}
+	}
+	id := cwReq.ConversationState.ConversationId
+	if convTracker.tryClaim(id) {
+		return func() { convTracker.release(id) }
+	}
+	// Another request from this session already owns the stable conversationId;
+	// give this concurrent one its own conversation.
+	cwReq.ConversationState.ConversationId = generateUUID()
+	return func() {}
+}
+
 func kiroRuntimeEndpoint(region string) string {
 	region = strings.TrimSpace(region)
 	if region == "" {
@@ -3911,6 +3967,13 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	// Build CodeWhisperer request
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
 
+	// Keep the stable conversationId concurrency-safe: parallel Task subagents
+	// share the parent session id, so without this they'd all hit the backend on
+	// one conversationId and serialize/fail together. Must run before marshaling.
+	_, convSessionKey := extractSessionID(anthropicReq.Metadata)
+	releaseConv := claimStableConversation(&cwReq, convSessionKey)
+	defer releaseConv()
+
 	// Serialize request body
 	cwReqBody, err := jsonStr.Marshal(cwReq)
 	if err != nil {
@@ -5764,6 +5827,12 @@ func getToken() (TokenData, error) {
 func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string) {
 	// Build CodeWhisperer request
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
+
+	// Concurrency-safe stable conversationId (see claimStableConversation). Must
+	// run before marshaling the body below.
+	_, convSessionKey := extractSessionID(anthropicReq.Metadata)
+	releaseConv := claimStableConversation(&cwReq, convSessionKey)
+	defer releaseConv()
 
 	// Serialize request body
 	cwReqBody, err := jsonStr.Marshal(cwReq)
