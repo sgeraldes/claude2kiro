@@ -4025,7 +4025,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	var resp *http.Response
 	var lastErr error
 
-	for attempt := range 3 {
+	const maxAttempts = 5
+	for attempt := range maxAttempts {
 		if attempt > 0 {
 			// Recreate request for retry (body was consumed)
 			proxyReq, err = http.NewRequest(
@@ -4041,7 +4042,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			proxyReq.Header.Set("Content-Type", "application/json")
 			proxyReq.Header.Set("Accept", "text/event-stream")
 			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
-			time.Sleep(100 * time.Millisecond) // Brief delay before retry
+			time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
 		}
 
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
@@ -4062,9 +4063,18 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// only fix) and must not be retried or mislabeled. Compute once, reuse below.
 		contextTooLong := resp.StatusCode == 400 && isContextLengthExceeded(body)
 
-		if resp.StatusCode == 400 && attempt < 2 && !contextTooLong {
-			// Transient 400 error - retry.
-			lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
+		// Retry flaky 400s AND transient backend overload (429/503, or a 500
+		// "unexpectedly high load ... please try again") with jittered backoff.
+		// Overload is the common failure when many heavy subagents run at once;
+		// without this the proxy fails instantly and Claude Code re-sends the
+		// whole ~240k-token request, adding load and desynchronizing into waves.
+		overloaded := isTransientOverload(resp.StatusCode, body)
+		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong)) {
+			if overloaded {
+				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
+			} else {
+				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
+			}
 			continue
 		}
 
@@ -6057,6 +6067,44 @@ func isContextLengthExceeded(body []byte) bool {
 	}
 	// Non-JSON body: only trust the structured enum, never the English phrase.
 	return strings.Contains(strings.ToLower(string(body)), "content_length_exceeds_threshold")
+}
+
+// isTransientOverload reports whether a non-200 CodeWhisperer response is a
+// transient backend capacity failure worth retrying with backoff. Kiro sheds
+// load under heavy concurrent traffic with an HTTP 500 whose body says
+// "Encountered unexpectedly high load ... please try again"; it can also surface
+// as 429 (throttling) or 503 (unavailable). These are the opposite of a 400
+// context-length error: the same request will succeed once load subsides.
+func isTransientOverload(status int, body []byte) bool {
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		return true
+	}
+	if status != http.StatusInternalServerError {
+		return false
+	}
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "high load") ||
+		strings.Contains(s, "please try again") ||
+		strings.Contains(s, "try again later") ||
+		strings.Contains(s, "throttl") ||
+		strings.Contains(s, "overloaded") ||
+		strings.Contains(s, "capacity")
+}
+
+// retryBackoff returns an exponential backoff duration with full jitter for the
+// given 1-based retry attempt. Jitter is essential here: the Kiro backend sheds
+// load in synchronized waves, so N parallel subagents that all fail and retry in
+// lockstep just re-collide. Jitter desynchronizes them. Capped at 8s.
+func retryBackoff(attempt int) time.Duration {
+	const base = 400 * time.Millisecond
+	const maxBackoff = 8 * time.Second
+	backoff := base << (attempt - 1) // attempt is >= 1
+	if backoff <= 0 || backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+	// Full jitter within [backoff/2, backoff] to keep a floor while spreading.
+	half := int(backoff / 2)
+	return backoff/2 + time.Duration(cryptoRandIntn(half+1))
 }
 
 // sendNonRetryableErrorEvent emits an Anthropic error event typed
