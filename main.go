@@ -3907,22 +3907,32 @@ var (
 func startServerWithLogger(port string, lg *logger.Logger) {
 	mux := buildServerMux(lg)
 
-	// Write proxy port file so `claude2kiro remote` can find us
-	writeProxyPortFile(port)
-	defer removeProxyPortFile()
-
 	// Localhost-only proxy; TLS not needed for loopback traffic.
 	srv := &http.Server{Addr: ":" + port, Handler: mux}
 
-	// Create listener to ensure port is bound before notifying TUI
+	// Bind the port BEFORE writing the port file. A failed bind here (another
+	// claude2kiro already owns the port) must NOT touch the running proxy's
+	// port file — otherwise a second TUI's failed start deletes the first
+	// proxy's ~/.claude2kiro/proxy.port, breaking `remote`, `run` auto-attach,
+	// and the /credits & /status plugin commands. Running two proxies also
+	// races on the shared auth token and causes intermittent 403s, so surface
+	// that explicitly instead of a generic bind error.
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		lg.LogError(fmt.Sprintf("Server failed to start: %v", err))
+		detail := err.Error()
+		if existing, ok := detectLiveProxy(); ok {
+			detail = fmt.Sprintf("another claude2kiro proxy is already running at %s — stop it first (running two races the auth token and causes 403s)", existing)
+		}
+		lg.LogError("Server failed to start: " + detail)
 		if p := lg.GetProgram(); p != nil {
-			p.Send(dashboard.ServerStoppedMsg{Err: err})
+			p.Send(dashboard.ServerStoppedMsg{Err: fmt.Errorf("%s", detail)})
 		}
 		return
 	}
+
+	// We own the port now — advertise it so `claude2kiro remote` can find us.
+	writeProxyPortFile(port)
+	defer removeProxyPortFile()
 
 	activeTUIServerMu.Lock()
 	activeTUIServer = srv
