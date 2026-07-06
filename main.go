@@ -2876,10 +2876,12 @@ func remoteConnect() {
 
 	fmt.Printf("Connecting to proxy at %s\n", baseURL)
 
-	// Seed ~/.claude.json (key approval + onboarding), install plugin, optimize hooks
+	// Seed ~/.claude.json (key approval + onboarding), install plugin, optimize
+	// hooks, and inject Kiro release notes — same setup as `run`'s attach path.
 	ensureClaudeConfig()
 	installPlugin()
 	patchSemgrepHooks()
+	injectKiroChangelog()
 
 	// Launch claude pointed at the existing proxy. launchClaudeAgainstProxy uses
 	// exec.Command (not os.StartProcess) so Windows batch shims like npm's
