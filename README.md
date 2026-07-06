@@ -118,7 +118,13 @@ claude2kiro run
 
 The quickest way to start a session. It starts an embedded proxy, launches Claude Code pointing at it, and tears the proxy down when Claude Code exits.
 
-Each `claude2kiro run` is self-contained — multiple instances run independently, each with its own proxy on a random port.
+**If a proxy is already running** (a TUI dashboard or `claude2kiro server`), `run` detects it and **attaches to that proxy instead of starting a second one** — so you can keep a TUI open and just `claude2kiro run` from any other terminal without spawning extra proxies. When no proxy is running, it falls back to starting its own self-contained one on a random port, and multiple such instances run independently.
+
+Pass `--no-attach` to force a dedicated proxy for the session even when one is already running:
+
+```bash
+claude2kiro run --no-attach
+```
 
 <p align="center">
   <img src="docs/images/claude-code-using-proxy-light.png" alt="Claude Code running through Claude2Kiro" width="900" />
@@ -190,7 +196,7 @@ Use this when you want to upgrade without reinstalling manually.
 |---|---|
 | `claude2kiro` | Open the interactive TUI for login, dashboard, settings, and launch actions |
 | `claude2kiro login` | Authenticate with Kiro and save credentials locally |
-| `claude2kiro run` | Start an embedded proxy and launch Claude Code (self-contained) |
+| `claude2kiro run` | Launch Claude Code — attaches to a running proxy if one exists, else starts its own (`--no-attach` forces its own) |
 | `claude2kiro remote` | Launch Claude Code connected to an already-running proxy (TUI or server) |
 | `claude2kiro desktop` | Install/configure/launch Claude Desktop routed through the proxy (Windows) |
 | `claude2kiro update` | Download and switch to the latest released version |
@@ -218,13 +224,13 @@ Claude2Kiro is useful if you:
 
 | Mode | Command | Proxy lifecycle | Multi-session |
 |---|---|---|---|
-| **Run** | `claude2kiro run` | One proxy per session — starts and stops with Claude Code | Independent, no sharing |
-| **Dashboard** | `claude2kiro` | Persistent — managed from the TUI | Shared via `claude2kiro remote` |
-| **Server** | `claude2kiro server [port]` | Persistent — runs until stopped (Ctrl+C) | Shared via `claude2kiro remote` |
+| **Run** | `claude2kiro run` | Attaches to a running proxy if one exists; otherwise its own proxy, stopped with Claude Code | Auto-shares a running proxy |
+| **Dashboard** | `claude2kiro` | Persistent — managed from the TUI | Shared via `claude2kiro run` / `remote` |
+| **Server** | `claude2kiro server [port]` | Persistent — runs until stopped (Ctrl+C) | Shared via `claude2kiro run` / `remote` |
 
-**Run** is the simplest option for a single session. It starts a self-contained proxy on a random port, launches Claude Code, and tears the proxy down when Claude Code exits. Each `claude2kiro run` is independent — other sessions cannot connect to its proxy.
+**Run** is the simplest option. If a proxy is already running (TUI or server), `run` attaches to it — the same as `claude2kiro remote`, so a TUI you keep open is reused by every `run` from any terminal. When no proxy is running, `run` starts a self-contained one on a random port, launches Claude Code, and tears that proxy down on exit. Use `claude2kiro run --no-attach` to always start a dedicated proxy regardless.
 
-**Dashboard and server** both start a persistent proxy on a fixed port (default 8080). You can open additional Claude Code sessions against it with `claude2kiro remote`. All requests are logged to the same files on disk.
+**Dashboard and server** both start a persistent proxy on a fixed port (default 8080). Additional Claude Code sessions attach automatically via `claude2kiro run`, or explicitly with `claude2kiro remote`. All requests are logged to the same files on disk.
 
 The proxy is stateless — it reads the auth token from disk on every request and holds no session data in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
 

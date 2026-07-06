@@ -2783,37 +2783,51 @@ func readProxyPort() (string, error) {
 	return port, nil
 }
 
-// remoteConnect launches Claude Code connected to an already-running proxy.
-// Usage: claude2kiro remote [claude args...]
-// Reads the proxy port from ~/.claude2kiro/proxy.port (written by TUI/server mode).
-func remoteConnect() {
+// detectLiveProxy reports whether an already-running claude2kiro proxy (started
+// by TUI or `server` mode) is reachable, returning its base URL. It reads the
+// port from ~/.claude2kiro/proxy.port and probes /health with a short timeout
+// so a stale port file (proxy died, file left behind) fails fast instead of
+// hanging. Used by `run` to attach to an existing proxy instead of spawning a
+// second one, and by `remote` to locate the proxy to connect to.
+func detectLiveProxy() (string, bool) {
 	port, err := readProxyPort()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Start the proxy first with: claude2kiro (TUI) or claude2kiro server\n")
-		os.Exit(1)
+		return "", false
 	}
-
-	// Verify proxy is reachable
 	baseURL := fmt.Sprintf("http://127.0.0.1:%s", port)
-	resp, err := http.Get(baseURL + "/health")
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "Error: Proxy at %s is not responding\n", baseURL)
-		fmt.Fprintf(os.Stderr, "Start the proxy first with: claude2kiro (TUI) or claude2kiro server\n")
-		os.Exit(1)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(baseURL + "/health")
+	if err != nil {
+		return "", false
 	}
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	return baseURL, true
+}
 
-	fmt.Printf("Connecting to proxy at %s\n", baseURL)
+// extractNoAttachFlag pulls the claude2kiro-only "--no-attach" flag out of the
+// args destined for Claude Code (which would otherwise reject it as unknown),
+// reporting whether it was present.
+func extractNoAttachFlag(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	found := false
+	for _, a := range args {
+		if a == "--no-attach" {
+			found = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, found
+}
 
-	// Seed ~/.claude.json (key approval + onboarding), install plugin, optimize hooks
-	ensureClaudeConfig()
-	installPlugin()
-	patchSemgrepHooks()
-
-	// Build claude args
-	claudeArgs := os.Args[2:] // everything after "remote"
-
+// launchClaudeAgainstProxy execs Claude Code pointed at an already-running proxy
+// at baseURL, inheriting stdio, and exits the process with claude's exit code.
+// It never starts or stops a proxy — the proxy's lifecycle is owned by whoever
+// launched it (TUI/server). Shared by `run` (attach path) and `remote`.
+func launchClaudeAgainstProxy(claudePath, baseURL string, claudeArgs []string) {
 	cfg := config.Get()
 	if cfg.Advanced.SkipPermissions {
 		hasPermFlag := false
@@ -2828,14 +2842,6 @@ func remoteConnect() {
 		}
 	}
 
-	claudePath, err := ensureClaudeCodeInstalled()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Launch claude pointing at the proxy. exec.Command (not os.StartProcess)
-	// so Windows batch shims like npm's claude.cmd are runnable too.
 	claudeCmd := exec.Command(claudePath, claudeArgs...)
 	claudeCmd.Env = buildClaudeEnv(baseURL)
 	claudeCmd.Stdin, claudeCmd.Stdout, claudeCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -2851,6 +2857,36 @@ func remoteConnect() {
 	os.Exit(0)
 }
 
+// remoteConnect launches Claude Code connected to an already-running proxy.
+// Usage: claude2kiro remote [claude args...]
+// Reads the proxy port from ~/.claude2kiro/proxy.port (written by TUI/server mode).
+func remoteConnect() {
+	baseURL, ok := detectLiveProxy()
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: no running proxy found (nothing responding at ~/.claude2kiro/proxy.port).\n")
+		fmt.Fprintf(os.Stderr, "Start the proxy first with: claude2kiro (TUI) or claude2kiro server\n")
+		os.Exit(1)
+	}
+
+	claudePath, err := ensureClaudeCodeInstalled()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Connecting to proxy at %s\n", baseURL)
+
+	// Seed ~/.claude.json (key approval + onboarding), install plugin, optimize hooks
+	ensureClaudeConfig()
+	installPlugin()
+	patchSemgrepHooks()
+
+	// Launch claude pointed at the existing proxy. launchClaudeAgainstProxy uses
+	// exec.Command (not os.StartProcess) so Windows batch shims like npm's
+	// claude.cmd are runnable too, and exits with claude's exit code.
+	launchClaudeAgainstProxy(claudePath, baseURL, os.Args[2:]) // everything after "remote"
+}
+
 // runClaudeWithProxy starts the proxy in-process, launches claude with env vars, and shuts down when claude exits.
 // Usage: claude2kiro run [claude args...]
 // Only minimal change to ~/.claude.json: pre-approves the proxy API key to skip the confirmation prompt.
@@ -2861,6 +2897,23 @@ func runClaudeWithProxy() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// 0b. If a proxy is already running (TUI dashboard or `server` mode), attach
+	// to it instead of spawning a second one — this is the common case when the
+	// user keeps a TUI open and launches Claude Code from another terminal.
+	// `--no-attach` forces a dedicated, self-contained proxy for this session.
+	claudeArgs, noAttach := extractNoAttachFlag(os.Args[2:])
+	liveURL, liveOK := detectLiveProxy()
+	if liveOK && !noAttach {
+		fmt.Printf("Found a running proxy at %s — attaching to it.\n", liveURL)
+		fmt.Printf("(use 'claude2kiro run --no-attach' to start a dedicated proxy instead)\n")
+		ensureClaudeConfig()
+		installPlugin()
+		patchSemgrepHooks()
+		injectKiroChangelog()
+		launchClaudeAgainstProxy(claudePath, liveURL, claudeArgs)
+		return // launchClaudeAgainstProxy exits; kept for clarity
 	}
 
 	// 1. Verify we have a valid token, refresh if expired
@@ -2942,12 +2995,16 @@ func runClaudeWithProxy() {
 	// this the port file would hold a stale value from a previous server run.
 	// Note: this function ends in os.Exit on error paths, which skips defers,
 	// so the file is also removed explicitly before each os.Exit below.
-	writeProxyPortFile(fmt.Sprintf("%d", port))
-	defer removeProxyPortFile()
+	//
+	// Skip this when another proxy (TUI/server) already owns the port file:
+	// this session was forced into its own proxy via --no-attach, but it must
+	// not clobber the long-lived proxy's advertised port for /credits & friends.
+	if !liveOK {
+		writeProxyPortFile(fmt.Sprintf("%d", port))
+		defer removeProxyPortFile()
+	}
 
-	// 6. Build claude command with remaining args
-	claudeArgs := os.Args[2:] // everything after "run"
-
+	// 6. Build claude command with remaining args (--no-attach already stripped)
 	// Prepend --dangerously-skip-permissions if configured (default: true)
 	if cfg.Advanced.SkipPermissions {
 		// Only add if user hasn't already passed a permission flag
@@ -2991,7 +3048,9 @@ func runClaudeWithProxy() {
 	fmt.Println("Proxy stopped.")
 
 	if runErr != nil {
-		removeProxyPortFile() // os.Exit skips the deferred cleanup
+		if !liveOK {
+			removeProxyPortFile() // os.Exit skips the deferred cleanup
+		}
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
