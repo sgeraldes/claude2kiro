@@ -4133,7 +4133,14 @@ func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Dur
 	// and the /credits & /status plugin commands. Running two proxies also
 	// races on the shared auth token and causes intermittent 403s, so surface
 	// that explicitly instead of a generic bind error.
-	ln, err := net.Listen("tcp", ":"+port)
+	//
+	// Bind loopback only (127.0.0.1), not all interfaces (":"+port). This keeps
+	// the proxy off the network — it holds the Kiro token with no auth, so it
+	// must not be reachable from other hosts — and avoids the Windows Firewall
+	// prompt: loopback listeners are never firewalled, whereas a 0.0.0.0 listener
+	// prompts on every new binary path (each version installs to a fresh path, so
+	// the user was re-prompted on every update). Matches what `run` already does.
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
 		if existing, ok := detectLiveProxy(); ok {
 			// Another live proxy owns the port — terminal, don't restart.
