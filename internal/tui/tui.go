@@ -405,10 +405,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clearStatusMsg:
 		m.menu.ClearStatus()
 
+	case LaunchClaudeResultMsg:
+		// Surface a spawn failure (e.g. no terminal, exec error) instead of
+		// silently swallowing it; success is visible in the new terminal window.
+		if msg.Err != nil {
+			m.menu.SetStatus(fmt.Sprintf("Launch failed: %v", msg.Err), true)
+			cmds = append(cmds, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return clearStatusMsg{}
+			}))
+		}
+
 	case cmd.RefreshResultMsg:
 		if msg.Success {
 			m.menu.SetStatus(fmt.Sprintf("Token refreshed! Expires: %s", msg.ExpiresAt.Format("15:04:05")), false)
 			m.menu.RefreshTokenInfo()
+			// Re-fetch credits with the new token so the stale 403 (from the
+			// expired token) clears immediately instead of lingering.
+			cmds = append(cmds, menu.FetchCreditsCmd())
 		} else {
 			m.menu.SetStatus(fmt.Sprintf("Refresh failed: %v", msg.Err), true)
 		}
@@ -576,6 +589,11 @@ func (m Model) handleMenuAction(action menu.MenuAction) (tea.Model, tea.Cmd) {
 	case menu.ActionLaunchClaude:
 		if m.serverRunning {
 			return m, launchClaudeRemote(m.serverPort)
+		}
+
+	case menu.ActionLaunchDesktop:
+		if m.serverRunning {
+			return m, launchDesktopApp()
 		}
 
 	case menu.ActionRefreshToken:
@@ -756,6 +774,27 @@ func launchClaudeRemote(port string) tea.Cmd {
 			return LaunchClaudeResultMsg{Err: fmt.Errorf("failed to launch: %v", err)}
 		}
 
+		return LaunchClaudeResultMsg{}
+	}
+}
+
+// launchDesktopApp spawns `claude2kiro desktop` in a new terminal window so its
+// install / gateway-config / launch progress (and any "restart Desktop?" prompt)
+// stays visible. Claude Desktop is a Windows Store app, so the menu only offers
+// this on Windows.
+func launchDesktopApp() tea.Cmd {
+	return func() tea.Msg {
+		self, err := os.Executable()
+		if err != nil {
+			return LaunchClaudeResultMsg{Err: fmt.Errorf("cannot find executable: %v", err)}
+		}
+		if !fileExists("C:\\Windows\\System32\\cmd.exe") {
+			return LaunchClaudeResultMsg{Err: fmt.Errorf("Claude Desktop launch is Windows-only")}
+		}
+		proc := exec.Command("cmd", "/c", "start", "", self, "desktop")
+		if err := proc.Start(); err != nil {
+			return LaunchClaudeResultMsg{Err: fmt.Errorf("failed to launch: %v", err)}
+		}
 		return LaunchClaudeResultMsg{}
 	}
 }
