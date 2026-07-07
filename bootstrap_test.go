@@ -182,6 +182,14 @@ func TestEnsureDesktopGatewayConfigWritesConfig(t *testing.T) {
 	if entry["inferenceGatewayBaseUrl"] != "http://localhost:8080" {
 		t.Errorf("inferenceGatewayBaseUrl = %v", entry["inferenceGatewayBaseUrl"])
 	}
+	// Desktop's custom3p validator requires a credential for the gateway
+	// provider; without these the config is rejected and Desktop won't route.
+	if entry["inferenceCredentialKind"] != "static" {
+		t.Errorf("inferenceCredentialKind = %v, want static", entry["inferenceCredentialKind"])
+	}
+	if key, _ := entry["inferenceApiKey"].(string); key == "" {
+		t.Errorf("inferenceApiKey = %q, want a non-empty dummy credential", key)
+	}
 }
 
 func TestEnsureDesktopGatewayConfigUpdatesPort(t *testing.T) {

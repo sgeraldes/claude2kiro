@@ -286,6 +286,9 @@ type Logger struct {
 	program           *tea.Program
 	fileWriter        *os.File
 	filePath          string
+	logDir            string            // directory holding log files, for intra-day rotation
+	fileDate          string            // "2006-01-02" of the active file, to roll over at midnight
+	fileBytes         int64             // running size of the active file, to trigger rotation without stat-per-write
 	requestCount      uint64            // Counter for generating unique request IDs
 	seqNumMap         map[string]int    // Maps session ID to current sequential number
 	lastReqBody       map[string]string // Last request body per session, for delta logging
@@ -357,7 +360,8 @@ func (l *Logger) EnableFileLogging(logDir string) error {
 	}
 
 	// Create log file with date-based name
-	filename := time.Now().Format("2006-01-02") + ".log"
+	today := time.Now().Format("2006-01-02")
+	filename := today + ".log"
 	l.filePath = filepath.Join(logDir, filename)
 
 	file, err := os.OpenFile(l.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -366,11 +370,91 @@ func (l *Logger) EnableFileLogging(logDir string) error {
 	}
 
 	l.fileWriter = file
+	l.logDir = logDir
+	l.fileDate = today
+	// Seed the running size from the existing file so a restart mid-day still
+	// rotates at the right threshold rather than letting it grow another cap.
+	l.fileBytes = 0
+	if info, err := file.Stat(); err == nil {
+		l.fileBytes = info.Size()
+	}
 
 	// Best-effort housekeeping: compress old day-files and enforce retention/size
 	// caps. Runs once at startup; failures here never block logging.
 	maintainLogDir(logDir, l.filePath)
 	return nil
+}
+
+// maybeRollDateLocked switches the active file to today's date-named log when
+// the calendar day changes, so a proxy left running across midnight starts a
+// fresh day-file instead of appending to yesterday's indefinitely (which broke
+// per-day retention and made "today's log" grow forever). Caller must hold l.mu.
+func (l *Logger) maybeRollDateLocked() {
+	if l.fileWriter == nil || l.logDir == "" {
+		return
+	}
+	today := time.Now().Format("2006-01-02")
+	if today == l.fileDate {
+		return
+	}
+	newPath := filepath.Join(l.logDir, today+".log")
+	f, err := os.OpenFile(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return // keep writing to the current file rather than lose logging
+	}
+	l.fileWriter.Close()
+	l.fileWriter = f
+	l.filePath = newPath
+	l.fileDate = today
+	l.fileBytes = 0
+	if info, serr := f.Stat(); serr == nil {
+		l.fileBytes = info.Size()
+	}
+	// Compress+prune the day we just rolled off, off the hot path.
+	go maintainLogDir(l.logDir, l.filePath)
+}
+
+// maybeRotateLocked rolls the active log file to a timestamped sibling once it
+// exceeds MaxLogSizeMB, then compresses+prunes off the hot path. Without this a
+// single busy day grows one file without bound: enforceSizeCap runs only at
+// startup and never touches the active file, so the size cap is otherwise
+// meaningless intra-day. Caller must hold l.mu.
+func (l *Logger) maybeRotateLocked() {
+	if l.fileWriter == nil || l.logDir == "" {
+		return
+	}
+	capMB := config.Get().Logging.MaxLogSizeMB
+	if capMB <= 0 { // 0 = unlimited: never rotate by size
+		return
+	}
+	// Rotate the active file at half the total budget, leaving the other half
+	// for compressed rotated history so the directory total stays under the cap.
+	if l.fileBytes < int64(capMB)*1024*1024/2 {
+		return
+	}
+
+	l.fileWriter.Close()
+	rotated := strings.TrimSuffix(l.filePath, ".log") + "." + time.Now().Format("150405.000") + ".log"
+	if err := os.Rename(l.filePath, rotated); err != nil {
+		// Rename can fail if a reader holds the file open (Windows). Reopen the
+		// same file and try again on the next write rather than losing logging.
+		if f, ferr := os.OpenFile(l.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); ferr == nil {
+			l.fileWriter = f
+		} else {
+			l.fileWriter = nil
+		}
+		return
+	}
+	f, err := os.OpenFile(l.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		l.fileWriter = nil
+		return
+	}
+	l.fileWriter = f
+	l.fileBytes = 0
+	// Compress the rotated file and enforce the total-size cap without blocking
+	// logging. maintainLogDir skips the (fresh) active file, so this is safe.
+	go maintainLogDir(l.logDir, l.filePath)
 }
 
 // maintainLogDir performs startup housekeeping on the log directory:
@@ -645,9 +729,13 @@ func (l *Logger) Log(entry LogEntry) {
 		fileEntry.Body = bodyForFile
 	}
 
-	// Write to file with processed body
+	// Write to file with processed body. Roll to a new day-file if the date
+	// changed, then track size for intra-day rotation.
 	if l.fileWriter != nil {
-		l.fileWriter.WriteString(fileEntry.FormatPlain() + "\n")
+		l.maybeRollDateLocked()
+		n, _ := l.fileWriter.WriteString(fileEntry.FormatPlain() + "\n")
+		l.fileBytes += int64(n)
+		l.maybeRotateLocked()
 	}
 
 	// Update entry for memory storage
