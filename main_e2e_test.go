@@ -41,6 +41,11 @@ func writeFakeToken(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	t.Setenv("USERPROFILE", tmp)
+	// getToken() memoizes for 1 minute in a package global, so a real token
+	// cached by an earlier test would leak into this one (tests run well within
+	// the TTL). Reset it before and after so this test reads the fake token.
+	cachedToken = nil
+	t.Cleanup(func() { cachedToken = nil })
 	cacheDir := filepath.Join(tmp, ".aws", "sso", "cache")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		t.Fatal(err)

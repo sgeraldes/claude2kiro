@@ -36,6 +36,7 @@ import (
 	"github.com/manifoldco/promptui"
 
 	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/agents"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
@@ -602,23 +603,52 @@ type CodeWhispererEvent struct {
 // tokenRefreshMutex prevents concurrent token refresh operations
 var tokenRefreshMutex sync.Mutex
 
-// kiroRequestSema limits concurrent requests to Kiro backend (some 400s may be concurrency-related)
-// kiroRequestSema limits concurrent requests to Kiro backend.
-// Initialized lazily from config on first use.
-var kiroRequestSema chan struct{}
-var kiroSemaOnce sync.Once
-
-func getKiroSema() chan struct{} {
-	kiroSemaOnce.Do(func() {
-		cfg := config.Get()
-		size := cfg.Network.MaxConcurrentReqs
-		if size < 1 {
-			size = 4
-		}
-		kiroRequestSema = make(chan struct{}, size)
-	})
-	return kiroRequestSema
+// kiroLimiter bounds concurrent requests to the Kiro backend. It re-reads the
+// limit from config on every acquire so `max_concurrent_requests` can be tuned
+// live from the settings screen (e.g. lowered when the backend is shedding load
+// with HTTP 500 "high load") without restarting the proxy — a plain buffered
+// channel semaphore is fixed at creation and can't be resized.
+type kiroLimiter struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	active int
 }
+
+func newKiroLimiter() *kiroLimiter {
+	l := &kiroLimiter{}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
+func kiroConcurrencyLimit() int {
+	n := config.Get().Network.MaxConcurrentReqs
+	if n < 1 {
+		n = 4
+	}
+	return n
+}
+
+// acquire blocks until fewer than the current limit are in flight.
+func (l *kiroLimiter) acquire() {
+	l.mu.Lock()
+	for l.active >= kiroConcurrencyLimit() {
+		l.cond.Wait()
+	}
+	l.active++
+	l.mu.Unlock()
+}
+
+// release frees a slot and wakes any waiters (the limit may have risen).
+func (l *kiroLimiter) release() {
+	l.mu.Lock()
+	if l.active > 0 {
+		l.active--
+	}
+	l.cond.Broadcast()
+	l.mu.Unlock()
+}
+
+var kiroSema = newKiroLimiter()
 
 // ModelMap translates Anthropic model IDs (sent by Claude Code) to Kiro model IDs.
 // Kiro model IDs discovered via GET /ListAvailableModels?origin=AI_EDITOR
@@ -899,6 +929,66 @@ func printResolve() {
 		fmt.Println("available on this account: NO — not in the live model list; Kiro will likely reject it")
 		fmt.Println("run 'claude2kiro models' to see the models this account can use")
 	}
+}
+
+// printAgents prints per-subagent stats for a Claude Code session, derived from
+// the local subagent transcripts (see internal/agents). With no session id it
+// uses the most recently active one. This surfaces the per-agent tokens/turns/
+// throughput the proxy alone can't attribute (all subagents share one session).
+func printAgents(session string) {
+	if session == "" {
+		session = agents.MostRecentSession()
+	}
+	if session == "" {
+		fmt.Println("No Claude Code subagent sessions found under ~/.claude/projects/.")
+		fmt.Println("Run a session that spawns Task subagents first.")
+		return
+	}
+	stats := agents.SessionStats(session)
+	fmt.Printf("Subagent stats — session %s\n\n", session)
+	if len(stats) == 0 {
+		fmt.Println("No subagents recorded for this session.")
+		return
+	}
+	fmt.Printf("%-18s %-16s %6s %9s %8s %8s %9s\n", "AGENT", "MODEL", "TURNS", "IN TOK", "PEAK IN", "DUR", "IN/s")
+	fmt.Println(strings.Repeat("-", 82))
+	var totalIn int64
+	for _, s := range stats {
+		name := s.Name
+		if name == "" {
+			name = s.AgentType
+		}
+		fmt.Printf("%-18s %-16s %6d %9s %8s %8s %9s\n",
+			truncateField(name, 18), truncateField(s.Model, 16), s.Turns,
+			humanTokens(s.TotalInputTok), humanTokens(s.PeakInputToken),
+			s.Duration().Round(time.Second), humanTokens(int64(s.InputTokensPerSec())))
+		totalIn += s.TotalInputTok
+	}
+	fmt.Println(strings.Repeat("-", 82))
+	fmt.Printf("%d agents · %s tokens ingested total\n", len(stats), humanTokens(totalIn))
+	fmt.Println("(IN TOK = total tokens ingested across turns = credit/load driver; Kiro does not report output tokens.)")
+}
+
+// humanTokens formats a token count compactly: 1234 -> 1.2k, 23000000 -> 23.0M.
+func humanTokens(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
+}
+
+func truncateField(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 1 {
+		return s[:max]
+	}
+	return s[:max-1] + "…"
 }
 
 // printModels fetches the live model list from Kiro and prints it. This is the
@@ -2176,6 +2266,12 @@ func main() {
 		testProxy()
 	case "models":
 		printModels()
+	case "agents":
+		session := ""
+		if len(os.Args) > 2 {
+			session = os.Args[2]
+		}
+		printAgents(session)
 	case "resolve":
 		printResolve()
 	case "update":
@@ -3858,6 +3954,33 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 		io.Copy(w, strings.NewReader("OK"))
 	})
 
+	// Per-subagent stats endpoint: joins Claude Code's local subagent transcripts
+	// (which carry the name + per-turn token usage the proxy never sees) into a
+	// per-agent view. ?session=<id> selects a session; default is the most
+	// recently active one. Empty agents list when no local transcripts exist.
+	mux.HandleFunc("/agents", func(w http.ResponseWriter, r *http.Request) {
+		// No Access-Control-Allow-Origin: the live dashboard is served from this
+		// same origin, and per-agent names/usage shouldn't be readable cross-origin
+		// by any page the user has open. The session id is validated in the agents
+		// package before it touches the filesystem (no glob injection).
+		w.Header().Set("Content-Type", "application/json")
+		session := r.URL.Query().Get("session")
+		if session == "" {
+			session = agents.MostRecentSession()
+		}
+		stats := agents.SessionStats(session)
+		if stats == nil {
+			stats = []agents.Stats{}
+		}
+		data, err := json.Marshal(map[string]any{"session": session, "agents": stats})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.Copy(w, strings.NewReader(`{"error":"failed to serialize agent stats"}`))
+			return
+		}
+		w.Write(data)
+	})
+
 	// Resolve endpoint: shows how a model id routes to Kiro and whether the
 	// resolved model is in this account's live catalog. Used by the kiro-proxy
 	// plugin to answer "which model am I actually on, and can I use it?".
@@ -4085,9 +4208,9 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	proxyReq.Header.Set("Accept", "text/event-stream")
 	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
-	// Acquire semaphore to limit concurrent Kiro requests
-	getKiroSema() <- struct{}{}
-	defer func() { <-getKiroSema() }()
+	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
+	kiroSema.acquire()
+	defer kiroSema.release()
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response

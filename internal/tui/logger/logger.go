@@ -289,6 +289,7 @@ type Logger struct {
 	logDir            string            // directory holding log files, for intra-day rotation
 	fileDate          string            // "2006-01-02" of the active file, to roll over at midnight
 	fileBytes         int64             // running size of the active file, to trigger rotation without stat-per-write
+	maintWG           sync.WaitGroup    // tracks background compress/prune goroutines so DisableFileLogging can wait for them
 	requestCount      uint64            // Counter for generating unique request IDs
 	seqNumMap         map[string]int    // Maps session ID to current sequential number
 	lastReqBody       map[string]string // Last request body per session, for delta logging
@@ -411,7 +412,8 @@ func (l *Logger) maybeRollDateLocked() {
 		l.fileBytes = info.Size()
 	}
 	// Compress+prune the day we just rolled off, off the hot path.
-	go maintainLogDir(l.logDir, l.filePath)
+	l.maintWG.Add(1)
+	go func(dir, path string) { defer l.maintWG.Done(); maintainLogDir(dir, path) }(l.logDir, l.filePath)
 }
 
 // maybeRotateLocked rolls the active log file to a timestamped sibling once it
@@ -454,7 +456,8 @@ func (l *Logger) maybeRotateLocked() {
 	l.fileBytes = 0
 	// Compress the rotated file and enforce the total-size cap without blocking
 	// logging. maintainLogDir skips the (fresh) active file, so this is safe.
-	go maintainLogDir(l.logDir, l.filePath)
+	l.maintWG.Add(1)
+	go func(dir, path string) { defer l.maintWG.Done(); maintainLogDir(dir, path) }(l.logDir, l.filePath)
 }
 
 // maintainLogDir performs startup housekeeping on the log directory:
@@ -658,12 +661,15 @@ func parseRetentionDays(s string) int {
 // DisableFileLogging closes the log file
 func (l *Logger) DisableFileLogging() {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.fileWriter != nil {
 		l.fileWriter.Close()
 		l.fileWriter = nil
 	}
+	l.mu.Unlock()
+
+	// Wait for any in-flight background compress/prune goroutines so they can't
+	// write after the file is closed or race a test's temp-dir cleanup.
+	l.maintWG.Wait()
 }
 
 // Log adds a new log entry
