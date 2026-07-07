@@ -85,6 +85,15 @@
     </table>
   </div>
 
+  <div class="card">
+    <div class="row"><div class="label" style="margin-bottom:10px">Subagents <span class="pill" id="agentsession">—</span></div></div>
+    <table>
+      <thead><tr><th>Agent</th><th class="num">Turns</th><th class="num">In tok</th><th class="num">Peak</th><th class="num">In/s</th></tr></thead>
+      <tbody id="agents"><tr><td colspan="5" class="num">loading…</td></tr></tbody>
+    </table>
+    <div class="meta" style="margin-top:8px"><span>Per named subagent · Kiro reports 0 output tokens, so throughput is ingestion-based</span></div>
+  </div>
+
   <div class="foot">Auto-refreshes every <span id="iv">10</span>s · <span id="ts">—</span></div>
 
   <script>
@@ -210,10 +219,29 @@
       } catch (e) { /* leave previous content */ }
     }
 
+    async function loadAgents() {
+      try {
+        var r = await fetch('/agents', { cache: 'no-store' });
+        var d = await r.json();
+        document.getElementById('agentsession').textContent = (d.session || '').slice(-8) || '—';
+        var rows = (d.agents || []).map(function (a) {
+          var nm = a.name || a.agentType || '(unknown)';
+          return '<tr><td>' + esc(nm) + '</td>' +
+                 '<td class="num">' + (a.turns || 0) + '</td>' +
+                 '<td class="num">' + fmtCtx(a.totalInputTokens) + '</td>' +
+                 '<td class="num">' + fmtCtx(a.peakInputTokens) + '</td>' +
+                 '<td class="num">' + fmtCtx(Math.round(a.inputTokensPerSec || 0)) + '</td></tr>';
+        }).join('');
+        document.getElementById('agents').innerHTML = rows ||
+          '<tr><td colspan="5" class="num">no subagents in this session</td></tr>';
+      } catch (e) { /* leave previous content */ }
+    }
+
     function tick() {
       loadCredits();
       loadHistory();
       loadModels();
+      loadAgents();
       document.getElementById('ts').textContent = new Date().toLocaleTimeString();
     }
     tick();
