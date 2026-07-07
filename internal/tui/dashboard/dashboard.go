@@ -478,10 +478,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			newBypass := !currentBypass
 			m.bypassOverride = &newBypass
 
-			// If enabling bypass, disable comparison mode (mutually exclusive)
+			// If enabling bypass, disable comparison mode (mutually exclusive).
+			// Swap in a copy rather than mutating the live config in place — the
+			// proxy hot path reads it concurrently.
 			if newBypass && cfg.Advanced.ComparisonMode {
-				cfg.Advanced.ComparisonMode = false
-				config.Set(cfg) // Update in-memory config
+				updated := *cfg
+				updated.Advanced.ComparisonMode = false
+				config.Set(&updated)
 			}
 
 			// Log the mode change

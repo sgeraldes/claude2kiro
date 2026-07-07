@@ -72,6 +72,26 @@ func TestSessionStats_NoLocalFiles(t *testing.T) {
 	}
 }
 
+// TestSessionStats_RejectsGlobInjection ensures a glob-metacharacter session id
+// (e.g. "*") can't traverse into other projects/sessions via the Glob pattern.
+func TestSessionStats_RejectsGlobInjection(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", root)
+	// A real session that WOULD match a "*" glob.
+	subdir := filepath.Join(root, "projects", "p", "cccc1111-2222-4333-8444-ceaa090ceb21", "subagents")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeAgent(t, subdir, "dev-secret", `{"name":"dev-secret"}`,
+		[]string{`{"type":"assistant","timestamp":"2026-07-06T08:00:10.000Z","message":{"usage":{"input_tokens":1,"output_tokens":1}}}`})
+
+	for _, bad := range []string{"*", "?", "../*", "*/*", "a/b"} {
+		if got := SessionStats(bad); got != nil {
+			t.Fatalf("session id %q must be rejected, but returned %d agents", bad, len(got))
+		}
+	}
+}
+
 func TestMostRecentSession(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", root)

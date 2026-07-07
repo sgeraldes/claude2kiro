@@ -3959,8 +3959,11 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	// per-agent view. ?session=<id> selects a session; default is the most
 	// recently active one. Empty agents list when no local transcripts exist.
 	mux.HandleFunc("/agents", func(w http.ResponseWriter, r *http.Request) {
+		// No Access-Control-Allow-Origin: the live dashboard is served from this
+		// same origin, and per-agent names/usage shouldn't be readable cross-origin
+		// by any page the user has open. The session id is validated in the agents
+		// package before it touches the filesystem (no glob injection).
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		session := r.URL.Query().Get("session")
 		if session == "" {
 			session = agents.MostRecentSession()

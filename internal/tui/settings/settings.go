@@ -98,7 +98,12 @@ func New(width, height int, fromDashboard bool) Model {
 	ti.CharLimit = 200
 	ti.Width = 50
 
-	cfg := config.Get()
+	// Work on a private copy: applySetting mutates m.config fields in place, and
+	// the live config is read concurrently by the proxy hot path. Editing a copy
+	// and swapping it in atomically via config.Set (in Apply) avoids that race.
+	live := config.Get()
+	cfgCopy := *live
+	cfg := &cfgCopy
 
 	m := Model{
 		width:         width,

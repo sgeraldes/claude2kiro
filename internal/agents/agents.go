@@ -17,10 +17,18 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+// sessionIDRe bounds a session id to the shape Claude Code actually uses (a
+// UUID: hex + dashes). It is critical that the session id — which reaches here
+// from the /agents query parameter — never contains glob metacharacters or path
+// separators, because it is joined into a filepath.Glob pattern below. Without
+// this, `?session=*` would match every project/session on the machine.
+var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // Info is the subagent identity from its .meta.json sidecar.
 type Info struct {
@@ -40,6 +48,7 @@ type Stats struct {
 	TotalInputTok  int64     `json:"totalInputTokens"`
 	Start          time.Time `json:"start"`
 	End            time.Time `json:"end"`
+	Partial        bool      `json:"partial"` // true if the transcript couldn't be fully scanned (e.g. an oversized line), so stats undercount
 }
 
 // MarshalJSON adds the derived duration/throughput fields so API/dashboard
@@ -96,7 +105,7 @@ func claudeProjectsDir() string {
 // findSubagentsDir locates the subagents directory for a session across all
 // projects: <projects>/<project>/<sessionID>/subagents.
 func findSubagentsDir(sessionID string) string {
-	if sessionID == "" {
+	if sessionID == "" || !sessionIDRe.MatchString(sessionID) {
 		return ""
 	}
 	matches, _ := filepath.Glob(filepath.Join(claudeProjectsDir(), "*", sessionID, "subagents"))
@@ -169,7 +178,7 @@ func statsForAgent(metaPath, jsonlPath string) (Stats, bool) {
 	defer f.Close()
 
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // subagent lines can be large
+	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024) // subagent lines embed large tool outputs
 	for sc.Scan() {
 		line := sc.Bytes()
 		if !strings.Contains(string(line), `"type":"assistant"`) {
@@ -206,6 +215,11 @@ func statsForAgent(metaPath, jsonlPath string) (Stats, bool) {
 				s.End = t
 			}
 		}
+	}
+	// A scan error (e.g. bufio.ErrTooLong on a line past the 64MB buffer) means
+	// we stopped early; report partial stats rather than silently undercounting.
+	if sc.Err() != nil {
+		s.Partial = true
 	}
 	return s, true
 }

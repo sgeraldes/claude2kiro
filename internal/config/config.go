@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -235,20 +236,38 @@ func ExpandPath(path string) string {
 	return path
 }
 
-// Global config instance
-var current *Config
+// Global config instance, guarded by currentMu. The proxy hot path reads it on
+// every request (e.g. the concurrency limiter reads max_concurrent_requests),
+// while the TUI settings screen and dashboard swap it live via Set — so access
+// must be synchronized. Callers must treat the returned *Config as read-only and
+// install changes by building a new *Config and calling Set (never mutate the
+// pointed-to struct in place while it's live).
+var (
+	currentMu sync.RWMutex
+	current   *Config
+)
 
-// Get returns the current configuration (loads if not yet loaded)
+// Get returns the current configuration (loads defaults if not yet loaded).
 func Get() *Config {
+	currentMu.RLock()
+	c := current
+	currentMu.RUnlock()
+	if c != nil {
+		return c
+	}
+	currentMu.Lock()
+	defer currentMu.Unlock()
 	if current == nil {
 		current, _ = Load()
 	}
 	return current
 }
 
-// Set sets the current configuration
+// Set installs a new current configuration (atomic pointer swap).
 func Set(cfg *Config) {
+	currentMu.Lock()
 	current = cfg
+	currentMu.Unlock()
 }
 
 // Reload reloads configuration from file
@@ -257,7 +276,7 @@ func Reload() error {
 	if err != nil {
 		return err
 	}
-	current = cfg
+	Set(cfg)
 	return nil
 }
 
