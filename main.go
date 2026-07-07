@@ -861,6 +861,35 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 	)
 }
 
+// startTokenRefresher runs a goroutine that proactively renews the auth token
+// while the proxy is alive, so an idle proxy (no request traffic) never lets the
+// token lapse. It checks once immediately, then every minute; refreshTokenIfStale
+// is a no-op until the token is within its refresh window, so this is cheap. The
+// returned function stops the goroutine.
+func startTokenRefresher(lg *logger.Logger) func() {
+	done := make(chan struct{})
+	go func() {
+		refresh := func() {
+			if err := refreshTokenIfStale(); err != nil {
+				lg.LogError(fmt.Sprintf("Background token refresh failed: %v", err))
+			}
+		}
+		refresh() // catch a token that's already stale at startup
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				refresh()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
+}
+
 // refreshTokenIfStale refreshes the saved token when it is expired or expiring
 // within 5 minutes, mirroring what `claude2kiro run` does at startup. Returns
 // an error only when a refresh was needed and failed; a missing token is not
@@ -4037,6 +4066,14 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 	activeTUIServerMu.Lock()
 	serverStopWanted = false
 	activeTUIServerMu.Unlock()
+
+	// Keep the auth token fresh for the whole time the proxy is up, even with no
+	// request traffic. The on-request refresh (refreshTokenIfStale in the handler)
+	// never fires when the proxy sits idle, so the token would count down to
+	// EXPIRED, the credits panel would 403, and the next Claude Code call would
+	// stall on an expired token. Runs for the supervised lifetime of the proxy.
+	stopRefresher := startTokenRefresher(lg)
+	defer stopRefresher()
 
 	const maxRestarts = 5
 	const healthyRun = 60 * time.Second // a run longer than this isn't a crash loop
