@@ -3919,13 +3919,23 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 	const healthyRun = 60 * time.Second // a run longer than this isn't a crash loop
 	restarts := 0
 	for {
-		retry, served := serveProxyOnce(port, lg)
-
+		// Honor an intentional stop before (re)starting. This also covers a Stop
+		// that landed during the previous backoff window, when activeTUIServer was
+		// nil and StopServer's Shutdown had nothing live to act on — without this
+		// recheck the supervisor would rebind and defy the stop request.
 		activeTUIServerMu.Lock()
 		stopWanted := serverStopWanted
 		activeTUIServerMu.Unlock()
-		if !retry || stopWanted {
-			return // clean shutdown, terminal bind conflict, or user asked to stop
+		if stopWanted {
+			if p := lg.GetProgram(); p != nil {
+				p.Send(dashboard.ServerStoppedMsg{Err: nil})
+			}
+			return
+		}
+
+		retry, served := serveProxyOnce(port, lg)
+		if !retry {
+			return // clean shutdown or terminal bind conflict (handled in serveProxyOnce)
 		}
 
 		if served > healthyRun {
