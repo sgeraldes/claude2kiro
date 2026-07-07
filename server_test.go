@@ -15,9 +15,12 @@ import (
 // (via a defer registered before the bind). A failed start must leave any
 // existing ~/.claude2kiro/proxy.port untouched.
 func TestStartServerWithLogger_FailedBindKeepsPortFile(t *testing.T) {
-	// Occupy the port the way startServerWithLogger binds it (":port"), and
-	// serve /health so detectLiveProxy recognizes it as a live claude2kiro.
-	occupier, err := net.Listen("tcp", ":0")
+	// Occupy the port the way startServerWithLogger binds it ("127.0.0.1:port"),
+	// and serve /health so detectLiveProxy recognizes it as a live claude2kiro.
+	// This MUST match the proxy's bind address: on Windows a wildcard (":port")
+	// listener and a loopback-specific ("127.0.0.1:port") one coexist, so
+	// occupying ":0" would NOT create the bind conflict this test needs.
+	occupier, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to occupy a port: %v", err)
 	}
