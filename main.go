@@ -3311,6 +3311,7 @@ func runTUI() {
 		},
 		StopServer: func() tea.Msg {
 			activeTUIServerMu.Lock()
+			serverStopWanted = true // tell the supervisor this exit is intentional
 			srv := activeTUIServer
 			activeTUIServerMu.Unlock()
 			if srv != nil {
@@ -3900,11 +3901,56 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 var (
 	activeTUIServer   *http.Server
 	activeTUIServerMu sync.Mutex
+	serverStopWanted  bool             // guarded by activeTUIServerMu; true when the user asked to stop, so the supervisor won't auto-restart
 	proxyHttpClient   = &http.Client{} // Shared client for connection pooling
 )
 
-// startServerWithLogger starts the HTTP server with logging (used by TUI mode).
+// startServerWithLogger runs the TUI-mode HTTP proxy under a bounded supervisor:
+// if the server ever exits unexpectedly (rather than via an intentional
+// shutdown), it auto-restarts with linear backoff so the TUI isn't left running
+// with a dead proxy. The restart budget resets after any healthy run, so this
+// recovers from transient failures without masking a hard crash loop.
 func startServerWithLogger(port string, lg *logger.Logger) {
+	activeTUIServerMu.Lock()
+	serverStopWanted = false
+	activeTUIServerMu.Unlock()
+
+	const maxRestarts = 5
+	const healthyRun = 60 * time.Second // a run longer than this isn't a crash loop
+	restarts := 0
+	for {
+		retry, served := serveProxyOnce(port, lg)
+
+		activeTUIServerMu.Lock()
+		stopWanted := serverStopWanted
+		activeTUIServerMu.Unlock()
+		if !retry || stopWanted {
+			return // clean shutdown, terminal bind conflict, or user asked to stop
+		}
+
+		if served > healthyRun {
+			restarts = 0 // the crash followed a healthy run — not a tight loop
+		}
+		if restarts >= maxRestarts {
+			lg.LogError(fmt.Sprintf("Proxy exited unexpectedly %d times; auto-restart exhausted — restart it manually", maxRestarts))
+			if p := lg.GetProgram(); p != nil {
+				p.Send(dashboard.ServerStoppedMsg{Err: fmt.Errorf("proxy crashed repeatedly; auto-restart gave up after %d attempts", maxRestarts)})
+			}
+			return
+		}
+		restarts++
+		backoff := time.Duration(restarts) * time.Second
+		lg.LogInfo(fmt.Sprintf("Proxy exited unexpectedly — auto-restarting in %s (attempt %d/%d)", backoff, restarts, maxRestarts))
+		time.Sleep(backoff)
+	}
+}
+
+// serveProxyOnce runs one bind+serve cycle for the TUI-mode proxy. It returns
+// retry=true only when the server died in a way a restart might recover from;
+// false for an intentional shutdown or a terminal bind conflict (another proxy
+// already owns the port). served is how long Serve ran, so the supervisor can
+// tell a crash loop from an isolated failure after a healthy run.
+func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Duration) {
 	mux := buildServerMux(lg)
 
 	// Localhost-only proxy; TLS not needed for loopback traffic.
@@ -3919,15 +3965,19 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 	// that explicitly instead of a generic bind error.
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		detail := err.Error()
 		if existing, ok := detectLiveProxy(); ok {
-			detail = fmt.Sprintf("another claude2kiro proxy is already running at %s — stop it first (running two races the auth token and causes 403s)", existing)
+			// Another live proxy owns the port — terminal, don't restart.
+			detail := fmt.Sprintf("another claude2kiro proxy is already running at %s — stop it first (running two races the auth token and causes 403s)", existing)
+			lg.LogError("Server failed to start: " + detail)
+			if p := lg.GetProgram(); p != nil {
+				p.Send(dashboard.ServerStoppedMsg{Err: fmt.Errorf("%s", detail)})
+			}
+			return false, 0
 		}
-		lg.LogError("Server failed to start: " + detail)
-		if p := lg.GetProgram(); p != nil {
-			p.Send(dashboard.ServerStoppedMsg{Err: fmt.Errorf("%s", detail)})
-		}
-		return
+		// No live proxy detected: the port may still be releasing from our own
+		// prior crash (TIME_WAIT), so a bounded retry is worthwhile.
+		lg.LogError("Server failed to bind: " + err.Error())
+		return true, 0
 	}
 
 	// We own the port now — advertise it so `claude2kiro remote` can find us.
@@ -3945,16 +3995,24 @@ func startServerWithLogger(port string, lg *logger.Logger) {
 		p.Send(dashboard.ServerStartedMsg{Port: port})
 	}
 
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		lg.LogError(fmt.Sprintf("Server error: %v", err))
-	}
+	start := time.Now()
+	err = srv.Serve(ln)
+	served = time.Since(start)
 
 	activeTUIServerMu.Lock()
 	activeTUIServer = nil
 	activeTUIServerMu.Unlock()
-	if p := lg.GetProgram(); p != nil {
-		p.Send(dashboard.ServerStoppedMsg{Err: nil})
+
+	if err == http.ErrServerClosed {
+		// Intentional shutdown (StopServer or app quit).
+		if p := lg.GetProgram(); p != nil {
+			p.Send(dashboard.ServerStoppedMsg{Err: nil})
+		}
+		return false, served
 	}
+	// Unexpected exit — let the supervisor restart us.
+	lg.LogError(fmt.Sprintf("Server error: %v", err))
+	return true, served
 }
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
@@ -4026,6 +4084,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	var lastErr error
 
 	const maxAttempts = 5
+	refreshedOnce := false // one transparent token refresh per request (see 403 branch)
 	for attempt := range maxAttempts {
 		if attempt > 0 {
 			// Recreate request for retry (body was consumed)
@@ -4069,6 +4128,29 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// without this the proxy fails instantly and Claude Code re-sends the
 		// whole ~240k-token request, adding load and desynchronizing into waves.
 		overloaded := isTransientOverload(resp.StatusCode, body)
+
+		// Transparent recovery from an expired/invalid bearer token: the token
+		// lapsed mid-session (common on long runs). Refresh once and retry with
+		// the new token so the client never sees the 403 — previously the proxy
+		// refreshed but bounced "please retry" back to the caller, which had to
+		// intervene manually. Only once per request, so a genuinely dead refresh
+		// token can't spin a refresh loop; a still-403 after refresh falls
+		// through to the terminal error path below.
+		if resp.StatusCode == 403 && isInvalidBearerToken(body) && !refreshedOnce && attempt < maxAttempts-1 {
+			refreshedOnce = true
+			if err := tryRefreshToken(); err != nil {
+				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], err))
+				// Fall through to the terminal 403 handler, which surfaces a
+				// clear "refresh failed, please re-login" to the client.
+			} else {
+				if refreshed, gerr := getToken(); gerr == nil {
+					token = refreshed // next iteration rebuilds the request with the new token
+				}
+				lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
+				continue
+			}
+		}
+
 		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong)) {
 			if overloaded {
 				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
@@ -4681,13 +4763,17 @@ func claudeDesktopPIDs() []int {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
-	// Match the Store GUI exe by its package path and explicitly exclude the
-	// embedded claude-code CLI. The `-like '*WindowsApps*Claude*'` requires a
-	// real path, so a null/inaccessible Path (which `-notlike` alone would let
-	// through, since $null -notlike '*x*' is $true) can never land in the kill
-	// list — we only ever target processes we've positively identified.
+	// Identify the Store GUI processes while excluding the embedded claude-code
+	// CLI (whose Path contains "claude-code"). Store-app processes frequently
+	// return a null/inaccessible Path, so path matching alone silently misses a
+	// running Desktop — the exact failure that let `desktop` focus a stale
+	// instance instead of restarting it. So we positively identify a process as
+	// Desktop if EITHER its Path is under WindowsApps\...Claude..., OR (when Path
+	// is inaccessible) it carries a visible main window. The claude-code CLI is
+	// headless (no MainWindowHandle) and its Path, when readable, contains
+	// "claude-code" — so neither branch can ever select it.
 	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		`Get-Process claude -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*WindowsApps*Claude*' -and $_.Path -notlike '*claude-code*' } | Select-Object -ExpandProperty Id`).Output()
+		`Get-Process claude -ErrorAction SilentlyContinue | Where-Object { ($_.Path -like '*WindowsApps*Claude*') -or (($null -eq $_.Path) -and ($_.MainWindowHandle -ne 0)) } | Where-Object { $_.Path -notlike '*claude-code*' } | Select-Object -ExpandProperty Id`).Output()
 	if err != nil {
 		return nil
 	}
@@ -4698,6 +4784,29 @@ func claudeDesktopPIDs() []int {
 		}
 	}
 	return pids
+}
+
+// killClaudeDesktop force-stops every Claude Desktop GUI process and waits for
+// them to actually exit. Because Desktop is a single-instance Store app, a
+// relaunch that races a still-dying process just refocuses the old window (with
+// its stale config), so we poll until no Desktop PIDs remain before returning.
+// The embedded claude-code CLI is never in the target set (see claudeDesktopPIDs).
+func killClaudeDesktop() error {
+	for _, pid := range claudeDesktopPIDs() {
+		_ = exec.Command("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("Stop-Process -Id %d -Force -ErrorAction SilentlyContinue", pid)).Run()
+	}
+	// Wait up to ~5s for the process table to clear.
+	for range 25 {
+		if len(claudeDesktopPIDs()) == 0 {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if remaining := claudeDesktopPIDs(); len(remaining) > 0 {
+		return fmt.Errorf("processes still running after kill: %s", joinInts(remaining))
+	}
+	return nil
 }
 
 // claudeDesktopInstalled reports whether the Claude Desktop package is
@@ -4743,6 +4852,12 @@ func ensureClaudeDesktopInstalled() (bool, error) {
 // writes into Claude Desktop. Fixed so re-runs update in place and cleanup
 // (`claude2kiro disable`) can identify what we wrote.
 const desktopGatewayConfigID = "c14211b2-08e2-4c99-9c7b-e3d5e2b442fa"
+
+// desktopGatewayDummyAPIKey is a placeholder credential written into Desktop's
+// gateway config to satisfy its custom3p validator. The local proxy performs no
+// auth on incoming requests, so the value is never checked — it only needs to be
+// non-empty.
+const desktopGatewayDummyAPIKey = "claude2kiro"
 
 // ensureDesktopGatewayConfig writes Claude Desktop's managed gateway config
 // (%LOCALAPPDATA%\Claude-3p\configLibrary) pointing every Desktop surface
@@ -4794,9 +4909,16 @@ func ensureDesktopGatewayConfig(baseURL string) error {
 	}); err != nil {
 		return err
 	}
+	// A newer Claude Desktop build tightened its custom3p validator: a "gateway"
+	// provider must declare a credential, even one the local proxy ignores.
+	// Without it, Desktop rejects the whole config ("no credential configured
+	// for provider gateway: set inferenceCredentialKind ...") and refuses to
+	// route. The proxy doesn't check the key, so a static dummy satisfies it.
 	return writeJSON(filepath.Join(dir, desktopGatewayConfigID+".json"), map[string]any{
 		"inferenceProvider":       "gateway",
 		"inferenceGatewayBaseUrl": baseURL,
+		"inferenceCredentialKind": "static",
+		"inferenceApiKey":         desktopGatewayDummyAPIKey,
 	})
 }
 
@@ -4870,7 +4992,9 @@ func launchDesktop() {
 	}
 
 	// 3. If Claude Desktop is already running, prompt before killing it.
-	//    A restart is how Desktop picks up gateway/model/config changes.
+	//    A restart is how Desktop picks up gateway/model/config changes — and
+	//    because it's a single-instance Store app, relaunching without a full
+	//    restart just refocuses the existing window with the stale config.
 	if pids := claudeDesktopPIDs(); len(pids) > 0 {
 		fmt.Printf("Claude Desktop is already running (PID %s).\n", joinInts(pids))
 		fmt.Print("Restart it so config changes take effect? [y/N]: ")
@@ -4878,12 +5002,12 @@ func launchDesktop() {
 		ans, _ := reader.ReadString('\n')
 		ans = strings.ToLower(strings.TrimSpace(ans))
 		if ans == "y" || ans == "yes" {
-			for _, pid := range pids {
-				_ = exec.Command("powershell", "-NoProfile", "-Command",
-					fmt.Sprintf("Stop-Process -Id %d -Force", pid)).Run()
+			if err := killClaudeDesktop(); err != nil {
+				fmt.Fprintf(os.Stderr, "Could not fully stop Claude Desktop: %v\n", err)
+				fmt.Fprintln(os.Stderr, "Launching would only refocus the stale instance — aborting.")
+				os.Exit(1)
 			}
 			fmt.Println("Stopped existing Claude Desktop. Relaunching...")
-			time.Sleep(1 * time.Second)
 		} else {
 			fmt.Println("Leaving the running instance as-is. Nothing launched.")
 			return
