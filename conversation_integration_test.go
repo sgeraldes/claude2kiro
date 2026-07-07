@@ -56,21 +56,9 @@ func TestConcurrentSubagents_DistinctConversationIds(t *testing.T) {
 	cfg.Network.MaxConcurrentReqs = n
 	withConfig(t, &cfg)
 
-	// Force the shared Kiro semaphore to admit all n requests at once, regardless
-	// of on-disk config or which test triggered getKiroSema's sync.Once first.
-	// Without this the barrier below could deadlock (only <n arrive concurrently)
-	// and fail spuriously. Restore the prior state afterward.
-	prevSema := kiroRequestSema
-	kiroRequestSema = make(chan struct{}, n)
-	kiroSemaOnce.Do(func() {}) // consume the Once so getKiroSema returns ours
-	t.Cleanup(func() {
-		// Only restore a previously-initialized semaphore. If it was nil, the
-		// Once is now consumed and getKiroSema won't reinit, so leave our valid
-		// size-n channel in place (nil would block later tests forever).
-		if prevSema != nil {
-			kiroRequestSema = prevSema
-		}
-	})
+	// The live kiroLimiter reads MaxConcurrentReqs from config on each acquire,
+	// so setting it to n above lets all n requests below run concurrently and
+	// reach the barrier without a manual semaphore override.
 
 	lg := logger.NewLogger(100)
 

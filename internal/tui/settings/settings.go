@@ -298,6 +298,32 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "Number of characters shown in the log list preview column. Set to 0 for unlimited. Higher values show more content. Range: 0 (unlimited) - 200000.",
 			},
 		},
+		{
+			Key:         "logging.request_deltas",
+			Label:       "Request Deltas",
+			Description: "Log only the new tail of each request",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Logging.RequestDeltas),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "true",
+				RecommendedValue: "true",
+				Sensitive:        false,
+				DetailedDesc:     "Log only the NEW tail of each request body versus the previous request in the same session, instead of re-logging the whole (growing) conversation history every turn. Keeps log files far smaller. Disable only for full-fidelity debugging.",
+			},
+		},
+		{
+			Key:         "logging.compress_rotated",
+			Label:       "Compress Rotated Logs",
+			Description: "Gzip rotated log files",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Logging.CompressRotated),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "true",
+				RecommendedValue: "true",
+				Sensitive:        false,
+				DetailedDesc:     "Gzip rotated (non-active) .log files to .log.gz to save disk. Rotated files stay readable in the dashboard. Disable only if you need plain-text logs on disk.",
+			},
+		},
 	}
 
 	// Display settings
@@ -499,6 +525,38 @@ func (m *Model) loadSettings() {
 				ReferenceURL:     "https://pkg.go.dev/time#ParseDuration",
 			},
 		},
+		{
+			Key:         "network.max_concurrent_requests",
+			Label:       "Max Concurrent Requests",
+			Description: "Parallel requests to the Kiro backend",
+			Type:        TypeNumber,
+			Value:       fmt.Sprintf("%d", m.config.Network.MaxConcurrentReqs),
+			Min:         1,
+			Max:         32,
+			Step:        1,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "4",
+				RecommendedValue: "4",
+				Sensitive:        false,
+				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Range: 1-32.",
+			},
+		},
+		{
+			Key:         "network.max_tools_per_request",
+			Label:       "Max Tools Per Request",
+			Description: "Tool definitions sent per request",
+			Type:        TypeNumber,
+			Value:       fmt.Sprintf("%d", m.config.Network.MaxToolsPerRequest),
+			Min:         1,
+			Max:         200,
+			Step:        5,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "85",
+				RecommendedValue: "85",
+				Sensitive:        false,
+				DetailedDesc:     "Maximum number of tool definitions forwarded to Kiro per request. Kiro rejects requests with roughly 95+ tools, so this is capped below that. Lower it if you see tool-count-related 400 errors. Range: 1-200.",
+			},
+		},
 	}
 
 	// Advanced settings
@@ -622,6 +680,19 @@ func (m *Model) loadSettings() {
 				RecommendedValue: "false",
 				Sensitive:        false,
 				DetailedDesc:     "When enabled, the proxy writes raw request and response payloads to disk in ~/.claude2kiro/debug/ for troubleshooting. Can impact performance.",
+			},
+		},
+		{
+			Key:         "advanced.skip_permissions",
+			Label:       "Skip Permissions",
+			Description: "Pass --dangerously-skip-permissions to Claude Code",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.SkipPermissions),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "true",
+				RecommendedValue: "true",
+				Sensitive:        false,
+				DetailedDesc:     "When enabled, 'claude2kiro run'/'remote' launch Claude Code with --dangerously-skip-permissions so it doesn't prompt for tool approvals. Disable to have Claude Code ask before each tool use.",
 			},
 		},
 		{
@@ -764,6 +835,10 @@ func (m *Model) applySetting(s Setting) {
 		if v, err := strconv.Atoi(s.Value); err == nil {
 			m.config.Logging.PreviewLength = v
 		}
+	case "logging.request_deltas":
+		m.config.Logging.RequestDeltas = stringToBool(s.Value)
+	case "logging.compress_rotated":
+		m.config.Logging.CompressRotated = stringToBool(s.Value)
 
 	// Display
 	case "display.show_status_in_list":
@@ -805,6 +880,14 @@ func (m *Model) applySetting(s Setting) {
 		if d, err := parseDuration(s.Value); err == nil {
 			m.config.Network.StreamingDelayMax = d
 		}
+	case "network.max_concurrent_requests":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 1 {
+			m.config.Network.MaxConcurrentReqs = v
+		}
+	case "network.max_tools_per_request":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 1 {
+			m.config.Network.MaxToolsPerRequest = v
+		}
 
 	// Advanced
 	case "advanced.codewhisperer_endpoint":
@@ -828,6 +911,8 @@ func (m *Model) applySetting(s Setting) {
 		}
 	case "advanced.debug_mode":
 		m.config.Advanced.DebugMode = stringToBool(s.Value)
+	case "advanced.skip_permissions":
+		m.config.Advanced.SkipPermissions = stringToBool(s.Value)
 	case "advanced.stable_conversation_id":
 		m.config.Advanced.StableConversationID = stringToBool(s.Value)
 	case "advanced.history_mode":
