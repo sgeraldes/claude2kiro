@@ -36,6 +36,7 @@ import (
 	"github.com/manifoldco/promptui"
 
 	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/agents"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
@@ -928,6 +929,66 @@ func printResolve() {
 		fmt.Println("available on this account: NO — not in the live model list; Kiro will likely reject it")
 		fmt.Println("run 'claude2kiro models' to see the models this account can use")
 	}
+}
+
+// printAgents prints per-subagent stats for a Claude Code session, derived from
+// the local subagent transcripts (see internal/agents). With no session id it
+// uses the most recently active one. This surfaces the per-agent tokens/turns/
+// throughput the proxy alone can't attribute (all subagents share one session).
+func printAgents(session string) {
+	if session == "" {
+		session = agents.MostRecentSession()
+	}
+	if session == "" {
+		fmt.Println("No Claude Code subagent sessions found under ~/.claude/projects/.")
+		fmt.Println("Run a session that spawns Task subagents first.")
+		return
+	}
+	stats := agents.SessionStats(session)
+	fmt.Printf("Subagent stats — session %s\n\n", session)
+	if len(stats) == 0 {
+		fmt.Println("No subagents recorded for this session.")
+		return
+	}
+	fmt.Printf("%-18s %-16s %6s %9s %8s %8s %9s\n", "AGENT", "MODEL", "TURNS", "IN TOK", "PEAK IN", "DUR", "IN/s")
+	fmt.Println(strings.Repeat("-", 82))
+	var totalIn int64
+	for _, s := range stats {
+		name := s.Name
+		if name == "" {
+			name = s.AgentType
+		}
+		fmt.Printf("%-18s %-16s %6d %9s %8s %8s %9s\n",
+			truncateField(name, 18), truncateField(s.Model, 16), s.Turns,
+			humanTokens(s.TotalInputTok), humanTokens(s.PeakInputToken),
+			s.Duration().Round(time.Second), humanTokens(int64(s.InputTokensPerSec())))
+		totalIn += s.TotalInputTok
+	}
+	fmt.Println(strings.Repeat("-", 82))
+	fmt.Printf("%d agents · %s tokens ingested total\n", len(stats), humanTokens(totalIn))
+	fmt.Println("(IN TOK = total tokens ingested across turns = credit/load driver; Kiro does not report output tokens.)")
+}
+
+// humanTokens formats a token count compactly: 1234 -> 1.2k, 23000000 -> 23.0M.
+func humanTokens(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
+}
+
+func truncateField(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 1 {
+		return s[:max]
+	}
+	return s[:max-1] + "…"
 }
 
 // printModels fetches the live model list from Kiro and prints it. This is the
@@ -2205,6 +2266,12 @@ func main() {
 		testProxy()
 	case "models":
 		printModels()
+	case "agents":
+		session := ""
+		if len(os.Args) > 2 {
+			session = os.Args[2]
+		}
+		printAgents(session)
 	case "resolve":
 		printResolve()
 	case "update":
@@ -3885,6 +3952,30 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		io.Copy(w, strings.NewReader("OK"))
+	})
+
+	// Per-subagent stats endpoint: joins Claude Code's local subagent transcripts
+	// (which carry the name + per-turn token usage the proxy never sees) into a
+	// per-agent view. ?session=<id> selects a session; default is the most
+	// recently active one. Empty agents list when no local transcripts exist.
+	mux.HandleFunc("/agents", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		session := r.URL.Query().Get("session")
+		if session == "" {
+			session = agents.MostRecentSession()
+		}
+		stats := agents.SessionStats(session)
+		if stats == nil {
+			stats = []agents.Stats{}
+		}
+		data, err := json.Marshal(map[string]any{"session": session, "agents": stats})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.Copy(w, strings.NewReader(`{"error":"failed to serialize agent stats"}`))
+			return
+		}
+		w.Write(data)
 	})
 
 	// Resolve endpoint: shows how a model id routes to Kiro and whether the
