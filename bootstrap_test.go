@@ -187,8 +187,8 @@ func TestEnsureDesktopGatewayConfigWritesConfig(t *testing.T) {
 	if entry["inferenceCredentialKind"] != "static" {
 		t.Errorf("inferenceCredentialKind = %v, want static", entry["inferenceCredentialKind"])
 	}
-	if key, _ := entry["inferenceApiKey"].(string); key == "" {
-		t.Errorf("inferenceApiKey = %q, want a non-empty dummy credential", key)
+	if key, _ := entry["inferenceGatewayApiKey"].(string); key == "" {
+		t.Errorf("inferenceGatewayApiKey = %q, want a non-empty dummy credential", key)
 	}
 }
 
