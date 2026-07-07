@@ -405,6 +405,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clearStatusMsg:
 		m.menu.ClearStatus()
 
+	case LaunchClaudeResultMsg:
+		// Surface a spawn failure (e.g. no terminal, exec error) instead of
+		// silently swallowing it; success is visible in the new terminal window.
+		if msg.Err != nil {
+			m.menu.SetStatus(fmt.Sprintf("Launch failed: %v", msg.Err), true)
+			cmds = append(cmds, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return clearStatusMsg{}
+			}))
+		}
+
 	case cmd.RefreshResultMsg:
 		if msg.Success {
 			m.menu.SetStatus(fmt.Sprintf("Token refreshed! Expires: %s", msg.ExpiresAt.Format("15:04:05")), false)
