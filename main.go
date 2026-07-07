@@ -5095,12 +5095,54 @@ func ensureDesktopGatewayConfig(baseURL string) error {
 	// schema: kind "static" → apiKey flatKey:"inferenceGatewayApiKey"); an
 	// unrecognized field like inferenceApiKey is silently ignored, leaving the
 	// gateway credential-less and the config rejected.
-	return writeJSON(filepath.Join(dir, desktopGatewayConfigID+".json"), map[string]any{
+	if err := writeJSON(filepath.Join(dir, desktopGatewayConfigID+".json"), map[string]any{
 		"inferenceProvider":       "gateway",
 		"inferenceGatewayBaseUrl": baseURL,
 		"inferenceCredentialKind": "static",
 		"inferenceGatewayApiKey":  desktopGatewayDummyAPIKey,
-	})
+	}); err != nil {
+		return err
+	}
+
+	return ensureDesktopDeploymentMode(filepath.Dir(dir))
+}
+
+// ensureDesktopDeploymentMode un-parks the 3p profile. Desktop's startup gate
+// (decompiled from app.asar) is:
+//
+//	use3pProfile = configValid && (disableClaudeAiSignIn || deploymentMode != "1p")
+//
+// where deploymentMode persists in <Claude-3p>/claude_desktop_config.json.
+// When Desktop rejects a managed config (e.g. the pre-v1.6.4 credential-key
+// bug), it parks the profile with deploymentMode "1p" — and that value is
+// sticky: every later launch boots the consumer profile (user's own claude.ai
+// subscription) even once the gateway config is valid again. Flip it back to
+// "3p", preserving every other preference in the file. A missing file is fine
+// (mode undefined ≠ "1p" passes the gate), so only rewrite an existing one.
+func ensureDesktopDeploymentMode(profileDir string) error {
+	path := filepath.Join(profileDir, "claude_desktop_config.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // fresh profile: absent mode already passes the gate
+		}
+		return err
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		// Fail closed: don't rewrite a file we can't faithfully preserve.
+		return fmt.Errorf("existing %s can't be parsed (%v) — not rewriting; remove or fix its deploymentMode manually", path, err)
+	}
+	if mode, _ := cfg["deploymentMode"].(string); mode != "1p" {
+		return nil // not parked; nothing to do
+	}
+	cfg["deploymentMode"] = "3p"
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println("Claude Desktop's 3p profile was parked in consumer mode (deploymentMode \"1p\") — re-enabling gateway mode.")
+	return os.WriteFile(path, out, 0644)
 }
 
 // launchDesktop ensures Claude Desktop is installed, the proxy is up, and the
