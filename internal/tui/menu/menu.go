@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -150,6 +151,13 @@ func fetchCreditsInfo() CreditsInfo {
 }
 
 // fetchCreditsCmd returns a command that fetches credits
+// FetchCreditsCmd fetches Kiro credits and returns a CreditsUpdateMsg. Exported
+// so the root model can force an immediate refresh (e.g. right after a token
+// refresh) instead of waiting for the next periodic tick.
+func FetchCreditsCmd() tea.Cmd {
+	return fetchCreditsCmd()
+}
+
 func fetchCreditsCmd() tea.Cmd {
 	return func() tea.Msg {
 		// Check if this is a BuilderId account - skip credits API entirely
@@ -252,6 +260,7 @@ const (
 	ActionLogout          // Also used for Login (contextual)
 	ActionSettings
 	ActionQuit
+	ActionLaunchDesktop // Launch Claude Desktop routed through the proxy (Windows only)
 )
 
 // MenuActionMsg signals a menu action was selected
@@ -424,6 +433,10 @@ func (m *Model) rebuildMenuItems() {
 	if m.serverRunning {
 		items = append(items, MenuItem{ActionDashboard, "View Dashboard", "View the running server dashboard"})
 		items = append(items, MenuItem{ActionLaunchClaude, "Launch Claude Code", "Open Claude Code in a new terminal (connected to proxy)"})
+		// Claude Desktop is a Windows Store app; only offer it there.
+		if runtime.GOOS == "windows" {
+			items = append(items, MenuItem{ActionLaunchDesktop, "Launch Claude Desktop", "Configure & open Claude Desktop routed through the proxy"})
+		}
 	} else if isLoggedIn {
 		items = append(items, MenuItem{ActionServer, "Start Server", "Launch the API proxy server"})
 	}
@@ -523,13 +536,18 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		m.list.SetSize(msg.Width-8, msg.Height-12)
 
 	case StatusTickMsg:
-		// Refresh token info and rebuild menu if state changed
+		// Refresh token info and rebuild menu if state changed. Also re-fetch
+		// credits so a stale error (e.g. a 403 from a since-refreshed token)
+		// self-heals and usage stays current while the menu is open.
 		m.tokenInfo = getTokenInfo()
 		m.claudeConfig = getClaudeConfigStatus()
 		m.rebuildMenuItems()
-		return m, tea.Tick(30*time.Second, func(t time.Time) tea.Msg {
-			return StatusTickMsg(t)
-		})
+		return m, tea.Batch(
+			fetchCreditsCmd(),
+			tea.Tick(30*time.Second, func(t time.Time) tea.Msg {
+				return StatusTickMsg(t)
+			}),
+		)
 
 	case CreditsUpdateMsg:
 		m.credits = msg.Info
