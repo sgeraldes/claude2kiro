@@ -4924,11 +4924,15 @@ func ensureDesktopGatewayConfig(baseURL string) error {
 	// Without it, Desktop rejects the whole config ("no credential configured
 	// for provider gateway: set inferenceCredentialKind ...") and refuses to
 	// route. The proxy doesn't check the key, so a static dummy satisfies it.
+	// The flat key is inferenceGatewayApiKey (confirmed from Desktop's own
+	// schema: kind "static" → apiKey flatKey:"inferenceGatewayApiKey"); an
+	// unrecognized field like inferenceApiKey is silently ignored, leaving the
+	// gateway credential-less and the config rejected.
 	return writeJSON(filepath.Join(dir, desktopGatewayConfigID+".json"), map[string]any{
 		"inferenceProvider":       "gateway",
 		"inferenceGatewayBaseUrl": baseURL,
 		"inferenceCredentialKind": "static",
-		"inferenceApiKey":         desktopGatewayDummyAPIKey,
+		"inferenceGatewayApiKey":  desktopGatewayDummyAPIKey,
 	})
 }
 
