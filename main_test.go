@@ -65,6 +65,12 @@ func TestGetKiroModelID(t *testing.T) {
 		{"future opus 4.9 via family", "claude-opus-4-9", "claude-opus-4.8"},
 		{"unknown sonnet via family", "claude-sonnet-9-9", "claude-sonnet-4.6"},
 
+		// 4b. Unknown Claude family Kiro has no equivalent for (e.g. Fable/Mythos)
+		// -> best available Claude model, never a raw pass-through (Kiro rejects
+		// unknown ids with 400 INVALID_MODEL_ID, which looped Claude Code forever).
+		{"fable via best-claude fallback", "claude-fable-5", "claude-opus-4.8"},
+		{"mythos via best-claude fallback", "claude-mythos-5", "claude-opus-4.8"},
+
 		// 3/4. Raw kiro-style id passed straight through via catalog.
 		{"raw glm via catalog", "GLM-5", "glm-5"},
 	}
@@ -91,12 +97,47 @@ func TestGetKiroModelIDStaticFallback(t *testing.T) {
 		"claude-opus-4-9":   "claude-opus-4.6", // unknown version, no catalog -> static fallback
 		"claude-sonnet-9-9": "claude-sonnet-4.6",
 		"some-glm-thing":    "glm-5",
+		"claude-fable-5":    "claude-opus-4.6", // unknown Claude family, no catalog -> newest known stable
 	}
 	for in, want := range cases {
 		if got := getKiroModelID(in); got != want {
 			t.Errorf("getKiroModelID(%q) = %q, want %q (static fallback)", in, got, want)
 		}
 	}
+}
+
+// TestGetKiroModelIDUnknownClaudeFamilyNoOpus verifies that an unknown Claude
+// family falls through the live families in order (opus -> sonnet -> haiku)
+// when the account's catalog doesn't expose opus at all.
+func TestGetKiroModelIDUnknownClaudeFamilyNoOpus(t *testing.T) {
+	withStubCatalog(t, []models.KiroModel{
+		mk("claude-sonnet-4.6"),
+		mk("claude-haiku-4.5"),
+		mk("glm-5"),
+	})
+
+	if got := getKiroModelID("claude-fable-5"); got != "claude-sonnet-4.6" {
+		t.Errorf("getKiroModelID(claude-fable-5) = %q, want claude-sonnet-4.6 (opus-less catalog)", got)
+	}
+}
+
+// TestGetKiroModelIDUnknownClaudeFamilyClaudeFreeCatalog verifies that a
+// healthy live catalog with no Claude models at all never falls back to a
+// static Claude id the account provably lacks — it picks a model the account
+// has, preferring "auto".
+func TestGetKiroModelIDUnknownClaudeFamilyClaudeFreeCatalog(t *testing.T) {
+	t.Run("prefers auto when present", func(t *testing.T) {
+		withStubCatalog(t, []models.KiroModel{mk("glm-5"), mk("auto"), mk("deepseek-3.2")})
+		if got := getKiroModelID("claude-fable-5"); got != "auto" {
+			t.Errorf("getKiroModelID(claude-fable-5) = %q, want auto (claude-free catalog)", got)
+		}
+	})
+	t.Run("first listed model without auto", func(t *testing.T) {
+		withStubCatalog(t, []models.KiroModel{mk("glm-5"), mk("deepseek-3.2")})
+		if got := getKiroModelID("claude-fable-5"); got != "glm-5" {
+			t.Errorf("getKiroModelID(claude-fable-5) = %q, want glm-5 (claude-free catalog)", got)
+		}
+	})
 }
 
 func TestSanitizeToolName(t *testing.T) {
