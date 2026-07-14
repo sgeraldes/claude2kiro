@@ -121,6 +121,25 @@ func TestGetKiroModelIDUnknownClaudeFamilyNoOpus(t *testing.T) {
 	}
 }
 
+// TestGetKiroModelIDUnknownClaudeFamilyClaudeFreeCatalog verifies that a
+// healthy live catalog with no Claude models at all never falls back to a
+// static Claude id the account provably lacks — it picks a model the account
+// has, preferring "auto".
+func TestGetKiroModelIDUnknownClaudeFamilyClaudeFreeCatalog(t *testing.T) {
+	t.Run("prefers auto when present", func(t *testing.T) {
+		withStubCatalog(t, []models.KiroModel{mk("glm-5"), mk("auto"), mk("deepseek-3.2")})
+		if got := getKiroModelID("claude-fable-5"); got != "auto" {
+			t.Errorf("getKiroModelID(claude-fable-5) = %q, want auto (claude-free catalog)", got)
+		}
+	})
+	t.Run("first listed model without auto", func(t *testing.T) {
+		withStubCatalog(t, []models.KiroModel{mk("glm-5"), mk("deepseek-3.2")})
+		if got := getKiroModelID("claude-fable-5"); got != "glm-5" {
+			t.Errorf("getKiroModelID(claude-fable-5) = %q, want glm-5 (claude-free catalog)", got)
+		}
+	})
+}
+
 func TestSanitizeToolName(t *testing.T) {
 	// Short, valid names are unchanged.
 	for _, n := range []string{"Bash", "read_file", "mcp__slack__send", "a-b_c"} {

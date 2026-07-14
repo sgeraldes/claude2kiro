@@ -95,8 +95,10 @@ func TestProxyEndToEnd_SurfacesInvalidModel(t *testing.T) {
 	stubEndpoint(t, backend.URL+"/generateAssistantResponse")
 
 	mux := buildServerMux(logger.NewLogger(10))
+	// Requested and resolved ids differ (fable resolves to the stub catalog's
+	// best opus), so the assertions below prove the error names both.
 	reqBody, _ := json.Marshal(AnthropicRequest{
-		Model:     "glm-5",
+		Model:     "claude-fable-5",
 		MaxTokens: 64,
 		Stream:    true,
 		Messages:  []AnthropicRequestMessage{{Role: "user", Content: "hi"}},
@@ -110,6 +112,9 @@ func TestProxyEndToEnd_SurfacesInvalidModel(t *testing.T) {
 	}
 	if strings.Contains(body, "overloaded_error") {
 		t.Errorf("INVALID_MODEL_ID must not be labeled overloaded_error (the SDK auto-retries it); got:\n%s", body)
+	}
+	if !strings.Contains(body, "claude-fable-5") || !strings.Contains(body, "claude-opus-4.8") {
+		t.Errorf("error should name the requested (claude-fable-5) and actually-sent (claude-opus-4.8) model ids; got:\n%s", body)
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("backend hit %d times, want 1 (INVALID_MODEL_ID is deterministic; retrying it can never succeed)", got)
@@ -132,7 +137,7 @@ func TestNonStreamSurfacesBackendError(t *testing.T) {
 
 	mux := buildServerMux(logger.NewLogger(10))
 	reqBody, _ := json.Marshal(AnthropicRequest{
-		Model:     "glm-5",
+		Model:     "claude-fable-5",
 		MaxTokens: 64,
 		Stream:    false,
 		Messages:  []AnthropicRequestMessage{{Role: "user", Content: "hi"}},
@@ -156,7 +161,7 @@ func TestNonStreamSurfacesBackendError(t *testing.T) {
 	if envelope.Type != "error" || envelope.Error.Type != "invalid_request_error" {
 		t.Errorf("want type=error error.type=invalid_request_error, got %q/%q", envelope.Type, envelope.Error.Type)
 	}
-	if !strings.Contains(envelope.Error.Message, "glm-5") {
-		t.Errorf("error message should name the rejected model; got %q", envelope.Error.Message)
+	if !strings.Contains(envelope.Error.Message, "claude-fable-5") || !strings.Contains(envelope.Error.Message, "claude-opus-4.8") {
+		t.Errorf("error message should name the requested and actually-sent model ids; got %q", envelope.Error.Message)
 	}
 }

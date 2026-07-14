@@ -767,12 +767,23 @@ func getKiroModelID(anthropicModel string) string {
 	// 5. Unknown Claude family (e.g. "claude-fable-5"): Kiro serves no such
 	//    tier, and passing the id through draws a deterministic 400
 	//    INVALID_MODEL_ID. Serve the best Claude model this account exposes
-	//    instead, trying families best-first.
+	//    instead, trying families best-first. If the live catalog is healthy
+	//    but has no Claude models at all (rare plan shape), any model the
+	//    account actually has beats a static Claude id it provably lacks:
+	//    prefer "auto" (Kiro picks per task), else the first listed model.
 	if !matchedFamily && strings.HasPrefix(lower, "claude") {
 		for _, family := range []string{"opus", "sonnet", "haiku"} {
 			if id, ok := modelCatalog.ResolveFamily(family); ok {
 				return id
 			}
+		}
+		if live := modelCatalog.Models(); len(live) > 0 {
+			for _, m := range live {
+				if strings.EqualFold(m.ModelID, "auto") {
+					return m.ModelID
+				}
+			}
+			return live[0].ModelID
 		}
 	}
 
@@ -4391,10 +4402,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"Trimming unused MCP servers also reduces per-request size.")
 		} else if invalidModel {
 			// Kiro does not serve this model id at all. Non-retryable, so the
-			// user sees the cause instead of a silent retry loop.
+			// user sees the cause instead of a silent retry loop. Report the id
+			// the failed request actually carried, not a fresh resolution (the
+			// live catalog may have shifted since the request was built).
 			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
 				"Kiro rejected model %q (resolved to %q) as invalid: %s — this model does not exist on Kiro. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
-				anthropicReq.Model, getKiroModelID(anthropicReq.Model), strings.TrimSpace(string(body))))
+				anthropicReq.Model, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, strings.TrimSpace(string(body))))
 		} else if resp.StatusCode == 403 {
 			// 403 with a valid token is access denial — most commonly a model
 			// this Kiro account/plan does not expose. Send a non-retryable
@@ -6296,7 +6309,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			errType = "invalid_request_error"
 			msg = fmt.Sprintf(
 				"Kiro rejected model %q (resolved to %q) as invalid: %s — this model does not exist on Kiro. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
-				anthropicReq.Model, getKiroModelID(anthropicReq.Model), strings.TrimSpace(string(cwRespBody)))
+				anthropicReq.Model, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, strings.TrimSpace(string(cwRespBody)))
 		case resp.StatusCode == 400 && isContextLengthExceeded(cwRespBody):
 			errType = "invalid_request_error"
 			msg = "Context too long: this conversation exceeds Kiro's input-size limit. " +
