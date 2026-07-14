@@ -3902,6 +3902,10 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 		// Handle streaming request
 		var responsePreview string
 		var capturedKiroEvents []CapturedSSEEvent
+		// Streaming always answers 200 (errors ride inside the SSE stream);
+		// the non-stream path reports the status it actually wrote so backend
+		// errors show up as such in the dashboard instead of a hardcoded 200.
+		responseStatus := http.StatusOK
 		if anthropicReq.Stream {
 			// Pass capture slice if in comparison mode
 			var capture *[]CapturedSSEEvent
@@ -3910,12 +3914,12 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			}
 			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, token, lg, sessionID, reqResult.RequestID, capture)
 		} else {
-			handleNonStreamRequest(w, anthropicReq, token, lg, sessionID, reqResult.RequestID)
+			responseStatus = handleNonStreamRequest(w, anthropicReq, token, lg, sessionID, reqResult.RequestID)
 		}
 
 		// Log response
 		duration := time.Since(startTime)
-		lg.LogResponse(http.StatusOK, r.URL.Path, duration, responsePreview, sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+		lg.LogResponse(responseStatus, r.URL.Path, duration, responsePreview, sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
 
 		// Save Kiro events if in comparison mode
 		if cfg.Advanced.ComparisonMode && len(capturedKiroEvents) > 0 {
@@ -6222,8 +6226,10 @@ func getToken() (TokenData, error) {
 	return token, nil
 }
 
-// handleNonStreamRequest handles non-streaming requests
-func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string) {
+// handleNonStreamRequest handles non-streaming requests. It returns the HTTP
+// status it wrote so the caller's response log reflects backend errors instead
+// of a hardcoded 200 (streaming has no such choice: SSE commits 200 up front).
+func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string) int {
 	// Build CodeWhisperer request
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
 
@@ -6237,7 +6243,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	cwReqBody, err := jsonStr.Marshal(cwReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to serialize request: %v", err), http.StatusInternalServerError)
-		return
+		return http.StatusInternalServerError
 	}
 	if lg != nil {
 		lg.LogInfo(requestMetricsSummary(cwReq, len(cwReqBody), config.Get()))
@@ -6252,7 +6258,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create proxy request: %v", err), http.StatusInternalServerError)
-		return
+		return http.StatusInternalServerError
 	}
 
 	// Set request headers (same as streaming - Kiro always returns binary event stream)
@@ -6265,7 +6271,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	resp, err := proxyHttpClient.Do(proxyReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
-		return
+		return http.StatusInternalServerError
 	}
 	defer resp.Body.Close()
 
@@ -6273,7 +6279,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	cwRespBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-		return
+		return http.StatusInternalServerError
 	}
 
 	// Surface backend errors as real Anthropic error envelopes. An error JSON
@@ -6304,7 +6310,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		}); encErr != nil && lg != nil {
 			lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
 		}
-		return
+		return resp.StatusCode
 	}
 
 	// Debug: save CW request/response only when KIRO_DEBUG is set
@@ -6314,8 +6320,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		os.WriteFile(filepath.Join(debugDir, "last-cw-request.json"), cwReqBody, 0600)
 		os.WriteFile(filepath.Join(debugDir, "last-cw-response.bin"), cwRespBody, 0600)
 	}
-
-	respBodyStr := string(cwRespBody)
 
 	events := parser.ParseEvents(cwRespBody)
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
@@ -6395,12 +6399,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		})
 	}
 
-	// Check for error response
-	if strings.Contains(string(cwRespBody), "Improperly formed request.") {
-		http.Error(w, fmt.Sprintf("Request format error: %s", respBodyStr), http.StatusBadRequest)
-		return
-	}
-
 	// Build Anthropic response
 	anthropicResp := map[string]any{
 		"content":       contexts,
@@ -6418,6 +6416,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Send response
 	w.Header().Set("Content-Type", "application/json")
 	jsonStr.NewEncoder(w).Encode(anthropicResp)
+	return http.StatusOK
 }
 
 // sendSSEEvent sends an SSE event and optionally captures it

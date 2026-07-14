@@ -140,8 +140,8 @@ func TestNonStreamSurfacesBackendError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody)))
 
-	if rec.Code == http.StatusOK {
-		t.Fatalf("non-stream backend error must not answer 200; body:\n%s", rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("non-stream backend error status = %d, want 400; body:\n%s", rec.Code, rec.Body.String())
 	}
 	var envelope struct {
 		Type  string `json:"type"`
