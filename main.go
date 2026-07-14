@@ -726,8 +726,12 @@ var ModelMap = map[string]string{
 //     Kiro-style id.
 //  4. Family resolution from the live catalog - highest available version in the
 //     requested family (opus/sonnet/haiku/...).
-//  5. Static family fallback - newest known stable when the catalog is unreachable.
-//  6. Pass through as-is.
+//  5. Unknown Claude family (e.g. a tier Kiro has no equivalent for, like
+//     "claude-fable-5") - best available Claude model from the live catalog.
+//     Passing such an id through instead draws a 400 INVALID_MODEL_ID from
+//     Kiro, which the client's SDK retried silently forever.
+//  6. Static family fallback - newest known stable when the catalog is unreachable.
+//  7. Pass through as-is.
 func getKiroModelID(anthropicModel string) string {
 	// 1. Curated static map first.
 	if kiroModel, ok := ModelMap[anthropicModel]; ok {
@@ -749,8 +753,10 @@ func getKiroModelID(anthropicModel string) string {
 
 	// 4. Family resolution from the live catalog: pick the highest available
 	//    version in the requested family.
+	matchedFamily := false
 	for _, family := range []string{"opus", "haiku", "sonnet", "deepseek", "minimax", "qwen", "glm"} {
 		if strings.Contains(lower, family) {
+			matchedFamily = true
 			if id, ok := modelCatalog.ResolveFamily(family); ok {
 				return id
 			}
@@ -758,7 +764,19 @@ func getKiroModelID(anthropicModel string) string {
 		}
 	}
 
-	// 5. Static family fallback (catalog unreachable): newest known stable model.
+	// 5. Unknown Claude family (e.g. "claude-fable-5"): Kiro serves no such
+	//    tier, and passing the id through draws a deterministic 400
+	//    INVALID_MODEL_ID. Serve the best Claude model this account exposes
+	//    instead, trying families best-first.
+	if !matchedFamily && strings.HasPrefix(lower, "claude") {
+		for _, family := range []string{"opus", "sonnet", "haiku"} {
+			if id, ok := modelCatalog.ResolveFamily(family); ok {
+				return id
+			}
+		}
+	}
+
+	// 6. Static family fallback (catalog unreachable): newest known stable model.
 	switch {
 	case strings.Contains(lower, "opus"):
 		return "claude-opus-4.6"
@@ -774,9 +792,13 @@ func getKiroModelID(anthropicModel string) string {
 		return "qwen3-coder-next"
 	case strings.Contains(lower, "glm"):
 		return "glm-5"
+	case strings.HasPrefix(lower, "claude"):
+		// Unknown Claude family with no reachable catalog: any Claude model
+		// beats a guaranteed INVALID_MODEL_ID rejection.
+		return "claude-opus-4.6"
 	}
 
-	// 6. Last resort: pass through as-is (Kiro may accept it).
+	// 7. Last resort: pass through as-is (Kiro may accept it).
 	return anthropicModel
 }
 
@@ -4299,6 +4321,10 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// only fix) and must not be retried or mislabeled. Compute once, reuse below.
 		contextTooLong := resp.StatusCode == 400 && isContextLengthExceeded(body)
 
+		// Same for a 400 INVALID_MODEL_ID: the model id does not exist on the
+		// backend, so every retry fails identically.
+		invalidModel := resp.StatusCode == 400 && isInvalidModelID(body)
+
 		// Retry flaky 400s AND transient backend overload (429/503, or a 500
 		// "unexpectedly high load ... please try again") with jittered backoff.
 		// Overload is the common failure when many heavy subagents run at once;
@@ -4328,7 +4354,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			}
 		}
 
-		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong)) {
+		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !invalidModel)) {
 			if overloaded {
 				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
@@ -4359,6 +4385,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			sendNonRetryableErrorEvent(w, flusher, "Context too long: this conversation exceeds Kiro's input-size limit. "+
 				"Run /clear to start fresh or /compact to shrink the history, then retry. "+
 				"Trimming unused MCP servers also reduces per-request size.")
+		} else if invalidModel {
+			// Kiro does not serve this model id at all. Non-retryable, so the
+			// user sees the cause instead of a silent retry loop.
+			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
+				"Kiro rejected model %q (resolved to %q) as invalid: %s — this model does not exist on Kiro. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
+				anthropicReq.Model, getKiroModelID(anthropicReq.Model), strings.TrimSpace(string(body))))
 		} else if resp.StatusCode == 403 {
 			// 403 with a valid token is access denial — most commonly a model
 			// this Kiro account/plan does not expose. Send a non-retryable
@@ -6244,6 +6276,37 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		return
 	}
 
+	// Surface backend errors as real Anthropic error envelopes. An error JSON
+	// parsed as a binary event stream yields zero events, which used to come
+	// back as a 200 with empty content — invisible to the client.
+	if resp.StatusCode != http.StatusOK {
+		if lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream CodeWhisperer error status=%d: %s", resp.StatusCode, string(cwRespBody)))
+		}
+		errType := "api_error"
+		msg := fmt.Sprintf("CodeWhisperer error (status %d): %s", resp.StatusCode, strings.TrimSpace(string(cwRespBody)))
+		switch {
+		case resp.StatusCode == 400 && isInvalidModelID(cwRespBody):
+			errType = "invalid_request_error"
+			msg = fmt.Sprintf(
+				"Kiro rejected model %q (resolved to %q) as invalid: %s — this model does not exist on Kiro. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
+				anthropicReq.Model, getKiroModelID(anthropicReq.Model), strings.TrimSpace(string(cwRespBody)))
+		case resp.StatusCode == 400 && isContextLengthExceeded(cwRespBody):
+			errType = "invalid_request_error"
+			msg = "Context too long: this conversation exceeds Kiro's input-size limit. " +
+				"Run /clear to start fresh or /compact to shrink the history, then retry."
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		if encErr := json.NewEncoder(w).Encode(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": errType, "message": msg},
+		}); encErr != nil && lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
+		}
+		return
+	}
+
 	// Debug: save CW request/response only when KIRO_DEBUG is set
 	if os.Getenv("KIRO_DEBUG") != "" {
 		debugDir := filepath.Join(os.TempDir(), "kiro-debug")
@@ -6414,6 +6477,30 @@ func isContextLengthExceeded(body []byte) bool {
 	}
 	// Non-JSON body: only trust the structured enum, never the English phrase.
 	return strings.Contains(strings.ToLower(string(body)), "content_length_exceeds_threshold")
+}
+
+// isInvalidModelID reports whether a CodeWhisperer 400 body says the requested
+// model id does not exist on the backend: {"message":"Invalid model. Please
+// select a different model to continue.","reason":"INVALID_MODEL_ID"}. The
+// failure is deterministic — retrying can never succeed — and the generic error
+// path labels it overloaded_error, which the Anthropic SDK auto-retries, so the
+// client looped silently forever instead of showing the user anything.
+func isInvalidModelID(body []byte) bool {
+	var parsed struct {
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if strings.EqualFold(parsed.Reason, "invalid_model_id") {
+			return true
+		}
+		// Match the message field exactly (see isContextLengthExceeded: AWS can
+		// echo user content into other 400 errors, so no loose substring scan).
+		return strings.TrimRight(strings.ToLower(parsed.Message), ". ") ==
+			"invalid model. please select a different model to continue"
+	}
+	// Non-JSON body: only trust the structured enum, never the English phrase.
+	return strings.Contains(strings.ToLower(string(body)), "invalid_model_id")
 }
 
 // isTransientOverload reports whether a non-200 CodeWhisperer response is a
