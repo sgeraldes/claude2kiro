@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 )
@@ -174,6 +175,52 @@ func TestProxyEndToEnd_ReactiveInvalidModelNoRetry(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("backend hit %d times, want 1 (INVALID_MODEL_ID is deterministic; retrying it can never succeed)", got)
+	}
+}
+
+// TestProxyEndToEnd_OverloadedModeReturns529 verifies the spike behavior: with
+// Advanced.UnservableModelMode == "overloaded", an unservable model is answered
+// with HTTP 529 (overloaded_error) instead of the default invalid_request_error,
+// so a client launched with --fallback-model performs a native model switch.
+// Still caught pre-flight (0 backend hits), for both stream and non-stream.
+func TestProxyEndToEnd_OverloadedModeReturns529(t *testing.T) {
+	writeFakeToken(t)
+	withStubCatalog(t, stubList()) // has opus/sonnet/haiku/glm..., NOT fable
+
+	orig := config.Get()
+	cp := *orig
+	cp.Advanced.UnservableModelMode = "overloaded"
+	config.Set(&cp)
+	t.Cleanup(func() { config.Set(orig) })
+
+	var hits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Write(cwFrame(`{"content":"should-not-be-called"}`))
+	}))
+	defer backend.Close()
+	stubEndpoint(t, backend.URL+"/generateAssistantResponse")
+
+	mux := buildServerMux(logger.NewLogger(10))
+	for _, stream := range []bool{true, false} {
+		reqBody, _ := json.Marshal(AnthropicRequest{
+			Model:     "claude-fable-5",
+			MaxTokens: 64,
+			Stream:    stream,
+			Messages:  []AnthropicRequestMessage{{Role: "user", Content: "hi"}},
+		})
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody)))
+
+		if rec.Code != 529 {
+			t.Errorf("stream=%v: overloaded mode status = %d, want 529", stream, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "overloaded_error") {
+			t.Errorf("stream=%v: want overloaded_error body; got:\n%s", stream, rec.Body.String())
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Errorf("backend hit %d times, want 0 (still caught pre-flight)", got)
 	}
 }
 

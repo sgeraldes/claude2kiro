@@ -798,10 +798,46 @@ func modelUnavailableMessage(requested, kiroID string) string {
 	return b.String()
 }
 
+// codeWhispererOverloadedStatus is the HTTP status the proxy returns for an
+// unservable model when Advanced.UnservableModelMode == "overloaded". Claude
+// Code treats 429/529 on /v1/messages as an "overloaded" error and, if the
+// session was launched with --fallback-model <id>, natively switches to that
+// model (statusline updates; no dialog). See the model-fallback (FallbackTriggeredError)
+// path in the client.
+const codeWhispererOverloadedStatus = 529
+
+// unservableModelMode returns the effective response mode for an unservable
+// model: the CLAUDE2KIRO_UNSERVABLE_MODE env override (handy for a spike test
+// without editing config) if set, else Advanced.UnservableModelMode, else "error".
+func unservableModelMode() string {
+	if e := strings.TrimSpace(os.Getenv("CLAUDE2KIRO_UNSERVABLE_MODE")); e != "" {
+		return e
+	}
+	if m := config.Get().Advanced.UnservableModelMode; m != "" {
+		return m
+	}
+	return "error"
+}
+
 // writeModelUnavailable responds to a request whose model Kiro can't serve,
 // without contacting the backend. It matches the client's stream/non-stream
 // expectation and returns the HTTP status written (for response logging).
+//
+// In the default "error" mode it surfaces a non-retryable invalid_request_error
+// listing the account's models. In "overloaded" mode it instead returns a real
+// HTTP 529 overloaded_error so a client launched with --fallback-model performs
+// a native model switch. Because the pre-flight check runs before any SSE bytes
+// are written, a real HTTP status can still be set here for both stream types.
 func writeModelUnavailable(w http.ResponseWriter, stream bool, message string) int {
+	if unservableModelMode() == "overloaded" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(codeWhispererOverloadedStatus)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "overloaded_error", "message": message},
+		})
+		return codeWhispererOverloadedStatus
+	}
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")

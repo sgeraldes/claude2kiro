@@ -92,6 +92,7 @@ type AdvancedConfig struct {
 	ToolMode              string `yaml:"tool_mode"`               // Request diet tool mode: full, compact, none_text (default: full)
 	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
 	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
+	UnservableModelMode   string `yaml:"unservable_model_mode"`   // How to respond when Kiro can't serve the model: "error" (default; invalid_request_error listing models) or "overloaded" (HTTP 529 to trigger Claude Code's native --fallback-model switch)
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -168,6 +169,7 @@ func Default() *Config {
 			ToolMode:              "full",
 			ToolCompactMaxChars:   1024,
 			AggressiveCachePoints: false,
+			UnservableModelMode:   "error",
 		},
 	}
 }
