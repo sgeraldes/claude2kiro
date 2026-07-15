@@ -253,6 +253,22 @@ func (c *Catalog) Available() bool {
 	return len(c.models) > 0
 }
 
+// Fresh reports whether the catalog holds a list from a recent SUCCESSFUL fetch
+// (within the TTL). Unlike Available, it is false when the only cached data is
+// stale because the live fetch is currently failing: refreshIfStale keeps
+// serving stale-but-usable data on error and does not advance fetchedAt. Use
+// this to distinguish "this account definitively lacks a model" (fresh list, so
+// a negative is authoritative) from "we can't verify right now" (stale/empty).
+func (c *Catalog) Fresh() bool {
+	if c == nil {
+		return false
+	}
+	c.refreshIfStale()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
+}
+
 // ResolveFamily returns the highest-version available model ID whose ID contains
 // the given family keyword (e.g. "opus", "sonnet", "glm"). ok is false when the
 // catalog is empty or no model matches.
@@ -431,9 +447,10 @@ When the user wants to switch models, follow this flow:
 
 Important: the dialog shown by ` + "`/model`" + ` (no argument) is built into the
 Claude Code binary and varies with its version and login state — the proxy
-cannot add entries to it. A model missing from that dialog is still fully
-usable by passing its id explicitly: ` + "`/model <id>`" + ` always reaches the
-proxy, which maps it to a valid Kiro model (see resolution order below).
+cannot add entries to it. A model missing from that dialog is still usable by
+passing its id explicitly: ` + "`/model <id>`" + ` always reaches the proxy, which
+serves it when your account has it and otherwise catches the request and tells
+you which models it can use (see resolution order below).
 
 ## Checking the current model
 
@@ -442,8 +459,16 @@ context:
 
 1. Your own system prompt states the exact model id Claude Code sends (the
    "exact model ID is …" line); the statusline shows it too.
-2. Map it to the Kiro model that actually serves it:
-   ` + "`curl -s \"$ANTHROPIC_BASE_URL/resolve?model=<that-id>\"`" + `
+2. Map it to the Kiro model that actually serves it. Resolve the proxy URL
+   robustly (env var, else the running proxy's advertised port, else :8080):
+   ` + "```bash" + `
+   base="${ANTHROPIC_BASE_URL}"
+   if [ -z "$base" ]; then
+     port="$(tr -d '[:space:]' < "$HOME/.claude2kiro/proxy.port" 2>/dev/null)"
+     [ -n "$port" ] && base="http://127.0.0.1:$port" || base="http://localhost:8080"
+   fi
+   curl -s --max-time 6 "$base/resolve?model=<that-id>"
+   ` + "```" + `
    (outside a session: ` + "`claude2kiro resolve <that-id>`" + `).
    The JSON answers: ` + "`kiro_model`" + ` (what serves the request) and
    ` + "`in_live_catalog`" + ` (whether THIS account can use it).
@@ -469,14 +494,17 @@ When Claude Code sends a model ID, the proxy resolves it as follows:
    ID is in the live list, use it. This makes new Claude releases route correctly
    the moment Kiro exposes them, with no code change.
 3. **Raw catalog match** — if Claude Code already sent a Kiro-style ID.
-4. **Family resolution (live)** — picks the highest available version in the family
-   (e.g. an unknown ` + "`claude-opus-4-9`" + ` → newest available opus).
-5. **Unknown Claude family (live)** — a Claude tier Kiro doesn't serve (e.g.
-   ` + "`claude-fable-5`" + `) gets the best available Claude model (opus → sonnet → haiku).
-6. **Static family fallback** — newest known stable when the catalog is unreachable
-   (an unknown Claude family falls back to the newest known stable opus).
-7. **Pass through** as-is. If Kiro still rejects the id (400 INVALID_MODEL_ID),
-   the proxy surfaces a clear non-retryable error instead of retrying silently.
+4. **Best-effort candidate** — the normalized Kiro-form of a versioned Claude ID
+   (` + "`claude-opus-4-9`" + ` → ` + "`claude-opus-4.9`" + `), else the ID as sent. The proxy does
+   **not** substitute a different model here.
+
+The proxy resolves but never *substitutes*. If the resolved model isn't servable
+on your account (not in the live catalog), the proxy **catches the request and
+asks you to switch** instead of routing you to a different model at a different
+price: it replies with the error, your available model list, and how to change —
+` + "`/model auto`" + ` (Kiro picks the best model per task) or ` + "`/model <id>`" + `. It also
+never burns retries on a model Kiro can't serve (a 400 ` + "`INVALID_MODEL_ID`" + ` is
+surfaced immediately, not retried).
 
 ## Kiro Plans
 

@@ -715,23 +715,25 @@ var ModelMap = map[string]string{
 	"glm":   "glm-5",
 }
 
-// getKiroModelID converts an Anthropic model name to a Kiro model ID.
+// getKiroModelID converts an Anthropic model name to the Kiro model ID to send.
+//
+// It resolves but never *substitutes*: if the requested model has no servable
+// equivalent, it returns a best-effort candidate (the normalized Kiro-form, or
+// the id as sent) rather than swapping in a different model. The caller gates
+// the result with modelServable and, when it isn't servable, catches the
+// request and asks the user to choose — see the /v1/messages handler. Silently
+// routing an unknown model to a different one changes both the model's identity
+// and its credit cost without consent, so we don't.
 //
 // Resolution order:
 //  1. Curated static ModelMap (exact match) - fast, offline, handles legacy remaps.
-//  2. Normalized form against the live catalog - lets a brand-new Claude version
-//     (e.g. a freshly released Opus) route correctly the moment Kiro exposes it,
-//     with no code change. "claude-opus-4-8" -> "claude-opus-4.8" -> available? use it.
-//  3. Raw lowercased id against the live catalog - if Claude Code already sent a
-//     Kiro-style id.
-//  4. Family resolution from the live catalog - highest available version in the
-//     requested family (opus/sonnet/haiku/...).
-//  5. Unknown Claude family (e.g. a tier Kiro has no equivalent for, like
-//     "claude-fable-5") - best available Claude model from the live catalog.
-//     Passing such an id through instead draws a 400 INVALID_MODEL_ID from
-//     Kiro, which the client's SDK retried silently forever.
-//  6. Static family fallback - newest known stable when the catalog is unreachable.
-//  7. Pass through as-is.
+//  2. Normalized form found in the live catalog - lets a brand-new Claude version
+//     route correctly the moment Kiro exposes it. "claude-opus-4-8" ->
+//     "claude-opus-4.8" -> in catalog? use it.
+//  3. Raw lowercased id found in the live catalog - if Claude Code already sent a
+//     Kiro-style id (e.g. "glm-5").
+//  4. Best-effort candidate: the normalized Kiro-form of a versioned Claude id,
+//     else the id as sent. Not guaranteed servable — modelServable decides.
 func getKiroModelID(anthropicModel string) string {
 	// 1. Curated static map first.
 	if kiroModel, ok := ModelMap[anthropicModel]; ok {
@@ -739,78 +741,88 @@ func getKiroModelID(anthropicModel string) string {
 	}
 
 	// 2. Normalize to Kiro's dotted form and check the live catalog.
-	if normalized := models.NormalizeAnthropicID(anthropicModel); normalized != "" {
-		if modelCatalog.Has(normalized) {
-			return normalized
-		}
+	normalized := models.NormalizeAnthropicID(anthropicModel)
+	if normalized != "" && modelCatalog.Has(normalized) {
+		return normalized
 	}
 
 	// 3. Maybe Claude Code already sent a Kiro-style id (e.g. "glm-5").
-	lower := strings.ToLower(anthropicModel)
-	if modelCatalog.Has(lower) {
+	if lower := strings.ToLower(anthropicModel); modelCatalog.Has(lower) {
 		return lower
 	}
 
-	// 4. Family resolution from the live catalog: pick the highest available
-	//    version in the requested family.
-	matchedFamily := false
-	for _, family := range []string{"opus", "haiku", "sonnet", "deepseek", "minimax", "qwen", "glm"} {
-		if strings.Contains(lower, family) {
-			matchedFamily = true
-			if id, ok := modelCatalog.ResolveFamily(family); ok {
-				return id
-			}
-			break
-		}
+	// 4. Best-effort candidate — no cross-model substitution. The normalized
+	//    Kiro-form keeps a versioned Claude id readable (claude-opus-4-9 ->
+	//    claude-opus-4.9); anything else passes through unchanged.
+	if normalized != "" {
+		return normalized
 	}
-
-	// 5. Unknown Claude family (e.g. "claude-fable-5"): Kiro serves no such
-	//    tier, and passing the id through draws a deterministic 400
-	//    INVALID_MODEL_ID. Serve the best Claude model this account exposes
-	//    instead, trying families best-first. If the live catalog is healthy
-	//    but has no Claude models at all (rare plan shape), any model the
-	//    account actually has beats a static Claude id it provably lacks:
-	//    prefer "auto" (Kiro picks per task), else the first listed model.
-	if !matchedFamily && strings.HasPrefix(lower, "claude") {
-		for _, family := range []string{"opus", "sonnet", "haiku"} {
-			if id, ok := modelCatalog.ResolveFamily(family); ok {
-				return id
-			}
-		}
-		if live := modelCatalog.Models(); len(live) > 0 {
-			for _, m := range live {
-				if strings.EqualFold(m.ModelID, "auto") {
-					return m.ModelID
-				}
-			}
-			return live[0].ModelID
-		}
-	}
-
-	// 6. Static family fallback (catalog unreachable): newest known stable model.
-	switch {
-	case strings.Contains(lower, "opus"):
-		return "claude-opus-4.6"
-	case strings.Contains(lower, "haiku"):
-		return "claude-haiku-4.5"
-	case strings.Contains(lower, "sonnet"):
-		return "claude-sonnet-4.6"
-	case strings.Contains(lower, "deepseek"):
-		return "deepseek-3.2"
-	case strings.Contains(lower, "minimax"):
-		return "minimax-m2.5"
-	case strings.Contains(lower, "qwen"):
-		return "qwen3-coder-next"
-	case strings.Contains(lower, "glm"):
-		return "glm-5"
-	case strings.HasPrefix(lower, "claude"):
-		// Unknown Claude family with no reachable catalog: any Claude model
-		// beats a guaranteed INVALID_MODEL_ID rejection.
-		return "claude-opus-4.6"
-	}
-
-	// 7. Last resort: pass through as-is (Kiro may accept it).
 	return anthropicModel
+}
+
+// modelServable reports whether a resolved Kiro model id can be sent to the
+// backend. "auto" is always valid (Kiro picks the model per task). A negative
+// is only trusted when the catalog is Fresh (a recent successful fetch): a
+// stale or unreachable catalog can't authoritatively say a model is absent —
+// serving stale data would wrongly catch a just-added model — so we allow the
+// request through and let the backend's own 400 be the backstop (see
+// isInvalidModelID). Otherwise the model must be in this account's live catalog.
+func modelServable(kiroID string) bool {
+	if strings.EqualFold(kiroID, "auto") {
+		return true
+	}
+	if !modelCatalog.Fresh() {
+		return true
+	}
+	return modelCatalog.Has(kiroID)
+}
+
+// modelUnavailableMessage builds the actionable error shown when Kiro can't
+// serve the requested model: what was asked, how to switch, and the account's
+// real model list (when the catalog is available).
+func modelUnavailableMessage(requested, kiroID string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The model %q isn't available on your Kiro account", requested)
+	if kiroID != "" && !strings.EqualFold(kiroID, requested) {
+		fmt.Fprintf(&b, " (resolved to %q)", kiroID)
+	}
+	b.WriteString(". Switch with /model auto (Kiro picks the best model for each task) or /model <id> for a specific one.")
+	if list := modelCatalog.Models(); len(list) > 0 {
+		ids := make([]string, 0, len(list))
+		for _, m := range list {
+			ids = append(ids, m.ModelID)
+		}
+		fmt.Fprintf(&b, " Available on your account: %s.", strings.Join(ids, ", "))
+	}
+	b.WriteString(" Run /kiro-proxy:models (or `claude2kiro models`) to list them with details.")
+	return b.String()
+}
+
+// writeModelUnavailable responds to a request whose model Kiro can't serve,
+// without contacting the backend. It matches the client's stream/non-stream
+// expectation and returns the HTTP status written (for response logging).
+func writeModelUnavailable(w http.ResponseWriter, stream bool, message string) int {
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
+			return http.StatusInternalServerError
+		}
+		// SSE commits 200 up front; the non-retryable error rides in the stream.
+		sendNonRetryableErrorEvent(w, flusher, message)
+		return http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "invalid_request_error", "message": message},
+	})
+	return http.StatusBadRequest
 }
 
 // staticModelList returns a curated list of Kiro models built from the static
@@ -3863,6 +3875,23 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			return
 		}
 
+		// Pre-flight model check: if the live catalog shows Kiro can't serve the
+		// requested model, catch it here — don't spend a backend request on a
+		// deterministic rejection, and don't silently substitute a different
+		// (differently-priced) model. Tell the user how to switch instead. Runs
+		// before comparison mode so an unservable model doesn't spawn an upstream
+		// Anthropic comparison call either. AnthropicDirect already returned
+		// above (its models are real Anthropic ids, not gated by Kiro's catalog).
+		// When the catalog can't verify, the request proceeds and the backend's
+		// 400 INVALID_MODEL_ID is the backstop (see handleStreamRequestWithLogger).
+		kiroModel := getKiroModelID(anthropicReq.Model)
+		if !modelServable(kiroModel) {
+			lg.LogError(fmt.Sprintf("Model %q (resolved to %q) is not in this account's live catalog — catching pre-flight", anthropicReq.Model, kiroModel))
+			status := writeModelUnavailable(w, anthropicReq.Stream, modelUnavailableMessage(anthropicReq.Model, kiroModel))
+			lg.LogResponse(status, r.URL.Path, time.Since(startTime), "", sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+			return
+		}
+
 		// Comparison mode: shared timestamp for correlated saves
 		var comparisonTimestamp string
 
@@ -4401,13 +4430,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				"Run /clear to start fresh or /compact to shrink the history, then retry. "+
 				"Trimming unused MCP servers also reduces per-request size.")
 		} else if invalidModel {
-			// Kiro does not serve this model id at all. Non-retryable, so the
-			// user sees the cause instead of a silent retry loop. Report the id
-			// the failed request actually carried, not a fresh resolution (the
-			// live catalog may have shifted since the request was built).
-			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
-				"Kiro rejected model %q (resolved to %q) as invalid: %s — this model does not exist on Kiro. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
-				anthropicReq.Model, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, strings.TrimSpace(string(body))))
+			// Kiro does not serve this model id at all (backstop for when the
+			// pre-flight check couldn't run because the catalog was cold).
+			// Non-retryable, so the user sees the cause and the fix instead of a
+			// silent retry loop. Name the id the failed request actually carried.
+			sendNonRetryableErrorEvent(w, flusher, modelUnavailableMessage(
+				anthropicReq.Model, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId))
 		} else if resp.StatusCode == 403 {
 			// 403 with a valid token is access denial — most commonly a model
 			// this Kiro account/plan does not expose. Send a non-retryable
@@ -6307,9 +6335,8 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		switch {
 		case resp.StatusCode == 400 && isInvalidModelID(cwRespBody):
 			errType = "invalid_request_error"
-			msg = fmt.Sprintf(
-				"Kiro rejected model %q (resolved to %q) as invalid: %s — this model does not exist on Kiro. Run 'claude2kiro models' to see your account's model list, then switch with /model <id>.",
-				anthropicReq.Model, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, strings.TrimSpace(string(cwRespBody)))
+			msg = modelUnavailableMessage(
+				anthropicReq.Model, cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId)
 		case resp.StatusCode == 400 && isContextLengthExceeded(cwRespBody):
 			errType = "invalid_request_error"
 			msg = "Context too long: this conversation exceeds Kiro's input-size limit. " +

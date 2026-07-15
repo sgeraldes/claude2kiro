@@ -8,7 +8,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/sgeraldes/claude2kiro/internal/models"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 )
 
@@ -75,15 +77,74 @@ func TestIsInvalidModelID(t *testing.T) {
 	}
 }
 
-// TestProxyEndToEnd_SurfacesInvalidModel reproduces the "claude-fable-5" loop:
-// Kiro answers 400 INVALID_MODEL_ID for a model id it does not serve. The proxy
-// must not burn its retry budget on that deterministic failure (exactly one
-// upstream request) and must surface a non-retryable invalid_request_error —
-// the previous overloaded_error made Claude Code re-send the request silently
-// forever, showing the user nothing.
-func TestProxyEndToEnd_SurfacesInvalidModel(t *testing.T) {
+// TestProxyEndToEnd_CatchesUnservableModelPreflight is the core of the fix:
+// when the live catalog shows the requested model is not servable (e.g.
+// claude-fable-5, which Kiro has no equivalent for), the proxy must catch it
+// BEFORE contacting the backend — no request, no silent substitution — and
+// surface a non-retryable error that lists the account's real models and how
+// to switch.
+func TestProxyEndToEnd_CatchesUnservableModelPreflight(t *testing.T) {
 	writeFakeToken(t)
-	withStubCatalog(t, stubList())
+	withStubCatalog(t, stubList()) // has opus/sonnet/haiku/glm..., NOT fable
+
+	var hits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Write(cwFrame(`{"content":"should-not-be-called"}`))
+	}))
+	defer backend.Close()
+	stubEndpoint(t, backend.URL+"/generateAssistantResponse")
+
+	mux := buildServerMux(logger.NewLogger(10))
+
+	for _, stream := range []bool{true, false} {
+		reqBody, _ := json.Marshal(AnthropicRequest{
+			Model:     "claude-fable-5",
+			MaxTokens: 64,
+			Stream:    stream,
+			Messages:  []AnthropicRequestMessage{{Role: "user", Content: "hi"}},
+		})
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody)))
+
+		body := rec.Body.String()
+		if !strings.Contains(body, "invalid_request_error") {
+			t.Errorf("stream=%v: unservable model should surface invalid_request_error; got:\n%s", stream, body)
+		}
+		if strings.Contains(body, "overloaded_error") {
+			t.Errorf("stream=%v: must not be overloaded_error (the SDK auto-retries it); got:\n%s", stream, body)
+		}
+		if !strings.Contains(body, "claude-fable-5") {
+			t.Errorf("stream=%v: error should name the requested model; got:\n%s", stream, body)
+		}
+		// The message must list the account's real models and point at the fix.
+		if !strings.Contains(body, "claude-opus-4.8") || !strings.Contains(body, "/model auto") {
+			t.Errorf("stream=%v: error should list available models and mention /model auto; got:\n%s", stream, body)
+		}
+		if !stream && rec.Code != http.StatusBadRequest {
+			t.Errorf("non-stream unservable model status = %d, want 400", rec.Code)
+		}
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Errorf("backend hit %d times, want 0 (an unservable model must be caught pre-flight, not sent)", got)
+	}
+}
+
+// TestProxyEndToEnd_ReactiveInvalidModelNoRetry covers the backstop: when the
+// catalog is unavailable, the proxy can't check pre-flight and forwards the
+// request; if the backend answers 400 INVALID_MODEL_ID, it must not retry that
+// deterministic failure and must surface a non-retryable error (not the
+// overloaded_error the SDK auto-retries, which caused the silent loop).
+func TestProxyEndToEnd_ReactiveInvalidModelNoRetry(t *testing.T) {
+	writeFakeToken(t)
+	// Cold catalog: fetch always fails, so Available() is false and the
+	// pre-flight servability check lets the request through to the backend.
+	orig := modelCatalog
+	modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) {
+		return nil, errStub
+	})
+	t.Cleanup(func() { modelCatalog = orig })
 
 	var hits int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,10 +156,8 @@ func TestProxyEndToEnd_SurfacesInvalidModel(t *testing.T) {
 	stubEndpoint(t, backend.URL+"/generateAssistantResponse")
 
 	mux := buildServerMux(logger.NewLogger(10))
-	// Requested and resolved ids differ (fable resolves to the stub catalog's
-	// best opus), so the assertions below prove the error names both.
 	reqBody, _ := json.Marshal(AnthropicRequest{
-		Model:     "claude-fable-5",
+		Model:     "glm-5",
 		MaxTokens: 64,
 		Stream:    true,
 		Messages:  []AnthropicRequestMessage{{Role: "user", Content: "hi"}},
@@ -108,13 +167,10 @@ func TestProxyEndToEnd_SurfacesInvalidModel(t *testing.T) {
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "invalid_request_error") {
-		t.Errorf("INVALID_MODEL_ID should surface invalid_request_error; got:\n%s", body)
+		t.Errorf("reactive INVALID_MODEL_ID should surface invalid_request_error; got:\n%s", body)
 	}
 	if strings.Contains(body, "overloaded_error") {
-		t.Errorf("INVALID_MODEL_ID must not be labeled overloaded_error (the SDK auto-retries it); got:\n%s", body)
-	}
-	if !strings.Contains(body, "claude-fable-5") || !strings.Contains(body, "claude-opus-4.8") {
-		t.Errorf("error should name the requested (claude-fable-5) and actually-sent (claude-opus-4.8) model ids; got:\n%s", body)
+		t.Errorf("reactive INVALID_MODEL_ID must not be labeled overloaded_error; got:\n%s", body)
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("backend hit %d times, want 1 (INVALID_MODEL_ID is deterministic; retrying it can never succeed)", got)
@@ -123,10 +179,15 @@ func TestProxyEndToEnd_SurfacesInvalidModel(t *testing.T) {
 
 // TestNonStreamSurfacesBackendError verifies the non-streaming path returns a
 // real Anthropic error envelope on a CodeWhisperer error instead of parsing the
-// error body as an event stream and answering 200 with empty content.
+// error body as an event stream and answering 200 with empty content. Uses a
+// cold catalog so the request reaches the backend (pre-flight is skipped).
 func TestNonStreamSurfacesBackendError(t *testing.T) {
 	writeFakeToken(t)
-	withStubCatalog(t, stubList())
+	orig := modelCatalog
+	modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) {
+		return nil, errStub
+	})
+	t.Cleanup(func() { modelCatalog = orig })
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -137,7 +198,7 @@ func TestNonStreamSurfacesBackendError(t *testing.T) {
 
 	mux := buildServerMux(logger.NewLogger(10))
 	reqBody, _ := json.Marshal(AnthropicRequest{
-		Model:     "claude-fable-5",
+		Model:     "glm-5",
 		MaxTokens: 64,
 		Stream:    false,
 		Messages:  []AnthropicRequestMessage{{Role: "user", Content: "hi"}},
@@ -161,7 +222,7 @@ func TestNonStreamSurfacesBackendError(t *testing.T) {
 	if envelope.Type != "error" || envelope.Error.Type != "invalid_request_error" {
 		t.Errorf("want type=error error.type=invalid_request_error, got %q/%q", envelope.Type, envelope.Error.Type)
 	}
-	if !strings.Contains(envelope.Error.Message, "claude-fable-5") || !strings.Contains(envelope.Error.Message, "claude-opus-4.8") {
-		t.Errorf("error message should name the requested and actually-sent model ids; got %q", envelope.Error.Message)
+	if !strings.Contains(envelope.Error.Message, "glm-5") {
+		t.Errorf("error message should name the rejected model; got %q", envelope.Error.Message)
 	}
 }
