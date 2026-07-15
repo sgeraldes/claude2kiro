@@ -59,9 +59,10 @@ When the user wants to switch models, follow this flow:
 
 Important: the dialog shown by `/model` (no argument) is built into the
 Claude Code binary and varies with its version and login state — the proxy
-cannot add entries to it. A model missing from that dialog is still fully
-usable by passing its id explicitly: `/model <id>` always reaches the
-proxy, which maps it to a valid Kiro model (see resolution order below).
+cannot add entries to it. A model missing from that dialog is still usable by
+passing its id explicitly: `/model <id>` always reaches the proxy, which
+serves it when your account has it and otherwise catches the request and tells
+you which models it can use (see resolution order below).
 
 ## Checking the current model
 

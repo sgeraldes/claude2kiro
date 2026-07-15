@@ -761,15 +761,17 @@ func getKiroModelID(anthropicModel string) string {
 }
 
 // modelServable reports whether a resolved Kiro model id can be sent to the
-// backend. "auto" is always valid (Kiro picks the model per task). When the
-// live catalog is unavailable we can't verify, so we allow the request through
-// and let the backend's own 400 be the backstop (see isInvalidModelID).
-// Otherwise the model must be present in this account's live catalog.
+// backend. "auto" is always valid (Kiro picks the model per task). A negative
+// is only trusted when the catalog is Fresh (a recent successful fetch): a
+// stale or unreachable catalog can't authoritatively say a model is absent —
+// serving stale data would wrongly catch a just-added model — so we allow the
+// request through and let the backend's own 400 be the backstop (see
+// isInvalidModelID). Otherwise the model must be in this account's live catalog.
 func modelServable(kiroID string) bool {
 	if strings.EqualFold(kiroID, "auto") {
 		return true
 	}
-	if !modelCatalog.Available() {
+	if !modelCatalog.Fresh() {
 		return true
 	}
 	return modelCatalog.Has(kiroID)
@@ -3873,6 +3875,23 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			return
 		}
 
+		// Pre-flight model check: if the live catalog shows Kiro can't serve the
+		// requested model, catch it here — don't spend a backend request on a
+		// deterministic rejection, and don't silently substitute a different
+		// (differently-priced) model. Tell the user how to switch instead. Runs
+		// before comparison mode so an unservable model doesn't spawn an upstream
+		// Anthropic comparison call either. AnthropicDirect already returned
+		// above (its models are real Anthropic ids, not gated by Kiro's catalog).
+		// When the catalog can't verify, the request proceeds and the backend's
+		// 400 INVALID_MODEL_ID is the backstop (see handleStreamRequestWithLogger).
+		kiroModel := getKiroModelID(anthropicReq.Model)
+		if !modelServable(kiroModel) {
+			lg.LogError(fmt.Sprintf("Model %q (resolved to %q) is not in this account's live catalog — catching pre-flight", anthropicReq.Model, kiroModel))
+			status := writeModelUnavailable(w, anthropicReq.Stream, modelUnavailableMessage(anthropicReq.Model, kiroModel))
+			lg.LogResponse(status, r.URL.Path, time.Since(startTime), "", sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
+			return
+		}
+
 		// Comparison mode: shared timestamp for correlated saves
 		var comparisonTimestamp string
 
@@ -3918,20 +3937,6 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 				}
 			}(headersCopy, compSessionID, compRequestID, comparisonTimestamp)
 			// Continue with normal Kiro flow below...
-		}
-
-		// Pre-flight model check: if the live catalog shows Kiro can't serve the
-		// requested model, catch it here — don't spend a backend request on a
-		// deterministic rejection, and don't silently substitute a different
-		// (differently-priced) model. Tell the user how to switch instead. When
-		// the catalog is unavailable we can't check, so the request proceeds and
-		// the backend's 400 INVALID_MODEL_ID is the backstop (see below).
-		kiroModel := getKiroModelID(anthropicReq.Model)
-		if !modelServable(kiroModel) {
-			lg.LogError(fmt.Sprintf("Model %q (resolved to %q) is not in this account's live catalog — catching pre-flight", anthropicReq.Model, kiroModel))
-			status := writeModelUnavailable(w, anthropicReq.Stream, modelUnavailableMessage(anthropicReq.Model, kiroModel))
-			lg.LogResponse(status, r.URL.Path, time.Since(startTime), "", sessionID, fullUUID, reqResult.RequestID, reqResult.SeqNum)
-			return
 		}
 
 		// Handle streaming request

@@ -253,6 +253,22 @@ func (c *Catalog) Available() bool {
 	return len(c.models) > 0
 }
 
+// Fresh reports whether the catalog holds a list from a recent SUCCESSFUL fetch
+// (within the TTL). Unlike Available, it is false when the only cached data is
+// stale because the live fetch is currently failing: refreshIfStale keeps
+// serving stale-but-usable data on error and does not advance fetchedAt. Use
+// this to distinguish "this account definitively lacks a model" (fresh list, so
+// a negative is authoritative) from "we can't verify right now" (stale/empty).
+func (c *Catalog) Fresh() bool {
+	if c == nil {
+		return false
+	}
+	c.refreshIfStale()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
+}
+
 // ResolveFamily returns the highest-version available model ID whose ID contains
 // the given family keyword (e.g. "opus", "sonnet", "glm"). ok is false when the
 // catalog is empty or no model matches.
@@ -431,9 +447,10 @@ When the user wants to switch models, follow this flow:
 
 Important: the dialog shown by ` + "`/model`" + ` (no argument) is built into the
 Claude Code binary and varies with its version and login state — the proxy
-cannot add entries to it. A model missing from that dialog is still fully
-usable by passing its id explicitly: ` + "`/model <id>`" + ` always reaches the
-proxy, which maps it to a valid Kiro model (see resolution order below).
+cannot add entries to it. A model missing from that dialog is still usable by
+passing its id explicitly: ` + "`/model <id>`" + ` always reaches the proxy, which
+serves it when your account has it and otherwise catches the request and tells
+you which models it can use (see resolution order below).
 
 ## Checking the current model
 

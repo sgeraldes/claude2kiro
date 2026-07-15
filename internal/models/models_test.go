@@ -128,6 +128,47 @@ func TestCatalogServesStaleOnError(t *testing.T) {
 	}
 }
 
+func TestCatalogFresh(t *testing.T) {
+	// A recent successful fetch within the TTL is Fresh.
+	good := NewCatalog(time.Minute, func() ([]KiroModel, error) {
+		return sampleModels(), nil
+	})
+	if !good.Fresh() {
+		t.Error("catalog with a recent successful fetch should be Fresh")
+	}
+
+	// A catalog serving stale data because the live fetch is failing is NOT
+	// Fresh, even though it still Has the last good models. Only a successful
+	// refetch advances fetchedAt; here the refetch fails, so once the TTL
+	// elapses the last-success time is beyond the window. A short but real TTL
+	// (plus a sleep past it) keeps this deterministic regardless of clock
+	// granularity.
+	const ttl = 20 * time.Millisecond
+	var fail bool
+	var mu sync.Mutex
+	stale := NewCatalog(ttl, func() ([]KiroModel, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			return nil, fmt.Errorf("fetch down")
+		}
+		return sampleModels(), nil
+	})
+	if !stale.Has("claude-opus-4.8") {
+		t.Fatal("expected initial fetch to populate cache")
+	}
+	mu.Lock()
+	fail = true
+	mu.Unlock()
+	time.Sleep(2 * ttl) // let the last successful fetch fall outside the TTL
+	if stale.Fresh() {
+		t.Error("catalog serving stale data after fetch failures must not be Fresh")
+	}
+	if !stale.Has("claude-opus-4.8") {
+		t.Error("stale catalog should still serve its last good data via Has")
+	}
+}
+
 func TestCatalogEmptyOnFirstFailure(t *testing.T) {
 	cat := NewCatalog(time.Minute, func() ([]KiroModel, error) {
 		return nil, fmt.Errorf("no network")
