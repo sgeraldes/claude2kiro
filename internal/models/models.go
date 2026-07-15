@@ -442,8 +442,16 @@ context:
 
 1. Your own system prompt states the exact model id Claude Code sends (the
    "exact model ID is …" line); the statusline shows it too.
-2. Map it to the Kiro model that actually serves it:
-   ` + "`curl -s \"$ANTHROPIC_BASE_URL/resolve?model=<that-id>\"`" + `
+2. Map it to the Kiro model that actually serves it. Resolve the proxy URL
+   robustly (env var, else the running proxy's advertised port, else :8080):
+   ` + "```bash" + `
+   base="${ANTHROPIC_BASE_URL}"
+   if [ -z "$base" ]; then
+     port="$(tr -d '[:space:]' < "$HOME/.claude2kiro/proxy.port" 2>/dev/null)"
+     [ -n "$port" ] && base="http://127.0.0.1:$port" || base="http://localhost:8080"
+   fi
+   curl -s --max-time 6 "$base/resolve?model=<that-id>"
+   ` + "```" + `
    (outside a session: ` + "`claude2kiro resolve <that-id>`" + `).
    The JSON answers: ` + "`kiro_model`" + ` (what serves the request) and
    ` + "`in_live_catalog`" + ` (whether THIS account can use it).
