@@ -61,17 +61,16 @@ func TestGetKiroModelID(t *testing.T) {
 		// 2. Unknown future version -> normalized form found in live catalog.
 		{"dated opus 4.8", "claude-opus-4-8-20260101", "claude-opus-4.8"},
 
-		// 4. Unknown version not in catalog -> family resolution picks highest available.
-		{"future opus 4.9 via family", "claude-opus-4-9", "claude-opus-4.8"},
-		{"unknown sonnet via family", "claude-sonnet-9-9", "claude-sonnet-4.6"},
+		// Unknown ids are NOT substituted for a different model — resolution
+		// yields a candidate (normalized Kiro-form, else raw) and the servability
+		// gate (modelServable) decides whether to serve or catch. An unknown
+		// version keeps its own version; an unknown Claude family keeps its name.
+		{"future opus 4.9 keeps its version", "claude-opus-4-9", "claude-opus-4.9"},
+		{"unknown sonnet keeps its version", "claude-sonnet-9-9", "claude-sonnet-9.9"},
+		{"fable is not substituted", "claude-fable-5", "claude-fable-5"},
+		{"mythos is not substituted", "claude-mythos-5", "claude-mythos-5"},
 
-		// 4b. Unknown Claude family Kiro has no equivalent for (e.g. Fable/Mythos)
-		// -> best available Claude model, never a raw pass-through (Kiro rejects
-		// unknown ids with 400 INVALID_MODEL_ID, which looped Claude Code forever).
-		{"fable via best-claude fallback", "claude-fable-5", "claude-opus-4.8"},
-		{"mythos via best-claude fallback", "claude-mythos-5", "claude-opus-4.8"},
-
-		// 3/4. Raw kiro-style id passed straight through via catalog.
+		// 3. Raw kiro-style id passed straight through via catalog.
 		{"raw glm via catalog", "GLM-5", "glm-5"},
 	}
 
@@ -84,8 +83,10 @@ func TestGetKiroModelID(t *testing.T) {
 	}
 }
 
-// TestGetKiroModelIDStaticFallback verifies resolution still works (offline-safe)
-// when the catalog is empty, via the static family fallback.
+// TestGetKiroModelIDStaticFallback verifies that the curated static map still
+// resolves the common current ids offline (catalog unreachable), and that
+// unknown ids pass through as a best-effort candidate rather than being
+// substituted for a different model.
 func TestGetKiroModelIDStaticFallback(t *testing.T) {
 	orig := modelCatalog
 	modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) {
@@ -94,48 +95,52 @@ func TestGetKiroModelIDStaticFallback(t *testing.T) {
 	t.Cleanup(func() { modelCatalog = orig })
 
 	cases := map[string]string{
-		"claude-opus-4-9":   "claude-opus-4.6", // unknown version, no catalog -> static fallback
-		"claude-sonnet-9-9": "claude-sonnet-4.6",
-		"some-glm-thing":    "glm-5",
-		"claude-fable-5":    "claude-opus-4.6", // unknown Claude family, no catalog -> newest known stable
+		// Static map entries still resolve with no catalog.
+		"claude-opus-4-8":            "claude-opus-4.8",
+		"glm-5":                      "glm-5",
+		"claude-3-7-sonnet-20250219": "claude-sonnet-4.5", // curated legacy remap
+		// Unknown ids: normalized Kiro-form (if it's a versioned Claude id) or
+		// raw, never a cross-family substitute. The servability gate + backend
+		// 400 backstop handle these; the proxy does not invent a replacement.
+		"claude-opus-4-9":   "claude-opus-4.9",
+		"claude-sonnet-9-9": "claude-sonnet-9.9",
+		"some-glm-thing":    "some-glm-thing",
+		"claude-fable-5":    "claude-fable-5",
 	}
 	for in, want := range cases {
 		if got := getKiroModelID(in); got != want {
-			t.Errorf("getKiroModelID(%q) = %q, want %q (static fallback)", in, got, want)
+			t.Errorf("getKiroModelID(%q) = %q, want %q (offline)", in, got, want)
 		}
 	}
 }
 
-// TestGetKiroModelIDUnknownClaudeFamilyNoOpus verifies that an unknown Claude
-// family falls through the live families in order (opus -> sonnet -> haiku)
-// when the account's catalog doesn't expose opus at all.
-func TestGetKiroModelIDUnknownClaudeFamilyNoOpus(t *testing.T) {
-	withStubCatalog(t, []models.KiroModel{
-		mk("claude-sonnet-4.6"),
-		mk("claude-haiku-4.5"),
-		mk("glm-5"),
-	})
-
-	if got := getKiroModelID("claude-fable-5"); got != "claude-sonnet-4.6" {
-		t.Errorf("getKiroModelID(claude-fable-5) = %q, want claude-sonnet-4.6 (opus-less catalog)", got)
-	}
-}
-
-// TestGetKiroModelIDUnknownClaudeFamilyClaudeFreeCatalog verifies that a
-// healthy live catalog with no Claude models at all never falls back to a
-// static Claude id the account provably lacks — it picks a model the account
-// has, preferring "auto".
-func TestGetKiroModelIDUnknownClaudeFamilyClaudeFreeCatalog(t *testing.T) {
-	t.Run("prefers auto when present", func(t *testing.T) {
-		withStubCatalog(t, []models.KiroModel{mk("glm-5"), mk("auto"), mk("deepseek-3.2")})
-		if got := getKiroModelID("claude-fable-5"); got != "auto" {
-			t.Errorf("getKiroModelID(claude-fable-5) = %q, want auto (claude-free catalog)", got)
+// TestModelServable verifies the servability gate that decides whether a
+// resolved model is sent or caught pre-flight.
+func TestModelServable(t *testing.T) {
+	t.Run("warm catalog gates on membership", func(t *testing.T) {
+		withStubCatalog(t, stubList())
+		if !modelServable("claude-opus-4.8") {
+			t.Error("claude-opus-4.8 is in the catalog; want servable")
+		}
+		if modelServable("claude-fable-5") {
+			t.Error("claude-fable-5 is not in the catalog; want NOT servable")
 		}
 	})
-	t.Run("first listed model without auto", func(t *testing.T) {
+	t.Run("auto is always servable", func(t *testing.T) {
+		// A catalog that does not list "auto" as a model.
 		withStubCatalog(t, []models.KiroModel{mk("glm-5"), mk("deepseek-3.2")})
-		if got := getKiroModelID("claude-fable-5"); got != "glm-5" {
-			t.Errorf("getKiroModelID(claude-fable-5) = %q, want glm-5 (claude-free catalog)", got)
+		if !modelServable("auto") {
+			t.Error("auto must always be servable (Kiro picks per task)")
+		}
+	})
+	t.Run("cold catalog allows through (best effort)", func(t *testing.T) {
+		orig := modelCatalog
+		modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) {
+			return nil, errStub
+		})
+		t.Cleanup(func() { modelCatalog = orig })
+		if !modelServable("claude-fable-5") {
+			t.Error("with no catalog to verify against, allow through and let the backend 400 be the backstop")
 		}
 	})
 }
@@ -312,10 +317,12 @@ func TestResolveModelInfo(t *testing.T) {
 	if info.KiroModel != "glm-5" || info.InCatalog {
 		t.Errorf("limited catalog: got %+v, want glm-5 flagged as not in catalog", info)
 	}
-	// A generic/unknown opus id resolves within the account's own catalog,
-	// which is why such an account always lands on Opus 4.6.
-	if got := getKiroModelID("claude-opus-4-9"); got != "claude-opus-4.6" {
-		t.Errorf("family resolution on limited catalog = %q, want claude-opus-4.6", got)
+	// An unknown opus version is NOT substituted for the account's newest opus;
+	// it keeps its own version as the candidate and is flagged not-in-catalog so
+	// the caller surfaces it instead of silently serving a different model.
+	info = resolveModelInfo("claude-opus-4-9")
+	if info.KiroModel != "claude-opus-4.9" || info.InCatalog {
+		t.Errorf("limited catalog: got %+v, want candidate claude-opus-4.9 flagged not in catalog", info)
 	}
 }
 

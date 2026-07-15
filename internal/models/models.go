@@ -469,14 +469,17 @@ When Claude Code sends a model ID, the proxy resolves it as follows:
    ID is in the live list, use it. This makes new Claude releases route correctly
    the moment Kiro exposes them, with no code change.
 3. **Raw catalog match** — if Claude Code already sent a Kiro-style ID.
-4. **Family resolution (live)** — picks the highest available version in the family
-   (e.g. an unknown ` + "`claude-opus-4-9`" + ` → newest available opus).
-5. **Unknown Claude family (live)** — a Claude tier Kiro doesn't serve (e.g.
-   ` + "`claude-fable-5`" + `) gets the best available Claude model (opus → sonnet → haiku).
-6. **Static family fallback** — newest known stable when the catalog is unreachable
-   (an unknown Claude family falls back to the newest known stable opus).
-7. **Pass through** as-is. If Kiro still rejects the id (400 INVALID_MODEL_ID),
-   the proxy surfaces a clear non-retryable error instead of retrying silently.
+4. **Best-effort candidate** — the normalized Kiro-form of a versioned Claude ID
+   (` + "`claude-opus-4-9`" + ` → ` + "`claude-opus-4.9`" + `), else the ID as sent. The proxy does
+   **not** substitute a different model here.
+
+The proxy resolves but never *substitutes*. If the resolved model isn't servable
+on your account (not in the live catalog), the proxy **catches the request and
+asks you to switch** instead of routing you to a different model at a different
+price: it replies with the error, your available model list, and how to change —
+` + "`/model auto`" + ` (Kiro picks the best model per task) or ` + "`/model <id>`" + `. It also
+never burns retries on a model Kiro can't serve (a 400 ` + "`INVALID_MODEL_ID`" + ` is
+surfaced immediately, not retried).
 
 ## Kiro Plans
 
