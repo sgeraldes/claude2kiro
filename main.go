@@ -4361,9 +4361,10 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		// A context-length-exceeded 400 is not transient (a smaller request is the
-		// only fix) and must not be retried or mislabeled. Compute once, reuse below.
+		// Permanent 400s cannot succeed when resent unchanged. Classify the known
+		// structured reasons once and reuse them in both retry and error handling.
 		contextTooLong := resp.StatusCode == 400 && isContextLengthExceeded(body)
+		requestBodyInvalid := resp.StatusCode == 400 && isRequestBodyInvalid(body)
 
 		// Same for a 400 INVALID_MODEL_ID: the model id does not exist on the
 		// backend, so every retry fails identically.
@@ -4398,7 +4399,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			}
 		}
 
-		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !invalidModel)) {
+		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel)) {
 			if overloaded {
 				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
@@ -4429,6 +4430,11 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			sendNonRetryableErrorEvent(w, flusher, "Context too long: this conversation exceeds Kiro's input-size limit. "+
 				"Run /clear to start fresh or /compact to shrink the history, then retry. "+
 				"Trimming unused MCP servers also reduces per-request size.")
+		} else if requestBodyInvalid {
+			// Schema-invalid requests are deterministic. Preserve Kiro's detail but
+			// classify the error as non-retryable so the client does not resend it.
+			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
+				"Kiro rejected the request body as invalid: %s", strings.TrimSpace(string(body))))
 		} else if invalidModel {
 			// Kiro does not serve this model id at all (backstop for when the
 			// pre-flight check couldn't run because the catalog was cold).
@@ -6540,6 +6546,36 @@ func isInvalidModelID(body []byte) bool {
 	}
 	// Non-JSON body: only trust the structured enum, never the English phrase.
 	return strings.Contains(strings.ToLower(string(body)), "invalid_model_id")
+}
+
+// isRequestBodyInvalid reports whether CodeWhisperer explicitly rejected the
+// request schema. Only structured fields are inspected because user-controlled
+// content may contain the same words without describing the actual error.
+func isRequestBodyInvalid(body []byte) bool {
+	var parsed struct {
+		Reason    string `json:"reason"`
+		Code      string `json:"code"`
+		ErrorType string `json:"__type"`
+		Message   string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+
+	for _, value := range []string{parsed.Reason, parsed.Code, parsed.ErrorType} {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "request_body_invalid" ||
+			normalized == "invalid_request" ||
+			normalized == "invalid_request_exception" ||
+			strings.HasSuffix(normalized, "#invalidrequestexception") {
+			return true
+		}
+	}
+
+	message := strings.TrimRight(strings.ToLower(strings.TrimSpace(parsed.Message)), ". ")
+	return message == "request body is invalid" ||
+		message == "invalid request body" ||
+		message == "improperly formed request"
 }
 
 // isTransientOverload reports whether a non-200 CodeWhisperer response is a

@@ -155,3 +155,43 @@ func TestProxyEndToEnd_SurfacesAccessDenied(t *testing.T) {
 		t.Errorf("access-denied 403 must not be treated as token expiry; got:\n%s", body)
 	}
 }
+
+// TestProxyEndToEnd_DoesNotRetryInvalidRequest verifies that a structurally
+// invalid request is attempted once. Retrying the identical body cannot repair
+// it and previously multiplied each native web-search failure fivefold.
+func TestProxyEndToEnd_DoesNotRetryInvalidRequest(t *testing.T) {
+	writeFakeToken(t)
+	withStubCatalog(t, stubList())
+
+	attempts := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}`))
+	}))
+	defer backend.Close()
+	stubEndpoint(t, backend.URL+"/generateAssistantResponse")
+
+	mux := buildServerMux(logger.NewLogger(10))
+	reqBody, _ := json.Marshal(AnthropicRequest{
+		Model:     "claude-opus-4-8",
+		MaxTokens: 64,
+		Stream:    true,
+		Messages:  []AnthropicRequestMessage{{Role: "user", Content: "search"}},
+	})
+	requestBody := bytes.NewReader(reqBody)
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", requestBody)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request)
+
+	if attempts != 1 {
+		t.Errorf("invalid request attempts = %d, want 1", attempts)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "invalid_request_error") {
+		t.Errorf("invalid request should surface invalid_request_error; got:\n%s", body)
+	}
+	if !strings.Contains(body, "Invalid tool use format") {
+		t.Errorf("invalid request should preserve the backend explanation; got:\n%s", body)
+	}
+}
