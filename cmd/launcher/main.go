@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -284,9 +285,18 @@ func getLatestRelease() (version string, downloadURL string) {
 	return version, ""
 }
 
-// downloadBinary downloads a URL to a file path.
+// downloadBinary downloads a URL to a file path. Connection phases (dial, TLS,
+// headers) are bounded so a hung server fails fast — this runs in the
+// foreground for `claude2kiro update` — but total transfer time is uncapped so
+// a slow-but-progressing download of a ~19MB binary still completes.
 func downloadBinary(url, targetPath string) error {
-	resp, err := http.Get(url)
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}}
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}

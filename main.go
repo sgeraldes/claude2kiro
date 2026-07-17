@@ -2877,8 +2877,16 @@ func selfUpdate() {
 
 	fmt.Printf("Downloading %s...\n", assetName)
 
-	// Download new binary
-	dlResp, err := http.Get(downloadURL)
+	// Download new binary. Bound the connection phases (dial, TLS, headers) so
+	// a hung server fails fast, but leave total transfer time uncapped so a
+	// slow-but-progressing download of a ~19MB binary still completes.
+	dlClient := &http.Client{Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}}
+	dlResp, err := dlClient.Get(downloadURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
 		os.Exit(1)
@@ -3359,7 +3367,15 @@ func testProxy() {
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
-	client := &http.Client{}
+	// Bound connection phases only: the streamed generation body may take a
+	// while, but headers arrive quickly — a server that never responds must
+	// fail the diagnostic instead of hanging it.
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: cfg.Network.HTTPTimeout,
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Request failed: %v\n", err)
@@ -6092,8 +6108,15 @@ func refreshTokenSocial(currentToken TokenData) (TokenData, error) {
 		return TokenData{}, fmt.Errorf("failed to serialize request: %v", err)
 	}
 
-	resp, err := http.Post(
-		"https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
+	// Bound the call: http.Post uses the zero-timeout default client, so a
+	// refresh endpoint that accepts the connection but never responds would
+	// otherwise freeze every command that refreshes at startup (run, server,
+	// TUI, request handler) — the process prints "refreshing..." and hangs
+	// forever. Endpoint comes from config for parity with cmd.RefreshTokenSocial.
+	cfg := config.Get()
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	resp, err := client.Post(
+		cfg.Advanced.KiroRefreshEndpoint,
 		"application/json",
 		bytes.NewBuffer(reqBody),
 	)
