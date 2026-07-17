@@ -234,7 +234,12 @@ func RefreshTokenSocial(currentToken TokenData) (TokenData, error) {
 		return TokenData{}, fmt.Errorf("failed to serialize request: %v", err)
 	}
 
-	resp, err := http.Post(
+	// Bound the call: http.Post uses the zero-timeout default client, so a
+	// refresh endpoint that accepts the connection but never responds would
+	// otherwise freeze every command that refreshes at startup (run, server,
+	// TUI) — the process prints "refreshing..." and hangs forever.
+	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
+	resp, err := client.Post(
 		cfg.Advanced.KiroRefreshEndpoint,
 		"application/json",
 		bytes.NewBuffer(reqBody),
