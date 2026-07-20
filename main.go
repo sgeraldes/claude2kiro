@@ -3170,7 +3170,6 @@ func launchClaudeAgainstProxy(claudePath, baseURL string, claudeArgs []string) {
 	claudeCmd.Env = buildClaudeEnv(baseURL)
 	claudeCmd.Stdin, claudeCmd.Stdout, claudeCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
-
 	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
 	if err := claudeCmd.Run(); err != nil {
 		if claudeCmd.ProcessState != nil {
@@ -3362,7 +3361,6 @@ func runClaudeWithProxy() {
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
 	claudeCmd.Stderr = os.Stderr
-
 
 	// 7. Run claude (blocks until it exits)
 	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
