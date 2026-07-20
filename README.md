@@ -30,6 +30,8 @@
 
 Claude2Kiro is a local proxy and launcher that lets Claude Code use Kiro authentication through an Anthropic-compatible interface.
 
+> **Part of [claude2all](https://github.com/sgeraldes/claude2all)** — one isolated Claude Code launcher per backend: Kimi K3, AWS Bedrock, OpenAI (ChatGPT OAuth), Kiro (this project), and multiple claude.ai accounts.
+
 ## Features
 
 - Use **Kiro authentication** instead of an Anthropic subscription
