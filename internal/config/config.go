@@ -92,6 +92,7 @@ type AdvancedConfig struct {
 	ToolMode              string `yaml:"tool_mode"`               // Request diet tool mode: full, compact, none_text (default: full)
 	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
 	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
+	Profile               string `yaml:"profile"`                 // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)

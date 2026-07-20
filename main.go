@@ -2543,10 +2543,50 @@ func findClaudeBinary() (string, error) {
 	return "", fmt.Errorf("'claude' not found in PATH")
 }
 
+// hasSavedModel reports whether the active profile's settings.json pins a model.
+func hasSavedModel() bool {
+	dir := claudeConfigDir()
+	if dir == "" {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		return false
+	}
+	var s map[string]any
+	if json.Unmarshal(data, &s) != nil {
+		return false
+	}
+	v, _ := s["model"].(string)
+	return strings.TrimSpace(v) != ""
+}
+
+// resolveProfileDir returns the Claude Code config directory named by the
+// advanced.profile config option: a bare name maps to ~/.claude-profiles/<name>,
+// an absolute path is used as-is. "" when the option is unset.
+func resolveProfileDir() string {
+	name := strings.TrimSpace(config.Get().Advanced.Profile)
+	if name == "" {
+		return ""
+	}
+	if filepath.IsAbs(name) {
+		return name
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude-profiles", name)
+}
+
 // claudeConfigDir returns the Claude Code config directory to operate on:
-// $CLAUDE_CONFIG_DIR when set (isolated profile), else ~/.claude.
+// $CLAUDE_CONFIG_DIR when set (isolated profile), else the advanced.profile
+// config option when set, else ~/.claude.
 func claudeConfigDir() string {
 	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
+		return v
+	}
+	if v := resolveProfileDir(); v != "" {
 		return v
 	}
 	homeDir, err := os.UserHomeDir()
@@ -2557,10 +2597,14 @@ func claudeConfigDir() string {
 }
 
 // claudeStateFile returns the path of Claude Code's .claude.json state file.
-// With $CLAUDE_CONFIG_DIR set the state file lives inside that directory;
-// otherwise it sits at ~/.claude.json (NOT inside ~/.claude).
+// With $CLAUDE_CONFIG_DIR set (or advanced.profile configured) the state file
+// lives inside that directory; otherwise it sits at ~/.claude.json (NOT inside
+// ~/.claude).
 func claudeStateFile() string {
 	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
+		return filepath.Join(v, ".claude.json")
+	}
+	if v := resolveProfileDir(); v != "" {
 		return filepath.Join(v, ".claude.json")
 	}
 	homeDir, err := os.UserHomeDir()
@@ -3016,13 +3060,25 @@ var bedrockEnvPrefixes = []string{
 // claude2kiro proxy at baseURL instead of going straight to a cloud provider.
 func buildClaudeEnv(baseURL string) []string {
 	src := os.Environ()
-	env := make([]string, 0, len(src)+4)
+	env := make([]string, 0, len(src)+5)
 	for _, kv := range src {
 		key, _, _ := strings.Cut(kv, "=")
 		if isBedrockRoutingVar(key) {
 			continue
 		}
 		env = append(env, kv)
+	}
+	// advanced.profile: isolate this session into its own config directory so
+	// kiro sessions never touch the shared ~/.claude profile.
+	if profileDir := resolveProfileDir(); profileDir != "" {
+		_ = os.MkdirAll(profileDir, 0755)
+		env = append(env, "CLAUDE_CONFIG_DIR="+profileDir)
+	}
+	if !hasSavedModel() {
+		// Claude Code's built-in default model isn't served by Kiro. Until the
+		// user pins one with /model, pass the literal "auto" so the proxy picks
+		// the best available model per request.
+		env = append(env, "ANTHROPIC_MODEL=auto")
 	}
 	return append(env,
 		"ANTHROPIC_BASE_URL="+baseURL,

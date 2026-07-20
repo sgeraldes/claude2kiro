@@ -6,11 +6,17 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/sgeraldes/claude2kiro/internal/config"
 )
 
 // setTestHome points the home-dir resolution at a temp dir for the test.
+// It also installs a neutral global config so tests never depend on the
+// developer's real ~/.claude2kiro/config.yaml (e.g. an advanced.profile
+// option must not redirect seeding into a profile directory).
 func setTestHome(t *testing.T, dir string) {
 	t.Helper()
+	config.Set(config.Default())
 	if runtime.GOOS == "windows" {
 		t.Setenv("USERPROFILE", dir)
 	} else {

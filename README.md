@@ -147,6 +147,20 @@ It also installs the local **kiro-proxy** plugin, which gives you slash commands
 > `/model <id>` (e.g. `/model claude-opus-4-8`), or launch with
 > `claude2kiro run --model <id>`. See `/kiro-proxy:models` for the live list,
 > or [Choosing a model](docs/USAGE.md#choosing-a-model).
+> Until you pin a model, sessions launch with `ANTHROPIC_MODEL=auto` and Kiro
+> picks the best available model per request.
+
+**Isolated profile (optional).** Set `advanced.profile` in `~/.claude2kiro/config.yaml`
+to keep Kiro sessions out of your main Claude profile:
+
+```yaml
+advanced:
+    profile: kiro     # uses ~/.claude-profiles/kiro (or pass an absolute path)
+```
+
+Every `run`/`remote` session then gets its own settings, history, and trust state —
+nothing touches `~/.claude`. Plugin installs and config seeding follow the profile
+too (setting `CLAUDE_CONFIG_DIR` yourself takes precedence over the option).
 
 ### `claude2kiro remote`
 
