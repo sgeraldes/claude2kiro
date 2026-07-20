@@ -1102,11 +1102,11 @@ func printModels() {
 // version cache found on disk — so the doc is refreshed even when the running
 // binary's version differs from the active install.
 func pluginCommandDirs() []string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	configDir := claudeConfigDir()
+	if configDir == "" {
 		return nil
 	}
-	base := filepath.Join(homeDir, ".claude", "plugins")
+	base := filepath.Join(configDir, "plugins")
 	cacheBase := filepath.Join(base, "cache", "claude2kiro", "kiro-proxy")
 
 	seen := map[string]bool{}
@@ -2402,12 +2402,10 @@ func ensureClaudeConfig() {
 }
 
 func seedClaudeConfig() error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return err
+	claudePath := claudeStateFile()
+	if claudePath == "" {
+		return fmt.Errorf("could not locate .claude.json")
 	}
-
-	claudePath := filepath.Join(homeDir, ".claude.json")
 	var cfg map[string]any
 
 	if data, err := os.ReadFile(claudePath); err == nil {
@@ -2500,23 +2498,32 @@ func promptYesNo(question string) bool {
 	return ans != "n" && ans != "no"
 }
 
-// findClaudeBinary locates the Claude Code executable: PATH first, then the
-// locations the official installers use. The extra candidates matter right
-// after an install, when this process's PATH is still stale.
+// findClaudeBinary locates the Claude Code executable. On Windows the native
+// installer locations are checked FIRST: a PATH lookup there can resolve to a
+// .cmd/.bat shim (npm wrapper, or a stale user-made script such as
+// ~/bin/claude.cmd) that is not the real CLI and breaks non-interactive
+// launches. LookPath is still the fallback so npm-only installs keep working.
 func findClaudeBinary() (string, error) {
+	homeDir, homeErr := os.UserHomeDir()
+	if runtime.GOOS == "windows" && homeErr == nil {
+		candidates := []string{filepath.Join(homeDir, ".local", "bin", "claude.exe")}
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			candidates = append(candidates, filepath.Join(v, "Microsoft", "WindowsApps", "claude.exe"))
+		}
+		for _, c := range candidates {
+			if ok, _ := FileExists(c); ok {
+				return c, nil
+			}
+		}
+	}
 	if p, err := exec.LookPath("claude"); err == nil {
 		return p, nil
 	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	if homeErr != nil {
 		return "", fmt.Errorf("'claude' not found in PATH")
 	}
 	var candidates []string
 	if runtime.GOOS == "windows" {
-		candidates = []string{filepath.Join(homeDir, ".local", "bin", "claude.exe")}
-		if v := os.Getenv("LOCALAPPDATA"); v != "" {
-			candidates = append(candidates, filepath.Join(v, "Microsoft", "WindowsApps", "claude.exe"))
-		}
 		if v := os.Getenv("APPDATA"); v != "" {
 			// npm shim — a batch file; launch sites use exec.Command, which
 			// runs .cmd via cmd.exe (os.StartProcess could not).
@@ -2534,6 +2541,33 @@ func findClaudeBinary() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("'claude' not found in PATH")
+}
+
+// claudeConfigDir returns the Claude Code config directory to operate on:
+// $CLAUDE_CONFIG_DIR when set (isolated profile), else ~/.claude.
+func claudeConfigDir() string {
+	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
+		return v
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude")
+}
+
+// claudeStateFile returns the path of Claude Code's .claude.json state file.
+// With $CLAUDE_CONFIG_DIR set the state file lives inside that directory;
+// otherwise it sits at ~/.claude.json (NOT inside ~/.claude).
+func claudeStateFile() string {
+	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
+		return filepath.Join(v, ".claude.json")
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude.json")
 }
 
 // ensureClaudeCodeInstalled returns the path to the Claude Code CLI, offering
@@ -2595,14 +2629,14 @@ var pluginFS embed.FS
 // It creates a local marketplace for claude2kiro, copies the files there,
 // and registers the plugin globally so Claude Code loads it.
 func installPlugin() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	configDir := claudeConfigDir()
+	if configDir == "" {
 		return
 	}
 
-	marketplaceDir := filepath.Join(homeDir, ".claude", "plugins", "marketplaces", "claude2kiro")
+	marketplaceDir := filepath.Join(configDir, "plugins", "marketplaces", "claude2kiro")
 	pluginSourceDir := filepath.Join(marketplaceDir, "kiro-proxy")
-	cacheDir := filepath.Join(homeDir, ".claude", "plugins", "cache", "claude2kiro", "kiro-proxy", menu.Version)
+	cacheDir := filepath.Join(configDir, "plugins", "cache", "claude2kiro", "kiro-proxy", menu.Version)
 
 	// Write plugin files to both marketplace and cache directories
 	for _, dir := range []string{pluginSourceDir, cacheDir} {
@@ -2636,7 +2670,7 @@ func installPlugin() {
 	}
 
 	// Register marketplace in known_marketplaces.json
-	marketplacesPath := filepath.Join(homeDir, ".claude", "plugins", "known_marketplaces.json")
+	marketplacesPath := filepath.Join(configDir, "plugins", "known_marketplaces.json")
 	var marketplaces map[string]any
 	if data, err := os.ReadFile(marketplacesPath); err == nil {
 		json.Unmarshal(data, &marketplaces)
@@ -2657,7 +2691,7 @@ func installPlugin() {
 	}
 
 	// Register in installed_plugins.json
-	installedPath := filepath.Join(homeDir, ".claude", "plugins", "installed_plugins.json")
+	installedPath := filepath.Join(configDir, "plugins", "installed_plugins.json")
 	var installed map[string]any
 	if data, err := os.ReadFile(installedPath); err == nil {
 		json.Unmarshal(data, &installed)
@@ -2684,7 +2718,7 @@ func installPlugin() {
 	}
 
 	// Enable in settings.json
-	settingsPath := filepath.Join(homeDir, ".claude", "settings.json")
+	settingsPath := filepath.Join(configDir, "settings.json")
 	var settings map[string]any
 	if data, err := os.ReadFile(settingsPath); err == nil {
 		json.Unmarshal(data, &settings)
@@ -2707,13 +2741,13 @@ func installPlugin() {
 // The security guidance is already injected at SessionStart via inject-secure-defaults.
 // This patch is re-applied on each launch since plugin updates overwrite hooks.json.
 func patchSemgrepHooks() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	configDir := claudeConfigDir()
+	if configDir == "" {
 		return
 	}
 
 	// Find semgrep plugin hooks.json in cache
-	semgrepDir := filepath.Join(homeDir, ".claude", "plugins", "cache", "claude-plugins-official", "semgrep")
+	semgrepDir := filepath.Join(configDir, "plugins", "cache", "claude-plugins-official", "semgrep")
 	entries, err := os.ReadDir(semgrepDir)
 	if err != nil {
 		return
@@ -2750,12 +2784,12 @@ func patchSemgrepHooks() {
 }
 
 func injectKiroChangelog() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	configDir := claudeConfigDir()
+	if configDir == "" {
 		return
 	}
 
-	cacheDir := filepath.Join(homeDir, ".claude", "cache")
+	cacheDir := filepath.Join(configDir, "cache")
 	os.MkdirAll(cacheDir, 0755)
 	cachePath := filepath.Join(cacheDir, "changelog.md")
 
@@ -2788,7 +2822,7 @@ func injectKiroChangelog() {
 	os.WriteFile(cachePath, []byte(combined), 0644)
 
 	// Clear lastReleaseNotesSeen so Claude Code shows the notes
-	claudePath := filepath.Join(homeDir, ".claude.json")
+	claudePath := claudeStateFile()
 	var cfg map[string]any
 	if data, err := os.ReadFile(claudePath); err == nil {
 		json.Unmarshal(data, &cfg)
@@ -3080,6 +3114,7 @@ func launchClaudeAgainstProxy(claudePath, baseURL string, claudeArgs []string) {
 	claudeCmd.Env = buildClaudeEnv(baseURL)
 	claudeCmd.Stdin, claudeCmd.Stdout, claudeCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
+
 	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
 	if err := claudeCmd.Run(); err != nil {
 		if claudeCmd.ProcessState != nil {
@@ -3271,6 +3306,7 @@ func runClaudeWithProxy() {
 	claudeCmd.Stdin = os.Stdin
 	claudeCmd.Stdout = os.Stdout
 	claudeCmd.Stderr = os.Stderr
+
 
 	// 7. Run claude (blocks until it exits)
 	fmt.Printf("Launching: claude %s\n", strings.Join(claudeArgs, " "))
