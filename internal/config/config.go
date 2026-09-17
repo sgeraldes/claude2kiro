@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 )
 
 // Config holds all application configuration
@@ -179,7 +181,7 @@ func configPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(homeDir, ".claude2kiro", "config.yaml"), nil
+	return profile.ConfigFilePath(homeDir), nil
 }
 
 // Load loads configuration from file, returning defaults if file doesn't exist

@@ -43,6 +43,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -867,7 +868,7 @@ func creditHistoryFilePath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(homeDir, ".claude2kiro", "credit-history.jsonl")
+	return filepath.Join(homeDir, ".claude2kiro", profile.CreditHistoryFileName())
 }
 
 // creditRecorder samples Kiro credit usage every 15 minutes and keeps 30 days of
@@ -3022,7 +3023,7 @@ func selfUpdate() {
 // proxyPortFilePath returns ~/.claude2kiro/proxy.port
 func proxyPortFilePath() string {
 	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".claude2kiro", "proxy.port")
+	return filepath.Join(homeDir, ".claude2kiro", profile.ProxyPortFileName())
 }
 
 // writeProxyPortFile writes the proxy port to a well-known file
@@ -4799,13 +4800,13 @@ func getTokenFilePath() string {
 		os.Exit(1)
 	}
 
-	return filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
+	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileName())
 }
 
 // getLoginConfigPath returns the path for login config file
 func getLoginConfigPath() string {
 	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".aws", "sso", "cache", "claude2kiro-login-config.json")
+	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.LoginConfigFileName())
 }
 
 // readLoginConfig reads the saved login configuration

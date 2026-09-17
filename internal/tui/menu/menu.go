@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/sgeraldes/claude2kiro/cmd"
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 )
 
 // Version is set at build time via ldflags
@@ -179,7 +180,7 @@ func getTokenInfo() TokenInfo {
 		return TokenInfo{}
 	}
 
-	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
+	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileName())
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
 		return TokenInfo{}

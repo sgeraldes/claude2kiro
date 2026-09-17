@@ -17,6 +17,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/internal/tui/messages"
 )
@@ -77,7 +78,7 @@ func GetTokenFilePath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
+	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileName())
 }
 
 // GetClientRegistrationPath returns the path for cached client registration
