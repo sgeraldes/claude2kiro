@@ -13,6 +13,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 )
 
 // savedIdCCredentials holds saved SSO credentials from token file
@@ -27,7 +29,7 @@ func getSavedIdCCredentials() (string, string) {
 	if err != nil {
 		return "", ""
 	}
-	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
+	tokenPath := filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileName())
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
 		return "", ""

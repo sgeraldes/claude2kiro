@@ -112,6 +112,26 @@ Supported login methods:
 
 Use this first if you have not authenticated yet, or if you need to switch accounts.
 
+#### Two Kiro identities on one machine
+
+One Kiro subscription is one Identity Center user and one monthly credit pool. To run a
+second identity side by side (a second subscribed user for delegated work, for example),
+set `CLAUDE2KIRO_PROFILE` and log in once under that name:
+
+```bash
+CLAUDE2KIRO_PROFILE=agentes claude2kiro login idc https://d5.awsapps.com/start us-east-1
+CLAUDE2KIRO_PROFILE=agentes claude2kiro credits
+CLAUDE2KIRO_PROFILE=agentes claude2kiro run -p "..."
+```
+
+Everything that identifies a session is keyed by the profile name, so the two never mix:
+the token (`~/.aws/sso/cache/kiro-auth-token.<profile>.json`), the saved login choice, the
+live-proxy port marker (`~/.claude2kiro/proxy.<profile>.port`, so `run` attaches to the
+proxy of the same identity) and the credit history. `~/.claude2kiro/config.<profile>.yaml`
+is used when it exists (give the second identity its own `server.port` there), otherwise
+the shared `config.yaml`. With the variable unset nothing changes: the historical file
+names stay in place.
+
 ### `claude2kiro run`
 
 ```bash

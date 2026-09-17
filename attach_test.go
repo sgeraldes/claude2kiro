@@ -104,3 +104,57 @@ func TestDetectLiveProxy_Non200(t *testing.T) {
 		t.Fatalf("expected ok=false when /health returns non-200")
 	}
 }
+
+// proxyServesThisProfile is the identity check detectLiveProxy applies to the
+// /health answer. Name() is process-cached, so these cases run against the
+// default profile (the one the test binary starts with) and assert both sides
+// of the rule; the named-profile side is the symmetric branch of the same
+// function.
+func TestProxyServesThisProfile_DefaultProfile(t *testing.T) {
+	cases := map[string]bool{
+		"":        true,  // older binary, no header: only the default profile accepts it
+		"default": true,  // a current default-profile proxy
+		"agentes": false, // another identity's proxy behind a stale marker
+	}
+	for header, want := range cases {
+		if got := proxyServesThisProfile(header); got != want {
+			t.Errorf("header %q: got %v want %v", header, got, want)
+		}
+	}
+}
+
+func TestDetectLiveProxy_OtherIdentityIsNotAttached(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.Header().Set(profileHeader, "agentes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	port := srv.URL[strings.LastIndex(srv.URL, ":")+1:]
+	writePortFile(t, port)
+
+	if _, ok := detectLiveProxy(); ok {
+		t.Fatalf("a healthy proxy that serves profile 'agentes' must not be attached by the default profile")
+	}
+}
+
+func TestDetectLiveProxy_SameIdentityIsAttached(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.Header().Set(profileHeader, "default")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	port := srv.URL[strings.LastIndex(srv.URL, ":")+1:]
+	writePortFile(t, port)
+
+	if _, ok := detectLiveProxy(); !ok {
+		t.Fatalf("a proxy that declares the default profile must be attached")
+	}
+}

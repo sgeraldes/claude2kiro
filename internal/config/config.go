@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 )
 
 // Config holds all application configuration
@@ -173,13 +175,25 @@ func Default() *Config {
 	}
 }
 
-// configPath returns the path to the config file
+// configPath returns the path the active profile reads its config from: its
+// own config.<profile>.yaml when it exists, else the shared config.yaml.
 func configPath() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(homeDir, ".claude2kiro", "config.yaml"), nil
+	return profile.ConfigReadPath(homeDir), nil
+}
+
+// savePath returns the path the active profile writes its config to. A named
+// profile always gets its own file, so a Settings change under one identity
+// never lands in the other's config.
+func savePath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return profile.ConfigSavePath(homeDir), nil
 }
 
 // Load loads configuration from file, returning defaults if file doesn't exist
@@ -208,7 +222,7 @@ func Load() (*Config, error) {
 
 // Save saves the configuration to file
 func (c *Config) Save() error {
-	path, err := configPath()
+	path, err := savePath()
 	if err != nil {
 		return err
 	}

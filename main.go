@@ -43,6 +43,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -867,7 +868,7 @@ func creditHistoryFilePath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(homeDir, ".claude2kiro", "credit-history.jsonl")
+	return filepath.Join(homeDir, ".claude2kiro", profile.CreditHistoryFileName())
 }
 
 // creditRecorder samples Kiro credit usage every 15 minutes and keeps 30 days of
@@ -3022,7 +3023,7 @@ func selfUpdate() {
 // proxyPortFilePath returns ~/.claude2kiro/proxy.port
 func proxyPortFilePath() string {
 	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".claude2kiro", "proxy.port")
+	return filepath.Join(homeDir, ".claude2kiro", profile.ProxyPortFileName())
 }
 
 // writeProxyPortFile writes the proxy port to a well-known file
@@ -3128,7 +3129,26 @@ func detectLiveProxy() (string, bool) {
 	if resp.StatusCode != http.StatusOK {
 		return "", false
 	}
+	// A stale proxy.<profile>.port can point at a port now held by the proxy of
+	// another identity (or by an older claude2kiro that sends no header). Only a
+	// proxy that declares this profile is ours; the default profile accepts the
+	// header-less answer of an older binary.
+	if !proxyServesThisProfile(resp.Header.Get(profileHeader)) {
+		return "", false
+	}
 	return baseURL, true
+}
+
+// profileHeader carries the profile a proxy serves in its /health answer.
+const profileHeader = "X-Claude2Kiro-Profile"
+
+// proxyServesThisProfile decides whether a /health answer with the given
+// profile header belongs to the active profile.
+func proxyServesThisProfile(header string) bool {
+	if header == "" {
+		return profile.Name() == ""
+	}
+	return header == profile.Label()
 }
 
 // extractNoAttachFlag pulls the claude2kiro-only "--no-attach" flag out of the
@@ -4150,7 +4170,10 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	})
 
 	// Add health check endpoint
+	// /health names the identity this proxy serves, so a `run` under another
+	// profile never attaches to it through a stale port marker.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(profileHeader, profile.Label())
 		w.WriteHeader(http.StatusOK)
 		io.Copy(w, strings.NewReader("OK"))
 	})
@@ -4799,13 +4822,13 @@ func getTokenFilePath() string {
 		os.Exit(1)
 	}
 
-	return filepath.Join(homeDir, ".aws", "sso", "cache", "kiro-auth-token.json")
+	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileName())
 }
 
 // getLoginConfigPath returns the path for login config file
 func getLoginConfigPath() string {
 	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".aws", "sso", "cache", "claude2kiro-login-config.json")
+	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.LoginConfigFileName())
 }
 
 // readLoginConfig reads the saved login configuration

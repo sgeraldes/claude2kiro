@@ -7,7 +7,7 @@ allowed-tools:
   - Write
 ---
 
-Manage the claude2kiro proxy configuration at `~/.claude2kiro/config.yaml`.
+Manage the claude2kiro proxy configuration at `~/.claude2kiro/config.yaml` (with `CLAUDE2KIRO_PROFILE=<name>` set, the file is `~/.claude2kiro/config.<name>.yaml`; read it if it exists, else fall back to `config.yaml`, and always write to the profile's own file).
 
 If no arguments are provided, read and display the current config with explanations.
 
@@ -30,7 +30,7 @@ Available settings and their defaults:
 Note: Max concurrent Kiro requests (4) and max tools per request (85) are hardcoded and cannot be changed via config.
 
 Steps:
-1. Read `~/.claude2kiro/config.yaml` (create if missing)
+1. Read the config file for the active profile (see above; create if missing)
 2. If viewing: show all current values in a table
 3. If setting: update the YAML value and save
 4. Confirm the change

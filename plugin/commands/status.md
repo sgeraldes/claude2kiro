@@ -8,7 +8,7 @@ Check the Kiro proxy status by reading its config and querying its endpoints. Ru
 
 1. Read the proxy config:
 ```bash
-cat ~/.claude2kiro/config.yaml 2>/dev/null || echo "No config file (using defaults)"
+cat ~/.claude2kiro/config${CLAUDE2KIRO_PROFILE:+.$CLAUDE2KIRO_PROFILE}.yaml 2>/dev/null || cat ~/.claude2kiro/config.yaml 2>/dev/null || echo "No config file (using defaults)"
 ```
 
 2. Resolve the proxy URL (prefer `ANTHROPIC_BASE_URL`, else the running proxy's
@@ -16,7 +16,8 @@ cat ~/.claude2kiro/config.yaml 2>/dev/null || echo "No config file (using defaul
 ```bash
 base="${ANTHROPIC_BASE_URL}"
 if [ -z "$base" ]; then
-  port="$(tr -d '[:space:]' < "$HOME/.claude2kiro/proxy.port" 2>/dev/null)"
+  marker="proxy${CLAUDE2KIRO_PROFILE:+.$CLAUDE2KIRO_PROFILE}.port"
+  port="$(tr -d '[:space:]' < "$HOME/.claude2kiro/$marker" 2>/dev/null)"
   [ -n "$port" ] && base="http://127.0.0.1:$port" || base="http://localhost:8080"
 fi
 echo "Proxy URL: $base"
