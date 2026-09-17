@@ -6,12 +6,13 @@ allowed-tools:
 
 Check Kiro credit usage by querying the proxy's credits endpoint. Resolve the
 proxy URL robustly: prefer `ANTHROPIC_BASE_URL`, fall back to the port written
-by the running proxy (`~/.claude2kiro/proxy.port`), then `localhost:8080`:
+by the running proxy (`~/.claude2kiro/proxy.port`, or `proxy.<profile>.port` when `CLAUDE2KIRO_PROFILE` is set), then `localhost:8080`:
 
 ```bash
 base="${ANTHROPIC_BASE_URL}"
 if [ -z "$base" ]; then
-  port="$(tr -d '[:space:]' < "$HOME/.claude2kiro/proxy.port" 2>/dev/null)"
+  marker="proxy${CLAUDE2KIRO_PROFILE:+.$CLAUDE2KIRO_PROFILE}.port"
+  port="$(tr -d '[:space:]' < "$HOME/.claude2kiro/$marker" 2>/dev/null)"
   [ -n "$port" ] && base="http://127.0.0.1:$port" || base="http://localhost:8080"
 fi
 curl -s --max-time 10 "$base/credits" 2>/dev/null

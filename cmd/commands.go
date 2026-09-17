@@ -405,7 +405,7 @@ func ExportEnvCmd() tea.Msg {
 
 // LogoutCmd returns a function that logs out
 func LogoutCmd() tea.Msg {
-	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), "claude2kiro-login-config.json")
+	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), profile.LoginConfigFileName())
 	tokenPath := GetTokenFilePath()
 
 	os.Remove(configPath)

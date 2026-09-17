@@ -11,49 +11,87 @@
 //	login config    ~/.aws/sso/cache/claude2kiro-login-config[.<profile>].json
 //	proxy port file ~/.claude2kiro/proxy[.<profile>].port
 //	credit history  ~/.claude2kiro/credit-history[.<profile>].jsonl
-//	config          ~/.claude2kiro/config.<profile>.yaml when it exists, else config.yaml
+//	config          read: ~/.claude2kiro/config.<profile>.yaml when it exists, else config.yaml
+//	                save: always ~/.claude2kiro/config.<profile>.yaml
 //
 // The default profile (variable unset or empty) keeps the historical file names,
 // so nothing changes for an existing install. The client registration cache is
 // keyed by clientIdHash already and is shared on purpose.
+//
+// A name is either valid ([A-Za-z0-9_-], up to 64 chars) or fatal: silently
+// dropping characters would let "../" or "a/b" resolve to another identity's
+// files, which is worse than refusing to start.
 package profile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 // EnvVar is the environment variable that selects the profile.
 const EnvVar = "CLAUDE2KIRO_PROFILE"
 
-// Name returns the active profile name, sanitized to [A-Za-z0-9_-], or "" for
-// the default profile.
-func Name() string {
-	return sanitize(os.Getenv(EnvVar))
+// DefaultLabel is how the default profile identifies itself where a name is
+// needed (the /health header, messages).
+const DefaultLabel = "default"
+
+var validName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+var (
+	once sync.Once
+	name string
+)
+
+// Validate returns the profile name a raw value denotes, or an error when the
+// value is not a valid name. Whitespace around the value is ignored; an empty
+// value is the default profile ("").
+func Validate(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if !validName.MatchString(raw) {
+		return "", fmt.Errorf("%s=%q is not a valid profile name: use letters, digits, '-' or '_' (max 64)", EnvVar, raw)
+	}
+	return raw, nil
 }
 
-func sanitize(raw string) string {
-	raw = strings.TrimSpace(raw)
-	var b strings.Builder
-	for _, r := range raw {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			b.WriteRune(r)
+// Name returns the active profile name, or "" for the default profile. An
+// invalid CLAUDE2KIRO_PROFILE is fatal: the process exits with code 2 and the
+// reason on stderr, before any file of another identity can be touched.
+func Name() string {
+	once.Do(func() {
+		n, err := Validate(os.Getenv(EnvVar))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
 		}
+		name = n
+	})
+	return name
+}
+
+// Label is the name to show: the profile name, or "default".
+func Label() string {
+	if n := Name(); n != "" {
+		return n
 	}
-	return b.String()
+	return DefaultLabel
 }
 
 // suffixed inserts ".<profile>" before the extension of base when a profile is
 // active: "kiro-auth-token.json" -> "kiro-auth-token.agentes.json".
 func suffixed(base string) string {
-	name := Name()
-	if name == "" {
+	n := Name()
+	if n == "" {
 		return base
 	}
 	ext := filepath.Ext(base)
-	return strings.TrimSuffix(base, ext) + "." + name + ext
+	return strings.TrimSuffix(base, ext) + "." + n + ext
 }
 
 // TokenFileName is the file name of the Kiro token for the active profile.
@@ -68,18 +106,24 @@ func ProxyPortFileName() string { return suffixed("proxy.port") }
 // CreditHistoryFileName is the file name of the credit history for the active profile.
 func CreditHistoryFileName() string { return suffixed("credit-history.jsonl") }
 
-// ConfigFilePath returns ~/.claude2kiro/config.<profile>.yaml if the active
-// profile has its own config, otherwise the shared ~/.claude2kiro/config.yaml.
-// A per-profile config is how a second identity gets its own server.port.
-func ConfigFilePath(homeDir string) string {
-	shared := filepath.Join(homeDir, ".claude2kiro", "config.yaml")
-	name := Name()
-	if name == "" {
-		return shared
+// ConfigSavePath is where the active profile's configuration is written:
+// config.<profile>.yaml for a named profile, config.yaml for the default. A
+// named profile never writes the shared file, so a Settings change under one
+// identity cannot leak into the other.
+func ConfigSavePath(homeDir string) string {
+	return filepath.Join(homeDir, ".claude2kiro", suffixed("config.yaml"))
+}
+
+// ConfigReadPath is where the active profile's configuration is read from: its
+// own config.<profile>.yaml when that file exists, otherwise the shared
+// config.yaml, so a new profile inherits the machine's settings until it saves.
+func ConfigReadPath(homeDir string) string {
+	own := ConfigSavePath(homeDir)
+	if Name() == "" {
+		return own
 	}
-	own := filepath.Join(homeDir, ".claude2kiro", "config."+name+".yaml")
 	if _, err := os.Stat(own); err == nil {
 		return own
 	}
-	return shared
+	return filepath.Join(homeDir, ".claude2kiro", "config.yaml")
 }
