@@ -66,7 +66,7 @@ func TestFirstRequestUsesTheCurrentIdentityNotTheCallersToken(t *testing.T) {
 			}
 			assertFallbackAnswer(t, rec.Body.String())
 			identityMu.Lock()
-			exhausted := exhaustedIdentities["kiro2"]
+			exhausted := exhaustedIdentities["kiro2"] != ""
 			identityMu.Unlock()
 			if exhausted {
 				t.Fatal("the healthy fallback was marked exhausted")

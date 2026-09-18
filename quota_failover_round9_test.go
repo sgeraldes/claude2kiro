@@ -248,8 +248,8 @@ func TestRejectedBearerAlreadyReplacedIsAdoptedNotRetired(t *testing.T) {
 			if calls.Load() != 0 {
 				t.Fatal("the provider was asked to refresh credentials that were already replaced")
 			}
-			if refreshedFor[ident.Name] {
-				t.Fatal("the adopted credentials must keep their one refresh")
+			if len(refreshedFor) != 0 {
+				t.Fatalf("the adopted credentials must keep their one refresh: %v", refreshedFor)
 			}
 			identityMu.Lock()
 			reason := identityFailures[ident.Name]

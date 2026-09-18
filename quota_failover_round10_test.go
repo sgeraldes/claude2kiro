@@ -48,7 +48,7 @@ func TestLateRejectionAfterARefreshAdoptsANewLogin(t *testing.T) {
 			refreshedFor := map[string]bool{}
 			// first rejection: X is refreshed
 			got, _, moved, err := recoverFromInvalidBearer(ident, x, refreshedFor, true)
-			if err != nil || moved || got.AccessToken != "fresh-X" || !refreshedFor[ident.Name] {
+			if err != nil || moved || got.AccessToken != "fresh-X" || !refreshedFor["rotated-X"] {
 				t.Fatalf("first recovery: %+v moved=%v err=%v refreshed=%v", got, moved, err, refreshedFor)
 			}
 			// a login in another process replaces fresh-X with Y
@@ -71,7 +71,7 @@ func TestLateRejectionAfterARefreshAdoptsANewLogin(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("the identity was retired with login Y on disk: %q", reason)
 			}
-			if refreshedFor[ident.Name] {
+			if refreshedFor["ry"] {
 				t.Fatal("login Y must keep its own refresh")
 			}
 			// Y rejected too: refreshed once, then retired

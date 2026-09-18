@@ -176,12 +176,17 @@ meanwhile, from the proxy, the TUI or a `claude2kiro login`/`logout`/`refresh` i
 terminal, waits for that write and then wins: the refresh publishes only what the file
 still holds. A writer that cannot get the lock in 45 s writes nothing and says so. A bearer
 the backend rejects while another process has already replaced it on disk is not refreshed
-again and the identity is not retired: the file's credentials are adopted, before and
-after the identity's one refresh. A retired identity that someone logs in again (its file
-holds other credentials than the rejected ones) is tried again on the next failover. The
-proxy checks a cached token against the file's content on every request, so a token file
-written by another process is noticed on the next request, not at the cache's one-minute
-expiry. When
+again and the identity is not retired: the file's credentials are adopted, and they keep
+their own refresh (the refresh budget of a request follows the credentials it refreshed,
+not the identity). A login writes a `loginId` into its token file and a refresh keeps it,
+so an identity that is out of credits or retired is tried again on the next failover only
+when another login (another account) took its slot; a rotation of the same login changes
+nothing. The proxy checks a cached token against the file's content on every request, so a
+token file written by another process is noticed on the next request, not at the cache's
+one-minute expiry; while the file cannot be read at all the cached token is not served. On
+Windows the proxy reads the file with delete sharing, so its readers never block a login or
+a refresh in another process, and a writer waits up to a second for a program that holds
+the file without it. When
 every listed identity is exhausted or unusable the client gets a non-retryable error
 naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
 so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.

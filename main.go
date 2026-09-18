@@ -65,6 +65,12 @@ type TokenData struct {
 	ClientIdHash string `json:"clientIdHash,omitempty"` // For IdC auth - hash of start URL
 	Region       string `json:"region,omitempty"`       // For IdC auth - AWS region
 	StartUrl     string `json:"startUrl,omitempty"`     // For IdC Enterprise - the start URL
+	// LoginID names the login this token came from. A login sets it, a
+	// refresh keeps it: the proxy tells a rotation of the same login from a
+	// new login (another account) that way, when it decides whether an
+	// exhausted or retired slot is worth another look. A file written by
+	// Kiro itself has none; its access token stands in then.
+	LoginID string `json:"loginId,omitempty"`
 }
 
 // CreateTokenRequest represents the request to exchange auth code for tokens
@@ -4689,13 +4695,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 && isInvalidBearerToken(body) {
-			if err := tryRefreshToken(); err != nil {
-				lg.LogError(fmt.Sprintf("Token refresh failed: %v", err))
-				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token expired, refresh failed: %v. Please re-login", err))
-			} else {
-				lg.LogInfo("Token refreshed successfully")
-				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token refreshed, please retry"))
-			}
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("the backend rejected the bearer token %d times in a row (refreshes and identity switches included). Please re-login", maxAttempts))
 		} else if contextTooLong {
 			// The request exceeded Kiro's input-size limit. Retrying can't help,
 			// and the generic path below would label it overloaded_error (which
@@ -6300,7 +6300,31 @@ func saveTokenTo(tokenPath string, token *TokenData) error {
 	}
 	defer unlock()
 
+	if token.LoginID == "" {
+		token.LoginID = newLoginID()
+	}
 	return writeTokenLocked(tokenPath, token)
+}
+
+// newLoginID is a fresh id for a login (random, 16 hex digits).
+func newLoginID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// loginKey identifies the login a token belongs to: its LoginID, or the
+// access token for a file written without one.
+func loginKey(tok TokenData) string {
+	if tok.LoginID != "" {
+		return tok.LoginID
+	}
+	if tok.AccessToken != "" {
+		return tok.AccessToken
+	}
+	return "?"
 }
 
 // readToken reads and displays token information
@@ -6493,7 +6517,7 @@ func tryRefreshToken() error { return renewToken(false) }
 // backend just rejected the bearer) the provider is asked whatever the file
 // says, so a revoked token is found out instead of resent.
 func renewToken(force bool) error {
-	_, err := renewTokenPast(force, nil)
+	_, _, err := renewTokenPast(force, nil)
 	return err
 }
 
@@ -6501,8 +6525,10 @@ func renewToken(force bool) error {
 // file no longer holds those credentials (a login, or a refresh in another
 // process, replaced them while the request was out) they are adopted as they
 // are, without asking the provider, and adopted is true; the caller retries
-// with them. Otherwise the refresh proceeds as with force.
-func renewTokenPast(force bool, rejected *TokenData) (adopted bool, err error) {
+// with them. Otherwise the refresh proceeds as with force, and renewed is
+// the token the provider issued (what the file holds unless a later login
+// took it over).
+func renewTokenPast(force bool, rejected *TokenData) (renewed TokenData, adopted bool, err error) {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
 
@@ -6514,7 +6540,7 @@ func renewTokenPast(force bool, rejected *TokenData) (adopted bool, err error) {
 	identityName := profile.Active()
 	tokenPath := tokenFilePathFor(identityName)
 	if tokenPath == "" {
-		return false, fmt.Errorf("failed to get user home directory")
+		return TokenData{}, false, fmt.Errorf("failed to get user home directory")
 	}
 
 	// The lock is held from the read through the write, HTTP call included:
@@ -6523,12 +6549,12 @@ func renewTokenPast(force bool, rejected *TokenData) (adopted bool, err error) {
 	// login or a logout in another process waits for the write.
 	unlock, err := tokenfile.Lock(tokenPath)
 	if err != nil {
-		return false, err
+		return TokenData{}, false, err
 	}
 	newToken, adopted, err := renewTokenLocked(tokenPath, force, rejected)
 	unlock()
 	if err != nil || adopted || newToken.AccessToken == "" {
-		return adopted, err
+		return newToken, adopted, err
 	}
 
 	// An IdC token that never had its profileArn resolved (a reserve refreshed
@@ -6543,11 +6569,11 @@ func renewTokenPast(force bool, rejected *TokenData) (adopted bool, err error) {
 	// another process, owns the file now and nothing of this refresh is
 	// published; the cache stays empty until the next read.
 	if _, ok := publishFromFile(identityName, tokenPath, newToken, arn); !ok {
-		return false, nil
+		return newToken, false, nil
 	}
 
 	fmt.Println("Token refreshed successfully")
-	return false, nil
+	return newToken, false, nil
 }
 
 // renewTokenLocked reads, renews and writes the token file for a caller that
@@ -6585,6 +6611,7 @@ func renewTokenLocked(tokenPath string, force bool, rejected *TokenData) (newTok
 	if newToken.AccessToken == "" {
 		return TokenData{}, false, fmt.Errorf("token refresh produced no access token; keeping the previous credentials")
 	}
+	newToken.LoginID = currentToken.LoginID // the same login, rotated
 	if err := writeTokenLocked(tokenPath, &newToken); err != nil {
 		return TokenData{}, false, err
 	}
@@ -6809,13 +6836,21 @@ func publishTokenAt(name string, token TokenData, gen uint64) bool {
 }
 
 // cacheMatchesFile tells whether the token file still holds the cached
-// token's credentials and profile. A file that is gone does not; a file
-// that cannot be read right now (a writer mid-replacement) is given the
-// benefit of the doubt, the cache being what was read from it last.
+// token's credentials and profile. A file that is gone does not, and
+// neither does one that cannot be read: a writer mid-replacement gets a
+// few retries, after which the cache is not trusted over the file.
 func cacheMatchesFile(tokenPath string, cached TokenData) bool {
-	onDisk, err := readTokenFile(tokenPath)
+	var onDisk TokenData
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		onDisk, err = readTokenFile(tokenPath)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if err != nil {
-		return !errors.Is(err, os.ErrNotExist)
+		return false
 	}
 	return sameCredentials(onDisk, cached) && onDisk.ProfileArn == cached.ProfileArn
 }
@@ -6849,16 +6884,24 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := os.WriteFile(tmp, data, perm); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	// On Windows the rename fails while another process holds the file
+	// open without delete sharing (an editor, Kiro itself); such holds are
+	// short, so the rename is tried for a second before giving up.
+	var err error
+	for attempt := 0; attempt < 25; attempt++ {
+		if err = os.Rename(tmp, path); err == nil {
+			return nil
+		}
+		time.Sleep(40 * time.Millisecond)
 	}
-	return nil
+	_ = os.Remove(tmp)
+	return err
 }
 
-// readTokenFile parses one identity's token file.
+// readTokenFile parses one identity's token file. The read shares delete
+// access, so a writer's rename in another process is not blocked by it.
 func readTokenFile(tokenPath string) (TokenData, error) {
-	data, err := os.ReadFile(tokenPath)
+	data, err := tokenfile.ReadFile(tokenPath)
 	if err != nil {
 		return TokenData{}, fmt.Errorf("failed to read token file: %w", err)
 	}

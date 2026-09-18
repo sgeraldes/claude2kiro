@@ -398,7 +398,7 @@ func TestLate402FromOldIdentityDoesNotExhaustTheFallback(t *testing.T) {
 		assertFallbackAnswer(t, bodies[i].Body.String())
 	}
 	identityMu.Lock()
-	exhaustedFallback := exhaustedIdentities["kiro2"]
+	exhaustedFallback := exhaustedIdentities["kiro2"] != ""
 	identityMu.Unlock()
 	if exhaustedFallback {
 		t.Fatal("a late 402 from the primary marked the healthy fallback as exhausted")
