@@ -1949,14 +1949,24 @@ func selectProfileArn(profiles []kiroProfile) string {
 // with a conservative selection. Returns "" if none can be determined safely.
 func discoverProfileArn(accessToken string) string {
 	// Kiro IDE's stored profile belongs to whoever is signed into the IDE,
-	// which is the launched identity at best. A fallback identity must not
-	// borrow it: ask the API with its own bearer.
+	// which may or may not be this bearer's user. It is only trusted for the
+	// launched identity and only when the API, asked with this very bearer,
+	// lists that same profile; if the API cannot answer, the IDE value is the
+	// best available. A fallback identity never borrows it.
+	profiles := fetchProfilesFromAPI(accessToken)
 	if profile.Active() == profile.Name() {
 		if arn := readKiroProfileArn(); arn != "" {
-			return arn
+			if len(profiles) == 0 {
+				return arn
+			}
+			for _, p := range profiles {
+				if p.Arn == arn {
+					return arn
+				}
+			}
 		}
 	}
-	return selectProfileArn(fetchProfilesFromAPI(accessToken))
+	return selectProfileArn(profiles)
 }
 
 // buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
@@ -4434,6 +4444,16 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
 
+	// The token the caller read may already belong to a previous identity
+	// (another request failed over meanwhile). Build everything from the
+	// current token and the identity it was read for, as one pair; without
+	// that pair nothing is sent (see identity_failover.go).
+	token, ident, err := tokenForRequest()
+	if err != nil {
+		sendErrorEvent(w, flusher, "error", fmt.Errorf("Token unavailable: %v. Please re-login", err))
+		return ""
+	}
+
 	// Build CodeWhisperer request
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
 
@@ -4461,7 +4481,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	lg.LogInfo(requestMetricsSummary(cwReq, len(cwReqBody), cfg))
 
 	// Create streaming request
-	proxyReq, err := http.NewRequest(
+	var proxyReq *http.Request
+	proxyReq, err = http.NewRequest(
 		http.MethodPost,
 		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
@@ -4485,12 +4506,6 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	var resp *http.Response
 	var lastErr error
 
-	// Every attempt goes out with a token and the identity it was read for
-	// (see identity_failover.go). A 402 or 403 acts on that identity only.
-	ident := currentIdentity()
-	if tok, id, terr := tokenForRequest(); terr == nil {
-		token, ident = tok, id
-	}
 	// adopt switches the request to another token: bearer for the header and
 	// profileArn in the body, everything else (conversationId, history) kept.
 	adopt := func(tok TokenData, id identityRef) error {
@@ -4597,19 +4612,24 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// Otherwise refresh once per identity and retry with the new token so
 		// the client never sees the 403; a still-403 after refresh falls
 		// through to the terminal error path below.
-		if resp.StatusCode == 403 && isInvalidBearerToken(body) && attempt < maxAttempts-1 {
-			if cur := currentIdentity(); cur != ident {
-				if tok, id, terr := tokenForRequest(); terr == nil {
-					lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
-					if err := adopt(tok, id); err != nil {
-						sendErrorEvent(w, flusher, "Failed to serialize request", err)
-						return ""
-					}
-					attempt--
-					skipBackoff = true
-					continue
+		if resp.StatusCode == 403 && isInvalidBearerToken(body) && currentIdentity() != ident && switches < maxSwitches {
+			// The proxy moved to another identity while this request was out:
+			// its bearer is simply the old one. Adopt the current pair; this is
+			// an identity switch, not a transient retry, so it costs no attempt.
+			if tok, id, terr := tokenForRequest(); terr == nil {
+				switches++
+				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+				if err := adopt(tok, id); err != nil {
+					sendErrorEvent(w, flusher, "Failed to serialize request", err)
+					return ""
 				}
-			} else if !refreshedFor[ident.Name] {
+				attempt--
+				skipBackoff = true
+				continue
+			}
+		}
+		if resp.StatusCode == 403 && isInvalidBearerToken(body) && attempt < maxAttempts-1 {
+			if !refreshedFor[ident.Name] {
 				refreshedFor[ident.Name] = true
 				if err := tryRefreshToken(); err != nil {
 					lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], err))
@@ -6107,6 +6127,9 @@ func loginIdC(provider, startUrl, region string) {
 // exchangeCodeForTokensIdC exchanges auth code for tokens via SSO OIDC
 func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg *SSOClientRegistration, clientIdHash, provider, region, startUrl string) (*TokenData, error) {
 	tokenUrl := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
+	if override := config.Get().Advanced.SSOOIDCTokenEndpoint; override != "" {
+		tokenUrl = override
+	}
 
 	reqBody := SSOCreateTokenRequest{
 		ClientId:     clientReg.ClientId,
@@ -6348,6 +6371,9 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	}
 
 	tokenUrl := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
+	if override := config.Get().Advanced.SSOOIDCTokenEndpoint; override != "" {
+		tokenUrl = override
+	}
 
 	reqBody := SSOCreateTokenRequest{
 		ClientId:     clientReg.ClientId,
@@ -6514,6 +6540,16 @@ func tryRefreshToken() error {
 	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
+	// An IdC token that never had its profileArn resolved (a reserve refreshed
+	// straight from a stale login) gets it now, with the bearer that works.
+	if newToken.AuthMethod == "IdC" && newToken.ProfileArn == "" {
+		if arn := discoverProfileArn(newToken.AccessToken); arn != "" {
+			newToken.ProfileArn = arn
+			if data, merr := jsonStr.MarshalIndent(newToken, "", "  "); merr == nil {
+				_ = os.WriteFile(tokenPath, data, 0600)
+			}
+		}
+	}
 	publishToken(identityName, newToken)
 
 	fmt.Println("Token refreshed successfully")
@@ -6580,47 +6616,71 @@ var (
 )
 
 func getToken() (TokenData, error) {
-	tokenMutex.Lock()
-	defer tokenMutex.Unlock()
-
 	name := profile.Active()
 
+	tokenMutex.Lock()
 	// Use cache if it's fresh (less than 1 minute old, to pick up manual file edits)
 	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < time.Minute {
-		return *cachedToken, nil
+		tok := *cachedToken
+		tokenMutex.Unlock()
+		return tok, nil
 	}
+	tokenMutex.Unlock()
 
 	tokenPath := tokenFilePathFor(name)
 	if tokenPath == "" {
 		return TokenData{}, fmt.Errorf("failed to get user home directory")
 	}
-
-	data, err := os.ReadFile(tokenPath)
+	token, err := readTokenFile(tokenPath)
 	if err != nil {
-		return TokenData{}, fmt.Errorf("failed to read token file: %v", err)
-	}
-
-	var token TokenData
-	if err := jsonStr.Unmarshal(data, &token); err != nil {
-		return TokenData{}, fmt.Errorf("failed to parse token file: %v", err)
+		return TokenData{}, err
 	}
 
 	// Discover and persist the IdC/Enterprise profile ARN once. The Kiro backend
 	// associates requests with a CodeWhisperer profile; for IdC users it must be
-	// their own account-specific profile. We persist it so this runs only until
-	// the token file has it.
+	// their own account-specific profile. The discovery call runs outside every
+	// lock and its result is merged into whatever the file holds by then (a
+	// refresh may have rotated the tokens meanwhile), never written as a whole.
 	if token.AuthMethod == "IdC" && token.ProfileArn == "" {
 		if arn := discoverProfileArn(token.AccessToken); arn != "" {
-			token.ProfileArn = arn
-			_ = saveTokenTo(tokenPath, &token) // best-effort, to the file we read
+			token = mergeProfileArn(tokenPath, token, arn)
 		}
 	}
 
-	cachedToken = &token
-	cachedIdentity = name
-	cachedTokenTime = time.Now()
-
+	publishToken(name, token)
 	return token, nil
+}
+
+// readTokenFile parses one identity's token file.
+func readTokenFile(tokenPath string) (TokenData, error) {
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return TokenData{}, fmt.Errorf("failed to read token file: %v", err)
+	}
+	var token TokenData
+	if err := jsonStr.Unmarshal(data, &token); err != nil {
+		return TokenData{}, fmt.Errorf("failed to parse token file: %v", err)
+	}
+	return token, nil
+}
+
+// mergeProfileArn stores a discovered profileArn on the token file at
+// tokenPath, keeping whatever access/refresh tokens the file holds now. It is
+// serialized with token refreshes so the two writers never interleave. The
+// returned token is the merged on-disk state (or the given token plus the ARN
+// when the file could not be re-read).
+func mergeProfileArn(tokenPath string, token TokenData, arn string) TokenData {
+	tokenRefreshMutex.Lock()
+	defer tokenRefreshMutex.Unlock()
+	current, err := readTokenFile(tokenPath)
+	if err != nil {
+		current = token
+	}
+	if current.ProfileArn == "" {
+		current.ProfileArn = arn
+		_ = saveTokenTo(tokenPath, &current) // best-effort
+	}
+	return current
 }
 
 // publishToken installs a freshly written token in the cache for the identity
@@ -6638,6 +6698,14 @@ func publishToken(name string, token TokenData) {
 // status it wrote so the caller's response log reflects backend errors instead
 // of a hardcoded 200 (streaming has no such choice: SSE commits 200 up front).
 func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string) int {
+	// Token and the identity it was read for, as one pair (see
+	// identity_failover.go); the caller's token may be from a previous identity.
+	token, ident, err := tokenForRequest()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Token unavailable: %v. Please re-login", err), http.StatusInternalServerError)
+		return http.StatusInternalServerError
+	}
+
 	// Build CodeWhisperer request
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
 
@@ -6677,11 +6745,6 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 	}
 
-	// Token and the identity it was read for (see identity_failover.go).
-	ident := currentIdentity()
-	if tok, id, terr := tokenForRequest(); terr == nil {
-		token, ident = tok, id
-	}
 	setKiroHeaders(proxyReq, token)
 
 	logInfo := func(msg string) {
@@ -6763,8 +6826,9 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		}
 
 		if resp.StatusCode == 403 && isInvalidBearerToken(cwRespBody) {
-			if cur := currentIdentity(); cur != ident {
+			if cur := currentIdentity(); cur != ident && switches < maxSwitches {
 				if tok, id, terr := tokenForRequest(); terr == nil {
+					switches++
 					logInfo(fmt.Sprintf("403 from identity %s after failover (non-stream) — retrying with identity %s", ident.Name, profile.ActiveLabel()))
 					if err := adopt(tok, id); err != nil {
 						http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)

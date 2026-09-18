@@ -146,6 +146,7 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 		}
 		identityGen++
 		invalidateTokenCache()
+		modelCatalog.Invalidate()
 		if _, err := getToken(); err != nil {
 			// The file exists but cannot be read: not a usable reserve.
 			exhaustedIdentities[name] = true

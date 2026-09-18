@@ -90,6 +90,7 @@ type AdvancedConfig struct {
 	ProfilesEndpoint      string `yaml:"profiles_endpoint"` // ListAvailableProfiles (IdC profileArn discovery)
 	KiroAuthEndpoint      string `yaml:"kiro_auth_endpoint"`
 	KiroRefreshEndpoint   string `yaml:"kiro_refresh_endpoint"`
+	SSOOIDCTokenEndpoint  string `yaml:"sso_oidc_token_endpoint,omitempty"` // Override for the IdC token refresh URL (default https://oidc.<region>.amazonaws.com/token); tests point it at a local server
 	KiroUsageURL          string `yaml:"kiro_usage_url"`
 	AWSRegion             string `yaml:"aws_region"`
 	ComparisonMode        bool   `yaml:"comparison_mode"`         // Debug: send to both Anthropic and Kiro

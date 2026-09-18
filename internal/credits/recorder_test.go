@@ -157,3 +157,42 @@ func TestRecorderFollowsTheResolvedFile(t *testing.T) {
 		t.Fatalf("a's file must keep only a's sample: %+v", h)
 	}
 }
+
+// N05: Start loads the persisted history before the first network read returns.
+func TestRecorderStartLoadsPersistedHistoryBeforeFirstRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	seed := NewRecorder(path, time.Hour, 0, func() Reading { return Reading{} })
+	seed.appendLine(Snapshot{T: time.Now().Unix(), Used: 7, Limit: 1000})
+
+	release := make(chan struct{})
+	r := NewRecorder(path, time.Hour, 24*time.Hour, func() Reading { <-release; return Reading{Err: os.ErrNotExist} })
+	r.Start()
+	got := r.History()
+	close(release)
+	if len(got) != 1 || got[0].Used != 7 {
+		t.Fatalf("persisted history must be visible right after Start: %+v", got)
+	}
+}
+
+// H09: after the resolved file moves to an identity with no history yet,
+// History shows an empty series, never the previous identity's points.
+func TestRecorderHistoryFollowsTheResolvedFileEvenWithoutSamples(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "a.jsonl")
+	rd := Reading{Used: 100, Limit: 1000, Remaining: 900, Plan: "A"}
+	r := NewRecorderFor(func() string { return current }, time.Hour, 24*time.Hour, func() Reading { return rd })
+	r.sampleOnce()
+	if h := r.History(); len(h) != 1 {
+		t.Fatalf("a: %+v", h)
+	}
+
+	current = filepath.Join(dir, "b.jsonl") // no file yet
+	if h := r.History(); len(h) != 0 {
+		t.Fatalf("b has no history yet, got a's: %+v", h)
+	}
+	rd = Reading{Err: os.ErrNotExist}
+	r.sampleOnce() // failed read: still nothing of a's
+	if h := r.History(); len(h) != 0 {
+		t.Fatalf("after a failed read b must still be empty: %+v", h)
+	}
+}

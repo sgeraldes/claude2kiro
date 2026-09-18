@@ -135,6 +135,18 @@ func NewCatalog(ttl time.Duration, fetch func() ([]KiroModel, error)) *Catalog {
 	return &Catalog{ttl: ttl, fetch: fetch, ids: map[string]bool{}}
 }
 
+// Invalidate forgets the cached list so the next use refetches. The proxy
+// calls it when it moves to another Kiro identity: the models one account can
+// use are not necessarily the ones another can.
+func (c *Catalog) Invalidate() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.fetchedAt = time.Time{}
+	c.mu.Unlock()
+}
+
 // SetOnChange registers a callback invoked whenever a refresh produces a model
 // set different from the previous one (including the very first successful
 // fetch). The callback receives a copy of the new list. It runs synchronously

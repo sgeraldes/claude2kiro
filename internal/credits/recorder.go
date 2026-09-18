@@ -93,6 +93,7 @@ func (r *Recorder) Start() {
 	}
 	r.startOnce.Do(func() {
 		r.track()
+		r.load()
 		// Sample off the calling goroutine: read() is a network call, and Start
 		// runs inline in buildServerMux (TUI/server/run), so a slow Kiro API must
 		// not delay server startup. Loaded file history already fills the chart.
@@ -167,6 +168,9 @@ func (r *Recorder) History() []Snapshot {
 	if r == nil {
 		return nil
 	}
+	// The view follows the identity the proxy is on right now, even between
+	// samples: after a switch the previous identity's series is never shown.
+	r.track()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]Snapshot, len(r.snap))
@@ -181,6 +185,11 @@ func (r *Recorder) History() []Snapshot {
 func (r *Recorder) load() {
 	snaps, ok := r.readFile()
 	if !ok {
+		// No file for this identity yet: an empty series, not the previous
+		// identity's points.
+		r.mu.Lock()
+		r.snap = nil
+		r.mu.Unlock()
 		return
 	}
 

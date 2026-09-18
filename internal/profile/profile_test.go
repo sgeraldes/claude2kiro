@@ -10,6 +10,9 @@ import (
 // suffixed()/paths through Validate-driven fixtures rather than the cache.
 func withName(t *testing.T, n string, fn func()) {
 	t.Helper()
+	// Consume the Once first, or the first Name() call inside fn would read
+	// the environment and overwrite the fixture.
+	once.Do(func() {})
 	old := name
 	name = n
 	defer func() { name = old }()
