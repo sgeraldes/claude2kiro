@@ -9,3 +9,9 @@ func holdFileUnreadable(t *testing.T, path string) func() {
 	t.Helper()
 	return nil
 }
+
+// holdFileUndeletable has no Unix counterpart: an open file can be removed.
+func holdFileUndeletable(t *testing.T, path string) func() {
+	t.Helper()
+	return nil
+}

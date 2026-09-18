@@ -227,3 +227,52 @@ func TestADamagedRenewedRecordIsDiscarded(t *testing.T) {
 func jsonDecodeBody(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
+
+// N39: a stale record that cannot be removed keeps its place busy; a refresh
+// then does not call the provider (its result could not be kept if the
+// file is held too), and the file's refresh token is not spent. Once the
+// record can be removed, the refresh proceeds.
+func TestAStaleRecordThatCannotBeRemovedStopsTheRefresh(t *testing.T) {
+	x := TokenData{AccessToken: "user-X", RefreshToken: "rx", AuthMethod: "Social", ProfileArn: "arn:X", ExpiresAt: farFuture(), LoginID: "login-x"}
+	withIdentities(t, map[string]TokenData{"": x})
+	var calls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		io.WriteString(w, `{"accessToken":"fresh-X","refreshToken":"rotated-X","expiresIn":3600}`)
+	}))
+	t.Cleanup(provider.Close)
+	cfg := *config.Get()
+	cfg.Advanced.KiroRefreshEndpoint = provider.URL
+	withConfig(t, &cfg)
+	// a stale record: it replaces credentials the file no longer holds
+	old := TokenData{AccessToken: "old", RefreshToken: "old-r", AuthMethod: "Social", LoginID: "login-x"}
+	if err := keepRenewed(identityFile(""), old, TokenData{AccessToken: "old2", RefreshToken: "old-r2", AuthMethod: "Social", LoginID: "login-x"}); err != nil {
+		t.Fatal(err)
+	}
+	release := holdFileUndeletable(t, tokenfile.RenewedPath(identityFile("")))
+	if release == nil {
+		t.Skip("this platform cannot keep a file from being removed by holding it")
+	}
+	err := renewToken(true)
+	if err == nil || !strings.Contains(err.Error(), "cannot be removed right now") {
+		release()
+		t.Fatalf("the refresh must stop on the stale record it cannot remove: %v", err)
+	}
+	if calls.Load() != 0 {
+		release()
+		t.Fatal("the provider was called with the record still in the way")
+	}
+	release()
+	if err := renewToken(true); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("provider calls: %d", calls.Load())
+	}
+	if disk := readIdentityToken(t, ""); disk.AccessToken != "fresh-X" {
+		t.Fatalf("disk: %+v", disk)
+	}
+	if _, err := os.Stat(tokenfile.RenewedPath(identityFile(""))); err == nil {
+		t.Fatal("the stale record was left behind")
+	}
+}

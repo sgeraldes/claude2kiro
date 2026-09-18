@@ -6983,7 +6983,11 @@ func readRenewed(tokenPath string) (rec renewedRecord, present bool, err error) 
 		return renewedRecord{}, false, fmt.Errorf("%w: %v", errRenewedUnreadable, err)
 	}
 	if err := jsonStr.Unmarshal(data, &rec); err != nil || rec.Token.AccessToken == "" || rec.From.AccessToken == "" {
-		_ = os.Remove(tokenfile.RenewedPath(tokenPath)) // damaged: nothing in it to apply
+		// damaged: nothing in it to apply; but its place must be free before
+		// a refresh may need it
+		if err := os.Remove(tokenfile.RenewedPath(tokenPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return renewedRecord{}, false, fmt.Errorf("a damaged renewed record %s cannot be removed right now: %w", tokenfile.RenewedPath(tokenPath), err)
+		}
 		return renewedRecord{}, false, nil
 	}
 	return rec, true, nil
@@ -7020,8 +7024,13 @@ func promoteRenewed(tokenPath string, current TokenData) (TokenData, bool, error
 		}
 		return rec.Token, true, nil
 	default:
-		// the file moved on without it (another login, a later rotation)
-		_ = os.Remove(side)
+		// the file moved on without it (another login, a later rotation).
+		// A record that cannot be removed keeps its place busy: a refresh
+		// now could not keep its result there, so nothing is spent until it
+		// is gone.
+		if err := os.Remove(side); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return TokenData{}, false, fmt.Errorf("a stale renewed record %s cannot be removed right now: %w", side, err)
+		}
 		return TokenData{}, false, nil
 	}
 }

@@ -192,8 +192,9 @@ whose write still fails then keeps the token the provider issued in
 them is spent and is never sent again): the next request, refresh or recovery of that
 identity applies it, once, only over those credentials, and adopts it without spending its
 own refresh; a file that moved on (a login, a later rotation) makes the record stale, and a
-login or a logout discards it. While such a record exists but cannot be read, that
-identity's requests fail instead of spending the file's refresh token. An identity's `loginId` is written by this proxy's login; a
+login or a logout discards it. While such a record exists but cannot be read or removed
+(a program holds it), that identity's requests and refreshes fail instead of spending the
+file's refresh token, until it can. An identity's `loginId` is written by this proxy's login; a
 file Kiro itself writes has none and is told apart by its access token, so a rotation of
 such a file counts as a new login once. A 402 marks the login that made the request, so a
 login that took the slot meanwhile is not the one marked out of credits. When

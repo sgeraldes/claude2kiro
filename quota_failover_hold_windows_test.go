@@ -28,3 +28,22 @@ func holdFileUnreadable(t *testing.T, path string) func() {
 	}
 	return func() { windows.CloseHandle(h) }
 }
+
+// holdFileUndeletable opens path readable but without delete sharing, so it
+// can be read but not removed or replaced; nil when the platform still
+// lets it be removed.
+func holdFileUndeletable(t *testing.T, path string) func() {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := path + ".probe"
+	if err := os.WriteFile(probe, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = f.Close() }
+}
