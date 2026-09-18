@@ -81,6 +81,13 @@ func newFakeQuotaBackend(t *testing.T, exhausted ...string) *fakeQuotaBackend {
 	return f
 }
 
+// rejectBearer makes the backend answer 403 "invalid bearer" to a bearer.
+func (f *fakeQuotaBackend) rejectBearer(bearer string) {
+	f.mu.Lock()
+	f.expired[bearer] = true
+	f.mu.Unlock()
+}
+
 func (f *fakeQuotaBackend) seen() ([]string, []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

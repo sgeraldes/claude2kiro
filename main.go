@@ -3680,7 +3680,7 @@ func runTUI() {
 		ConfigureClaude: cmd.ConfigureClaudeCmd,
 		Unconfigure:     cmd.UnconfigureCmd,
 		ViewCredits:     cmd.ViewCreditsCmd,
-		Logout:          cmd.LogoutCmd,
+		Logout:          logoutCmd,
 		GetTokenExpiry:  cmd.GetTokenExpiry,
 		HasToken:        cmd.HasToken,
 		IsTokenExpired:  cmd.IsTokenExpired,
@@ -4649,22 +4649,25 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			}
 		}
 		if resp.StatusCode == 403 && isInvalidBearerToken(body) && attempt < maxAttempts-1 {
-			if !refreshedFor[ident.Name] {
-				refreshedFor[ident.Name] = true
-				if err := tryRefreshToken(); err != nil {
-					lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], err))
-					// Fall through to the terminal 403 handler, which surfaces a
-					// clear "refresh failed, please re-login" to the client.
-				} else {
-					if tok, id, terr := tokenForRequest(); terr == nil {
-						if err := adopt(tok, id); err != nil {
-							sendErrorEvent(w, flusher, "Failed to serialize request", err)
-							return ""
-						}
-					}
-					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
-					continue
+			tok, id, moved, rerr := recoverFromInvalidBearer(ident, refreshedFor, switches < maxSwitches)
+			if rerr != nil {
+				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], rerr))
+				// Fall through to the terminal 403 handler, which surfaces a
+				// clear "refresh failed, please re-login" to the client.
+			} else {
+				if err := adopt(tok, id); err != nil {
+					sendErrorEvent(w, flusher, "Failed to serialize request", err)
+					return ""
 				}
+				if moved {
+					switches++
+					attempt--
+					skipBackoff = true
+					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+				} else {
+					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
+				}
+				continue
 			}
 		}
 
@@ -5738,6 +5741,7 @@ func loginSocial(provider string) {
 	// The first terminal result wins; a stray or repeated callback after it
 	// must not block its handler (Shutdown waits for handlers) nor the login.
 	fail := loginFailer(errChan)
+	deliver := loginDeliverer(authCodeChan)
 
 	// Create HTTP server for callback with local mux (avoid polluting DefaultServeMux)
 	mux := http.NewServeMux()
@@ -5795,7 +5799,7 @@ func loginSocial(provider string) {
 			</html>
 		`))
 
-		authCodeChan <- code
+		deliver(code)
 	})
 
 	// Start server in goroutine
@@ -5831,7 +5835,7 @@ func loginSocial(provider string) {
 	select {
 	case code := <-authCodeChan:
 		// Shutdown server
-		server.Shutdown(context.Background())
+		shutdownLoginServer(server)
 
 		fmt.Println("Authorization code received, exchanging for tokens...")
 
@@ -5854,12 +5858,12 @@ func loginSocial(provider string) {
 		fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
 
 	case err := <-errChan:
-		server.Shutdown(context.Background())
+		shutdownLoginServer(server)
 		fmt.Printf("Authentication failed: %v\n", err)
 		os.Exit(1)
 
 	case <-ctx.Done():
-		server.Shutdown(context.Background())
+		shutdownLoginServer(server)
 		fmt.Println("Authentication timed out. Please try again.")
 		os.Exit(1)
 	}
@@ -6039,6 +6043,7 @@ func loginIdC(provider, startUrl, region string) {
 	authCodeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
 	fail := loginFailer(errChan)
+	deliver := loginDeliverer(authCodeChan)
 
 	// Create HTTP server for callback
 	mux := http.NewServeMux()
@@ -6077,7 +6082,7 @@ func loginIdC(provider, startUrl, region string) {
 			.box{text-align:center;background:#fff;padding:40px 60px;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.2)}h1{color:#333}p{color:#666}</style>
 			</head><body><div class="box"><h1>✓ Login Successful!</h1><p>You can close this window.</p></div></body></html>`))
 
-		authCodeChan <- code
+		deliver(code)
 	})
 
 	// Start server in goroutine
@@ -6113,7 +6118,7 @@ func loginIdC(provider, startUrl, region string) {
 
 	select {
 	case code := <-authCodeChan:
-		server.Shutdown(context.Background())
+		shutdownLoginServer(server)
 
 		fmt.Println("Authorization code received, exchanging for tokens...")
 
@@ -6137,12 +6142,12 @@ func loginIdC(provider, startUrl, region string) {
 		fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
 
 	case err := <-errChan:
-		server.Shutdown(context.Background())
+		shutdownLoginServer(server)
 		fmt.Printf("Authentication failed: %v\n", err)
 		os.Exit(1)
 
 	case <-ctx.Done():
-		server.Shutdown(context.Background())
+		shutdownLoginServer(server)
 		fmt.Println("Authentication timed out. Please try again.")
 		os.Exit(1)
 	}
@@ -6276,6 +6281,7 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 
 // saveToken saves the token to the token file
 func saveToken(token *TokenData) error {
+	tokenLoginGen.Add(1)
 	return saveTokenTo(getTokenFilePath(), token)
 }
 
@@ -6522,7 +6528,13 @@ func refreshTokenSocial(currentToken TokenData) (TokenData, error) {
 // tryRefreshToken attempts to refresh the token without exiting on failure
 // This is used by the server to handle 403 errors gracefully
 // Uses a mutex to prevent concurrent refresh attempts from racing
-func tryRefreshToken() error {
+func tryRefreshToken() error { return renewToken(false) }
+
+// renewToken renews the active identity's token. Without force, a token
+// that another goroutine renewed moments ago is left alone; with force (the
+// backend just rejected the bearer) the provider is asked whatever the file
+// says, so a revoked token is found out instead of resent.
+func renewToken(force bool) error {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
 
@@ -6548,7 +6560,7 @@ func tryRefreshToken() error {
 	}
 
 	// Check if token was already refreshed by another goroutine while we were waiting
-	if currentToken.ExpiresAt != "" {
+	if !force && currentToken.ExpiresAt != "" {
 		if expiresAt, parseErr := time.Parse(time.RFC3339, currentToken.ExpiresAt); parseErr == nil {
 			if time.Until(expiresAt) > 5*time.Minute {
 				// Token was recently refreshed, no need to refresh again
@@ -6577,17 +6589,21 @@ func tryRefreshToken() error {
 		return fmt.Errorf("failed to serialize new token: %v", err)
 	}
 
+	login := tokenLoginGen.Load()
 	if err := writeFileAtomic(tokenPath, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
 	bumpTokenGen()
 	// An IdC token that never had its profileArn resolved (a reserve refreshed
 	// straight from a stale login) gets it now, with the bearer that works.
+	// The ARN is merged, not written over: a login that landed meanwhile keeps
+	// its own credentials.
 	if newToken.AuthMethod == "IdC" && newToken.ProfileArn == "" {
 		if arn := discoverProfileArn(newToken.AccessToken); arn != "" {
-			newToken.ProfileArn = arn
-			if data, merr := jsonStr.MarshalIndent(newToken, "", "  "); merr == nil {
-				_ = writeFileAtomic(tokenPath, data, 0600) // best-effort; published below either way
+			if merged, _, ok := mergeProfileArnLocked(tokenPath, newToken, arn, login); ok {
+				newToken = merged
+			} else {
+				return nil // another login owns the file now; nothing of this refresh is published
 			}
 		}
 	}
@@ -6656,6 +6672,34 @@ func loginFailer(errChan chan<- error) func(error) {
 	}
 }
 
+// loginDeliverer hands the authorization code over the same way: the first
+// one wins, a repeated callback never blocks.
+func loginDeliverer(codeChan chan<- string) func(string) {
+	return func(code string) {
+		select {
+		case codeChan <- code:
+		default:
+		}
+	}
+}
+
+// shutdownLoginServer closes the callback server with a deadline, so a
+// handler that is somehow still busy cannot hold the login forever.
+func shutdownLoginServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+}
+
+// logoutCmd is the TUI's logout: the file goes, and so does anything the
+// proxy cached from it; a read that was in flight cannot put it back.
+func logoutCmd() tea.Msg {
+	msg := cmd.LogoutCmd()
+	tokenLoginGen.Add(1)
+	bumpTokenGen()
+	return msg
+}
+
 // refreshTokenCmd is the TUI's token refresh: the same writer as the proxy's
 // own refresh, so the cache generation and the identity locks see it.
 func refreshTokenCmd() tea.Msg {
@@ -6678,6 +6722,9 @@ var (
 	cachedTokenTime time.Time
 	tokenMutex      sync.Mutex
 	cachedTTL       time.Duration
+	// tokenLoginGen counts logins (a new principal in the file). A discovery
+	// started for one login must not attach its ARN to the next.
+	tokenLoginGen atomic.Uint64
 	// tokenWriteGen counts token file writes (refresh, login, ARN merge). A
 	// reader that started before a write must not publish what it read: by
 	// the time its discovery call returns, the bearer it holds may have been
@@ -6728,8 +6775,13 @@ func getToken() (TokenData, error) {
 		// the file holds by then (a refresh may have rotated the tokens
 		// meanwhile), never written as a whole.
 		if token.AuthMethod == "IdC" && token.ProfileArn == "" {
+			login := tokenLoginGen.Load()
 			if arn := discoverProfileArn(token.AccessToken); arn != "" {
-				token, gen = mergeProfileArn(tokenPath, token, arn)
+				var ok bool
+				token, gen, ok = mergeProfileArn(tokenPath, token, arn, login)
+				if !ok {
+					continue // the file changed hands or is gone: read it again
+				}
 			}
 		}
 		if publishTokenAt(name, token, gen) {
@@ -6806,23 +6858,35 @@ func readTokenFile(tokenPath string) (TokenData, error) {
 }
 
 // mergeProfileArn stores a discovered profileArn on the token file at
-// tokenPath, keeping whatever access/refresh tokens the file holds now. It is
-// serialized with token refreshes so the two writers never interleave. The
-// returned token is the merged on-disk state (or the given token plus the ARN
-// when the file could not be re-read), with the write generation that state
-// belongs to.
-func mergeProfileArn(tokenPath string, token TokenData, arn string) (TokenData, uint64) {
+// tokenPath, keeping whatever access/refresh tokens the file holds now (a
+// refresh may have rotated them). It is serialized with token refreshes so
+// the two writers never interleave. The ARN belongs to the login the discovery
+// was made for: if another login replaced the file since (login generation
+// moved) or the file is gone (logout), nothing is written and ok is false.
+// The returned token is the merged on-disk state, with the write generation
+// that state belongs to.
+func mergeProfileArn(tokenPath string, token TokenData, arn string, login uint64) (TokenData, uint64, bool) {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
+	return mergeProfileArnLocked(tokenPath, token, arn, login)
+}
+
+// mergeProfileArnLocked is mergeProfileArn for a caller that holds
+// tokenRefreshMutex.
+func mergeProfileArnLocked(tokenPath string, token TokenData, arn string, login uint64) (TokenData, uint64, bool) {
+	_ = token
+	if tokenLoginGen.Load() != login {
+		return TokenData{}, tokenWriteGen.Load(), false
+	}
 	current, err := readTokenFile(tokenPath)
 	if err != nil {
-		current = token
+		return TokenData{}, tokenWriteGen.Load(), false
 	}
 	if current.ProfileArn == "" {
 		current.ProfileArn = arn
 		_ = saveTokenTo(tokenPath, &current) // best-effort
 	}
-	return current, tokenWriteGen.Load()
+	return current, tokenWriteGen.Load(), true
 }
 
 // publishWrittenToken installs a token this process just wrote to its file:
@@ -6978,15 +7042,20 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 					}
 					continue
 				}
-			} else if !refreshedFor[ident.Name] {
-				refreshedFor[ident.Name] = true
-				if rerr := tryRefreshToken(); rerr != nil {
+			} else {
+				tok, id, moved, rerr := recoverFromInvalidBearer(ident, refreshedFor, switches < maxSwitches)
+				if rerr != nil {
 					logError(fmt.Sprintf("Token refresh on 403 failed (non-stream): %v", rerr))
-				} else if tok, id, terr := tokenForRequest(); terr == nil {
-					logInfo("Token refreshed after 403 (non-stream) — retrying transparently")
+				} else {
 					if err := adopt(tok, id); err != nil {
 						http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
 						return http.StatusInternalServerError
+					}
+					if moved {
+						switches++
+						logInfo(fmt.Sprintf("Bearer of identity %s rejected (non-stream) — moved to identity %s, retrying transparently", ident.Name, profile.ActiveLabel()))
+					} else {
+						logInfo("Token refreshed after 403 (non-stream) — retrying transparently")
 					}
 					continue
 				}

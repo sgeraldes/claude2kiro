@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -13,6 +14,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/internal/tui/login"
@@ -652,6 +654,21 @@ func (m Model) GetLogger() *logger.Logger {
 }
 
 // runLoginCommand runs the login command in background and streams output to TUI
+// LoginChildEnvironment is the environment of the login the TUI launches:
+// the child logs in the identity this TUI is on right now, which after a
+// failover is not the profile it was launched with. It is said explicitly
+// instead of letting the child inherit the launch profile and write the new
+// credentials into another identity's file.
+func LoginChildEnvironment() []string {
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, profile.EnvVar+"=") {
+			env = append(env, kv)
+		}
+	}
+	return append(env, profile.EnvVar+"="+profile.Active())
+}
+
 func runLoginCommand(args []string, program *tea.Program) tea.Cmd {
 	return func() tea.Msg {
 		executable, err := os.Executable()
@@ -660,6 +677,7 @@ func runLoginCommand(args []string, program *tea.Program) tea.Cmd {
 		}
 
 		cmd := exec.Command(executable, args...)
+		cmd.Env = LoginChildEnvironment()
 
 		// Capture both stdout and stderr
 		stdout, err := cmd.StdoutPipe()

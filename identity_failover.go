@@ -131,13 +131,63 @@ func tokenFilePathFor(name string) string {
 // token when it is stale. With nothing left it returns an error naming every
 // exhausted identity; the proxy stays where it was.
 func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error) {
+	return switchAway(failed, "")
+}
+
+// retireIdentity is switchToFallbackIdentity for an identity whose bearer the
+// backend rejects and whose refresh cannot fix (revoked login): it is not out
+// of credits, it is unusable until someone logs it in again. The reason is
+// remembered so the final error names it.
+func retireIdentity(failed identityRef, reason string) (TokenData, identityRef, error) {
+	return switchAway(failed, reason)
+}
+
+// recoverFromInvalidBearer is what a handler does with a 403 "invalid bearer"
+// from identity ident. If the proxy already moved on, the current identity's
+// pair is adopted. Otherwise the bearer is refreshed once, past the freshness
+// shortcut (the backend just said it is no good): a refresh the provider
+// rejects for good, or a bearer still rejected after a refresh, retires the
+// identity and moves to the next reserve when canSwitch allows. moved tells
+// the caller the pair belongs to another identity.
+func recoverFromInvalidBearer(ident identityRef, refreshedFor map[string]bool, canSwitch bool) (TokenData, identityRef, bool, error) {
+	if currentIdentity() != ident {
+		tok, id, err := tokenForRequest()
+		return tok, id, true, err
+	}
+	if !refreshedFor[ident.Name] {
+		refreshedFor[ident.Name] = true
+		err := renewToken(true)
+		if err == nil {
+			tok, id, terr := tokenForRequest()
+			return tok, id, false, terr
+		}
+		if !isPermanentRefreshError(err) || !canSwitch {
+			return TokenData{}, identityRef{}, false, err
+		}
+		tok, id, serr := retireIdentity(ident, "refresh rejected: "+err.Error())
+		return tok, id, true, serr
+	}
+	if !canSwitch {
+		return TokenData{}, identityRef{}, false, fmt.Errorf("bearer of identity %s still rejected after a refresh", ident.Name)
+	}
+	tok, id, serr := retireIdentity(ident, "bearer rejected after a refresh")
+	return tok, id, true, serr
+}
+
+// switchAway moves the proxy off the identity that failed: out of credits
+// when reason is empty, unusable for the given reason otherwise.
+func switchAway(failed identityRef, reason string) (TokenData, identityRef, error) {
 	identityMu.Lock()
 	if failed.Gen != identityGen || failed.Name != profile.Active() {
 		// Someone else already switched: adopt the current identity.
 		identityMu.Unlock()
 		return tokenForRequest()
 	}
-	exhaustedIdentities[failed.Name] = true
+	if reason == "" {
+		exhaustedIdentities[failed.Name] = true
+	} else {
+		identityFailures[failed.Name] = reason
+	}
 
 	cfg := config.Get()
 	candidates := append([]string{profile.Name()}, cfg.Auth.FallbackProfiles...)

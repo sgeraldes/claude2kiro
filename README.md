@@ -163,7 +163,11 @@ identity in use in `X-Claude2Kiro-Identity`. A reserve whose stale token cannot 
 refreshed is skipped for the next one: for good when the identity provider rejected it
 (revoked login, `invalid_grant`), only for this failover when the refresh failed for a
 passing reason (network, 5xx, a file another process is replacing, a refresh that answered
-without a token). A token file with no access token is skipped the same way. When
+without a token). A token file with no access token is skipped the same way. A bearer the
+backend rejects on a request is refreshed on the spot; if the provider rejects that refresh
+too, or the refreshed bearer is still rejected, that identity is retired and the next
+reserve serves the same request. A login started from the TUI after a failover logs in the
+identity the TUI is on, not the one it was launched with. When
 every listed identity is exhausted or unusable the client gets a non-retryable error
 naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
 so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.
