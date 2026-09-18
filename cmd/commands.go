@@ -18,6 +18,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/profile"
+	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/internal/tui/messages"
 )
@@ -354,8 +355,10 @@ func LogoutCmd() tea.Msg {
 	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), profile.LoginConfigFileName())
 	tokenPath := GetTokenFilePath()
 
+	unlock := tokenfile.Lock(tokenPath)
 	os.Remove(configPath)
 	os.Remove(tokenPath)
+	unlock()
 
 	return StatusMsg{
 		Message: "Logged out successfully",

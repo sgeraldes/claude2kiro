@@ -158,7 +158,7 @@ func TestRejectedBearerMovesToTheNextReserve(t *testing.T) {
 // N18: repeated successful callbacks do not block the login either.
 func TestLoginDelivererNeverBlocks(t *testing.T) {
 	codeChan := make(chan string, 1)
-	deliver := loginDeliverer(codeChan)
+	deliver := loginDeliverer(&loginOutcome{}, codeChan)
 	done := make(chan struct{})
 	go func() {
 		deliver("first")

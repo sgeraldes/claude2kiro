@@ -45,6 +45,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/internal/models"
 
 	"github.com/sgeraldes/claude2kiro/internal/profile"
+	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 	"github.com/sgeraldes/claude2kiro/internal/tui"
 	"github.com/sgeraldes/claude2kiro/internal/tui/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -5740,8 +5741,9 @@ func loginSocial(provider string) {
 	errChan := make(chan error, 1)
 	// The first terminal result wins; a stray or repeated callback after it
 	// must not block its handler (Shutdown waits for handlers) nor the login.
-	fail := loginFailer(errChan)
-	deliver := loginDeliverer(authCodeChan)
+	outcome := &loginOutcome{}
+	fail := loginFailer(outcome, errChan)
+	deliver := loginDeliverer(outcome, authCodeChan)
 
 	// Create HTTP server for callback with local mux (avoid polluting DefaultServeMux)
 	mux := http.NewServeMux()
@@ -6042,8 +6044,9 @@ func loginIdC(provider, startUrl, region string) {
 	// Channel to receive the auth code
 	authCodeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
-	fail := loginFailer(errChan)
-	deliver := loginDeliverer(authCodeChan)
+	outcome := &loginOutcome{}
+	fail := loginFailer(outcome, errChan)
+	deliver := loginDeliverer(outcome, authCodeChan)
 
 	// Create HTTP server for callback
 	mux := http.NewServeMux()
@@ -6281,7 +6284,6 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 
 // saveToken saves the token to the token file
 func saveToken(token *TokenData) error {
-	tokenLoginGen.Add(1)
 	return saveTokenTo(getTokenFilePath(), token)
 }
 
@@ -6295,6 +6297,8 @@ func saveTokenTo(tokenPath string, token *TokenData) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
+	unlock := tokenfile.Lock(tokenPath)
+	defer unlock()
 
 	data, err := jsonStr.MarshalIndent(token, "", "  ")
 	if err != nil {
@@ -6589,18 +6593,30 @@ func renewToken(force bool) error {
 		return fmt.Errorf("failed to serialize new token: %v", err)
 	}
 
-	login := tokenLoginGen.Load()
-	if err := writeFileAtomic(tokenPath, newData, 0600); err != nil {
-		return fmt.Errorf("failed to write token file: %v", err)
+	// The refreshed token replaces the credentials it was made from, and only
+	// those: under the cross-process file lock the file is read again, and a
+	// login that landed meanwhile (here or in another process) or a logout
+	// that removed the file win; nothing of this refresh is written or
+	// published then.
+	unlock := tokenfile.Lock(tokenPath)
+	onDisk, rerr := readTokenFile(tokenPath)
+	if rerr != nil || !sameCredentials(onDisk, currentToken) {
+		unlock()
+		return fmt.Errorf("the token file changed during the refresh (another login or a logout); keeping what is there")
+	}
+	werr := writeFileAtomic(tokenPath, newData, 0600)
+	unlock()
+	if werr != nil {
+		return fmt.Errorf("failed to write token file: %v", werr)
 	}
 	bumpTokenGen()
 	// An IdC token that never had its profileArn resolved (a reserve refreshed
 	// straight from a stale login) gets it now, with the bearer that works.
-	// The ARN is merged, not written over: a login that landed meanwhile keeps
-	// its own credentials.
+	// The ARN is merged under the same rule: only onto the credentials it
+	// belongs to.
 	if newToken.AuthMethod == "IdC" && newToken.ProfileArn == "" {
 		if arn := discoverProfileArn(newToken.AccessToken); arn != "" {
-			if merged, _, ok := mergeProfileArnLocked(tokenPath, newToken, arn, login); ok {
+			if merged, _, ok := mergeProfileArnLocked(tokenPath, newToken, arn); ok {
 				newToken = merged
 			} else {
 				return nil // another login owns the file now; nothing of this refresh is published
@@ -6658,28 +6674,39 @@ func setClaude() {
 	fmt.Println("Claude config file updated successfully")
 }
 
-// loginFailer reports a login failure on errChan without ever blocking: the
-// channel holds one result and the first terminal result is the login's
-// outcome; anything after it is dropped, so a callback that arrives late
-// (a retried browser tab, a stray request) finishes its handler and lets the
-// server shut down.
-func loginFailer(errChan chan<- error) func(error) {
+// loginOutcome makes the first terminal result of a login, success or
+// failure, the only one delivered: anything after it is dropped, so a
+// callback that arrives late (a retried browser tab, a stray request) never
+// blocks its handler nor competes with the result already taken.
+type loginOutcome struct {
+	once sync.Once
+}
+
+func (o *loginOutcome) settle(deliver func()) {
+	o.once.Do(deliver)
+}
+
+// loginFailer reports a login failure on errChan through the outcome.
+func loginFailer(o *loginOutcome, errChan chan<- error) func(error) {
 	return func(err error) {
-		select {
-		case errChan <- err:
-		default:
-		}
+		o.settle(func() {
+			select {
+			case errChan <- err:
+			default:
+			}
+		})
 	}
 }
 
-// loginDeliverer hands the authorization code over the same way: the first
-// one wins, a repeated callback never blocks.
-func loginDeliverer(codeChan chan<- string) func(string) {
+// loginDeliverer hands the authorization code over through the same outcome.
+func loginDeliverer(o *loginOutcome, codeChan chan<- string) func(string) {
 	return func(code string) {
-		select {
-		case codeChan <- code:
-		default:
-		}
+		o.settle(func() {
+			select {
+			case codeChan <- code:
+			default:
+			}
+		})
 	}
 }
 
@@ -6694,8 +6721,11 @@ func shutdownLoginServer(server *http.Server) {
 // logoutCmd is the TUI's logout: the file goes, and so does anything the
 // proxy cached from it; a read that was in flight cannot put it back.
 func logoutCmd() tea.Msg {
+	// serialized with this process's writers (mutex) and with any other
+	// process's (file lock) so nothing in flight can put the file back
+	tokenRefreshMutex.Lock()
+	defer tokenRefreshMutex.Unlock()
 	msg := cmd.LogoutCmd()
-	tokenLoginGen.Add(1)
 	bumpTokenGen()
 	return msg
 }
@@ -6703,7 +6733,8 @@ func logoutCmd() tea.Msg {
 // refreshTokenCmd is the TUI's token refresh: the same writer as the proxy's
 // own refresh, so the cache generation and the identity locks see it.
 func refreshTokenCmd() tea.Msg {
-	if err := tryRefreshToken(); err != nil {
+	// the user asked for a refresh: ask the provider, whatever the expiry says
+	if err := renewToken(true); err != nil {
 		return cmd.RefreshResultMsg{Success: false, Err: err}
 	}
 	return cmd.RefreshResultMsg{Success: true, ExpiresAt: cmd.GetTokenExpiry()}
@@ -6722,9 +6753,6 @@ var (
 	cachedTokenTime time.Time
 	tokenMutex      sync.Mutex
 	cachedTTL       time.Duration
-	// tokenLoginGen counts logins (a new principal in the file). A discovery
-	// started for one login must not attach its ARN to the next.
-	tokenLoginGen atomic.Uint64
 	// tokenWriteGen counts token file writes (refresh, login, ARN merge). A
 	// reader that started before a write must not publish what it read: by
 	// the time its discovery call returns, the bearer it holds may have been
@@ -6775,10 +6803,9 @@ func getToken() (TokenData, error) {
 		// the file holds by then (a refresh may have rotated the tokens
 		// meanwhile), never written as a whole.
 		if token.AuthMethod == "IdC" && token.ProfileArn == "" {
-			login := tokenLoginGen.Load()
 			if arn := discoverProfileArn(token.AccessToken); arn != "" {
 				var ok bool
-				token, gen, ok = mergeProfileArn(tokenPath, token, arn, login)
+				token, gen, ok = mergeProfileArn(tokenPath, token, arn)
 				if !ok {
 					continue // the file changed hands or is gone: read it again
 				}
@@ -6858,35 +6885,54 @@ func readTokenFile(tokenPath string) (TokenData, error) {
 }
 
 // mergeProfileArn stores a discovered profileArn on the token file at
-// tokenPath, keeping whatever access/refresh tokens the file holds now (a
-// refresh may have rotated them). It is serialized with token refreshes so
-// the two writers never interleave. The ARN belongs to the login the discovery
-// was made for: if another login replaced the file since (login generation
-// moved) or the file is gone (logout), nothing is written and ok is false.
-// The returned token is the merged on-disk state, with the write generation
-// that state belongs to.
-func mergeProfileArn(tokenPath string, token TokenData, arn string, login uint64) (TokenData, uint64, bool) {
+// tokenPath. The ARN belongs to the credentials the discovery was made with
+// (token): under the cross-process file lock the file is read again and the
+// ARN is written only if it still holds those very credentials. A login that
+// replaced them (this process or another), a refresh that rotated them, or a
+// logout that removed the file leave nothing written and ok false; the next
+// read discovers again with the bearer that is current then. The returned
+// token is the on-disk state, with the write generation it belongs to.
+func mergeProfileArn(tokenPath string, token TokenData, arn string) (TokenData, uint64, bool) {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
-	return mergeProfileArnLocked(tokenPath, token, arn, login)
+	return mergeProfileArnLocked(tokenPath, token, arn)
 }
 
 // mergeProfileArnLocked is mergeProfileArn for a caller that holds
 // tokenRefreshMutex.
-func mergeProfileArnLocked(tokenPath string, token TokenData, arn string, login uint64) (TokenData, uint64, bool) {
-	_ = token
-	if tokenLoginGen.Load() != login {
-		return TokenData{}, tokenWriteGen.Load(), false
-	}
+func mergeProfileArnLocked(tokenPath string, token TokenData, arn string) (TokenData, uint64, bool) {
+	unlock := tokenfile.Lock(tokenPath)
+	defer unlock()
 	current, err := readTokenFile(tokenPath)
-	if err != nil {
+	if err != nil || !sameCredentials(current, token) {
 		return TokenData{}, tokenWriteGen.Load(), false
 	}
 	if current.ProfileArn == "" {
 		current.ProfileArn = arn
-		_ = saveTokenTo(tokenPath, &current) // best-effort
+		_ = writeTokenLocked(tokenPath, &current) // best-effort
 	}
 	return current, tokenWriteGen.Load(), true
+}
+
+// sameCredentials tells whether two token files hold the same login: the
+// same access and refresh tokens. A login, a rotation or a logout changes
+// them; a merged ARN does not.
+func sameCredentials(a, b TokenData) bool {
+	return a.AccessToken == b.AccessToken && a.RefreshToken == b.RefreshToken
+}
+
+// writeTokenLocked writes a token file for a caller that already holds the
+// file lock, and records the write.
+func writeTokenLocked(tokenPath string, token *TokenData) error {
+	data, err := jsonStr.MarshalIndent(token, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal token: %v", err)
+	}
+	if err := writeFileAtomic(tokenPath, data, 0600); err != nil {
+		return fmt.Errorf("failed to write token file: %v", err)
+	}
+	bumpTokenGen()
+	return nil
 }
 
 // publishWrittenToken installs a token this process just wrote to its file:

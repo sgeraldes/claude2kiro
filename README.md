@@ -167,7 +167,10 @@ without a token). A token file with no access token is skipped the same way. A b
 backend rejects on a request is refreshed on the spot; if the provider rejects that refresh
 too, or the refreshed bearer is still rejected, that identity is retired and the next
 reserve serves the same request. A login started from the TUI after a failover logs in the
-identity the TUI is on, not the one it was launched with. When
+identity the TUI is on, not the one it was launched with. Token files are written under a
+lock shared across processes (`kiro-auth-token*.json.lock`): a refresh or a profile discovery
+writes back only over the credentials it started from, so a login or a logout that lands
+meanwhile, from the proxy or from another `claude2kiro`, always wins. When
 every listed identity is exhausted or unusable the client gets a non-retryable error
 naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
 so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.

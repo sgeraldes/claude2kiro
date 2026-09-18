@@ -156,7 +156,7 @@ func TestRollbackReferenceIsStableUnderConcurrentSelections(t *testing.T) {
 // dropped instead of blocking their handler.
 func TestLoginFailerNeverBlocks(t *testing.T) {
 	errChan := make(chan error, 1)
-	fail := loginFailer(errChan)
+	fail := loginFailer(&loginOutcome{}, errChan)
 	done := make(chan struct{})
 	go func() {
 		fail(errors.New("first"))
