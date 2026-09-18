@@ -92,7 +92,7 @@ func GetClientRegistrationPath(clientIdHash string) string {
 func GetToken() (TokenData, error) {
 	tokenPath := GetTokenFilePath()
 
-	data, err := os.ReadFile(tokenPath)
+	data, err := tokenfile.ReadFile(tokenPath)
 	if err != nil {
 		return TokenData{}, fmt.Errorf("failed to read token file: %v", err)
 	}

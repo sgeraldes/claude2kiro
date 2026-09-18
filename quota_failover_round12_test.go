@@ -155,7 +155,7 @@ func TestAWaitingRenewedTokenIsUsedByTheNextRefreshAndDiscardedByALogin(t *testi
 	x := TokenData{AccessToken: "user-X", RefreshToken: "rx", AuthMethod: "Social", ProfileArn: "arn:primary", ExpiresAt: farFuture(), LoginID: "login-x"}
 	withIdentities(t, map[string]TokenData{"": x})
 	renewed := TokenData{AccessToken: "fresh-X", RefreshToken: "rotated-X", AuthMethod: "Social", ProfileArn: "arn:primary", ExpiresAt: farFuture(), LoginID: "login-x"}
-	if err := keepRenewed(identityFile(""), renewed); err != nil {
+	if err := keepRenewed(identityFile(""), x, renewed); err != nil {
 		t.Fatal(err)
 	}
 	var calls atomic.Int32
@@ -180,16 +180,21 @@ func TestAWaitingRenewedTokenIsUsedByTheNextRefreshAndDiscardedByALogin(t *testi
 		t.Fatalf("disk: %+v", disk)
 	}
 	// a 403 recovery with a waiting token adopts it the same way
-	if err := keepRenewed(identityFile(""), TokenData{AccessToken: "fresh-X2", RefreshToken: "rotated-X2", AuthMethod: "Social", ProfileArn: "arn:primary", ExpiresAt: farFuture(), LoginID: "login-x"}); err != nil {
+	fresh := readIdentityToken(t, "")
+	if err := keepRenewed(identityFile(""), fresh, TokenData{AccessToken: "fresh-X2", RefreshToken: "rotated-X2", AuthMethod: "Social", ProfileArn: "arn:primary", ExpiresAt: farFuture(), LoginID: "login-x"}); err != nil {
 		t.Fatal(err)
 	}
-	fresh := readIdentityToken(t, "")
-	got, _, moved, err := recoverFromInvalidBearer(currentIdentity(), fresh, map[string]bool{}, false)
+	budget := map[string]bool{}
+	got, _, moved, err := recoverFromInvalidBearer(currentIdentity(), fresh, budget, false)
 	if err != nil || moved || got.AccessToken != "fresh-X2" || calls.Load() != 0 {
 		t.Fatalf("recovery: %+v moved=%v err=%v calls=%d", got, moved, err, calls.Load())
 	}
-	// a renewed token of another login is stale: discarded, not moved in
-	if err := keepRenewed(identityFile(""), TokenData{AccessToken: "stale", RefreshToken: "stale", AuthMethod: "Social", LoginID: "login-old"}); err != nil {
+	if len(budget) != 0 {
+		t.Fatalf("a promoted token is adopted, not this request's refresh: %v", budget)
+	}
+	// a renewed token that replaces other credentials than the file's is
+	// stale: discarded, not moved in
+	if err := keepRenewed(identityFile(""), x, TokenData{AccessToken: "stale", RefreshToken: "stale", AuthMethod: "Social", LoginID: "login-x"}); err != nil {
 		t.Fatal(err)
 	}
 	if tok, err := getToken(); err != nil || tok.AccessToken != "fresh-X2" {
@@ -199,7 +204,7 @@ func TestAWaitingRenewedTokenIsUsedByTheNextRefreshAndDiscardedByALogin(t *testi
 		t.Fatal("a stale renewed token was left behind")
 	}
 	// a login discards a waiting renewed token
-	if err := keepRenewed(identityFile(""), TokenData{AccessToken: "fresh-X3", RefreshToken: "rotated-X3", AuthMethod: "Social", LoginID: "login-x"}); err != nil {
+	if err := keepRenewed(identityFile(""), readIdentityToken(t, ""), TokenData{AccessToken: "fresh-X3", RefreshToken: "rotated-X3", AuthMethod: "Social", LoginID: "login-x"}); err != nil {
 		t.Fatal(err)
 	}
 	y := TokenData{AccessToken: "user-Y", RefreshToken: "ry", AuthMethod: "Social", ExpiresAt: farFuture()}
@@ -213,7 +218,7 @@ func TestAWaitingRenewedTokenIsUsedByTheNextRefreshAndDiscardedByALogin(t *testi
 		t.Fatalf("%+v %v", tok, err)
 	}
 	// and so does a logout
-	if err := keepRenewed(identityFile(""), TokenData{AccessToken: "fresh-Y", RefreshToken: "ry2", AuthMethod: "Social", LoginID: readIdentityToken(t, "").LoginID}); err != nil {
+	if err := keepRenewed(identityFile(""), readIdentityToken(t, ""), TokenData{AccessToken: "fresh-Y", RefreshToken: "ry2", AuthMethod: "Social", LoginID: readIdentityToken(t, "").LoginID}); err != nil {
 		t.Fatal(err)
 	}
 	logout()

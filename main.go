@@ -4555,6 +4555,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	skipBackoff := false
 	refreshedFor := map[string]bool{} // the credentials a refresh of this request produced, by refresh token
 	var lastRecoverErr error
+	sent := 0 // requests this handler sent to the backend, switches and refreshes included
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || skipBackoff {
 			// Recreate request for retry (body was consumed)
@@ -4577,6 +4578,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			skipBackoff = false
 		}
 
+		sent++
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
 		if lastErr != nil {
 			lg.LogError(fmt.Sprintf("CodeWhisperer request error (attempt %d): %v", attempt+1, lastErr))
@@ -4697,10 +4699,13 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 && isInvalidBearerToken(body) {
-			if lastRecoverErr != nil {
+			switch {
+			case lastRecoverErr != nil && strings.Contains(lastRecoverErr.Error(), "every configured identity is unavailable"):
+				sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf("the backend rejected the bearer token and no identity is left: %v", lastRecoverErr))
+			case lastRecoverErr != nil:
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("the backend rejected the bearer token and its recovery failed: %v", lastRecoverErr))
-			} else {
-				sendErrorEvent(w, flusher, "error", fmt.Errorf("the backend rejected the bearer token after %d attempts (refreshes and identity switches included). Please re-login", attempt+1))
+			default:
+				sendErrorEvent(w, flusher, "error", fmt.Errorf("the backend rejected the bearer token after %d requests (refreshes and identity switches included). Please re-login", sent))
 			}
 		} else if contextTooLong {
 			// The request exceeded Kiro's input-size limit. Retrying can't help,
@@ -6370,8 +6375,10 @@ func refreshToken() {
 	}
 	newToken, err := readTokenFile(getTokenFilePath())
 	if err != nil {
-		fmt.Printf("Failed to read the refreshed token: %v\n", err)
-		os.Exit(1)
+		// the refresh went through; a login or a logout in another process
+		// has replaced or removed the file since
+		fmt.Printf("The token file was replaced or removed after the refresh: %v\n", err)
+		return
 	}
 	tokenPreview := newToken.AccessToken
 	if len(tokenPreview) > 20 {
@@ -6600,7 +6607,10 @@ func renewTokenLocked(tokenPath string, force bool, rejected *TokenData) (newTok
 	if side, promoted, perr := promoteRenewed(tokenPath, currentToken); perr != nil {
 		return TokenData{}, false, perr
 	} else if promoted {
-		return side, false, nil
+		// what another refresh already obtained: adopted, not this
+		// request's refresh
+		bumpTokenGen()
+		return side, true, nil
 	}
 	if rejected != nil && !sameCredentials(currentToken, *rejected) {
 		// The rejected bearer is already gone from the file: what is there
@@ -6634,7 +6644,7 @@ func renewTokenLocked(tokenPath string, force bool, rejected *TokenData) (newTok
 	if err := writeTokenLocked(tokenPath, &newToken); err != nil {
 		// the provider issued it and the old refresh token is spent: keep
 		// it next to the file for the next writer or reader
-		if kerr := keepRenewed(tokenPath, newToken); kerr != nil {
+		if kerr := keepRenewed(tokenPath, currentToken, newToken); kerr != nil {
 			return TokenData{}, false, fmt.Errorf("%v; the renewed token could not be kept either: %v", err, kerr)
 		}
 		return TokenData{}, false, fmt.Errorf("%w; the renewed token is kept in %s until the token file can be replaced", err, tokenfile.RenewedPath(tokenPath))
@@ -6797,7 +6807,9 @@ func getToken() (TokenData, error) {
 	// A renewed token waiting next to the file (a refresh whose write
 	// failed) goes in first; the cache is dropped by that write.
 	if _, err := os.Stat(tokenfile.RenewedPath(tokenPath)); err == nil {
-		promoteRenewedToken(tokenPath)
+		if err := promoteRenewedToken(tokenPath); err != nil {
+			return TokenData{}, err
+		}
 	}
 
 	tokenMutex.Lock()
@@ -6928,61 +6940,107 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return err
 }
 
-// keepRenewed writes a token the provider just issued next to the token
-// file it could not replace, so it is not lost: the refresh token it came
-// from is spent. readRenewed hands it back to the next writer or reader of
-// that file, which moves it into place; a login or a logout discards it.
-func keepRenewed(tokenPath string, token TokenData) error {
-	data, err := jsonStr.MarshalIndent(token, "", "  ")
+// renewedRecord is what a refresh keeps next to the token file when the
+// file could not be replaced: the token the provider issued, and the
+// credentials it replaces (the refresh token among them is spent). The
+// record is applied only over those credentials, once.
+type renewedRecord struct {
+	From  credentialPair `json:"from"`
+	Token TokenData      `json:"token"`
+}
+
+type credentialPair struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+}
+
+// keepRenewed writes the renewed record atomically, so a crash leaves either
+// a whole record or none. Caller holds the file lock.
+func keepRenewed(tokenPath string, from, token TokenData) error {
+	rec := renewedRecord{From: credentialPair{from.AccessToken, from.RefreshToken}, Token: token}
+	data, err := jsonStr.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(tokenfile.RenewedPath(tokenPath), data, 0600)
+	return writeFileAtomic(tokenfile.RenewedPath(tokenPath), data, 0600)
 }
 
-// readRenewed returns the renewed token waiting next to the token file, if
-// there is one and it belongs to the login the file holds. Caller holds the
-// file lock.
-func readRenewed(tokenPath string, current TokenData) (TokenData, bool) {
-	side, err := readTokenFile(tokenfile.RenewedPath(tokenPath))
-	if err != nil || side.AccessToken == "" {
-		return TokenData{}, false
+// errRenewedUnreadable is a renewed record that exists but cannot be read
+// right now (a program holds it): the file's spent refresh token must not
+// be sent to the provider while it is there.
+var errRenewedUnreadable = errors.New("a renewed token is waiting next to the token file and cannot be read right now")
+
+// readRenewed returns the renewed record waiting next to the token file.
+// present is false when there is none; a record that cannot be read is an
+// error; one that cannot be parsed is discarded (its content is gone).
+// Caller holds the file lock.
+func readRenewed(tokenPath string) (rec renewedRecord, present bool, err error) {
+	data, err := tokenfile.ReadFile(tokenfile.RenewedPath(tokenPath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return renewedRecord{}, false, nil
+		}
+		return renewedRecord{}, false, fmt.Errorf("%w: %v", errRenewedUnreadable, err)
 	}
-	if side.LoginID != current.LoginID {
-		_ = os.Remove(tokenfile.RenewedPath(tokenPath)) // another login took the file: stale
-		return TokenData{}, false
+	if err := jsonStr.Unmarshal(data, &rec); err != nil || rec.Token.AccessToken == "" || rec.From.AccessToken == "" {
+		_ = os.Remove(tokenfile.RenewedPath(tokenPath)) // damaged: nothing in it to apply
+		return renewedRecord{}, false, nil
 	}
-	return side, true
+	return rec, true, nil
 }
 
-// promoteRenewed moves a waiting renewed token into the token file. Caller
-// holds the file lock. It reports whether the file now holds it.
+// promoteRenewed applies a waiting renewed record to the token file when the
+// file still holds the credentials the record replaces, and reports whether
+// it did (the caller adopts the result without spending anything). A file
+// that already holds the record's token only needs the record removed; a
+// file with other credentials (a login, a later rotation) makes the record
+// stale, and it is removed too. Caller holds the file lock.
 func promoteRenewed(tokenPath string, current TokenData) (TokenData, bool, error) {
-	side, ok := readRenewed(tokenPath, current)
-	if !ok {
+	rec, present, err := readRenewed(tokenPath)
+	if err != nil {
+		return TokenData{}, false, err
+	}
+	if !present {
 		return TokenData{}, false, nil
 	}
-	if err := writeTokenLocked(tokenPath, &side); err != nil {
-		return TokenData{}, false, fmt.Errorf("a renewed token is waiting in %s and the token file still cannot be replaced: %w", tokenfile.RenewedPath(tokenPath), err)
+	side := tokenfile.RenewedPath(tokenPath)
+	switch {
+	case sameCredentials(current, rec.Token):
+		// already applied: only the record is left to remove
+		if err := os.Remove(side); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return TokenData{}, false, fmt.Errorf("the renewed token is in place but its record %s cannot be removed: %w", side, err)
+		}
+		return TokenData{}, false, nil
+	case current.AccessToken == rec.From.AccessToken && current.RefreshToken == rec.From.RefreshToken:
+		if err := writeTokenLocked(tokenPath, &rec.Token); err != nil {
+			return TokenData{}, false, fmt.Errorf("a renewed token is waiting in %s and the token file still cannot be replaced: %w", side, err)
+		}
+		if err := os.Remove(side); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return rec.Token, true, fmt.Errorf("the renewed token is in place but its record %s cannot be removed: %w", side, err)
+		}
+		return rec.Token, true, nil
+	default:
+		// the file moved on without it (another login, a later rotation)
+		_ = os.Remove(side)
+		return TokenData{}, false, nil
 	}
-	_ = os.Remove(tokenfile.RenewedPath(tokenPath))
-	return side, true, nil
 }
 
 // promoteRenewedToken is promoteRenewed for a reader that holds no lock.
-func promoteRenewedToken(tokenPath string) {
+func promoteRenewedToken(tokenPath string) error {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
 	unlock, err := tokenfile.Lock(tokenPath)
 	if err != nil {
-		return
+		return err
 	}
 	defer unlock()
 	current, err := readTokenFile(tokenPath)
 	if err != nil {
-		return
+		return err
 	}
-	_, _, _ = promoteRenewed(tokenPath, current)
+	_, _, err = promoteRenewed(tokenPath, current)
+	return err
 }
 
 // readTokenFile parses one identity's token file. The read shares delete
@@ -7094,6 +7152,7 @@ func adoptReplacedCredentials(rejected TokenData) (bool, error) {
 	if _, promoted, perr := promoteRenewed(tokenPath, current); perr != nil {
 		return false, perr
 	} else if promoted {
+		bumpTokenGen()
 		return true, nil
 	}
 	if sameCredentials(current, rejected) {
@@ -7188,7 +7247,8 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Send request. A 402 means this identity's monthly credit pool is gone:
 	// move to the next fallback identity and resend, once per identity, so the
 	// client never sees the 402 while a pool is left. A 403 for an expired
-	// bearer is refreshed once per identity, or replaced by the current
+	// bearer refreshes those credentials once (the budget follows the
+	// credentials, see recoverFromInvalidBearer), or takes the current
 	// identity's token when the proxy already moved on.
 	var resp *http.Response
 	var cwRespBody []byte
