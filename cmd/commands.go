@@ -350,20 +350,65 @@ func ExportEnvCmd() tea.Msg {
 	}
 }
 
-// LogoutCmd returns a function that logs out
+// LoginFiles returns the login config and token file paths of the active
+// identity, resolved together.
+func LoginFiles() (configPath, tokenPath string) {
+	tokenPath = GetTokenFilePath()
+	configPath = filepath.Join(filepath.Dir(tokenPath), profile.LoginConfigFileName())
+	return configPath, tokenPath
+}
+
+// LogoutCmd logs the active identity out.
 func LogoutCmd() tea.Msg {
-	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), profile.LoginConfigFileName())
-	tokenPath := GetTokenFilePath()
+	return LogoutAt(LoginFiles())
+}
 
-	unlock := tokenfile.Lock(tokenPath)
-	os.Remove(configPath)
-	os.Remove(tokenPath)
-	unlock()
-
+// LogoutAt removes the given login config and token files. The caller
+// resolves the paths, so a logout started on one identity ends on it.
+func LogoutAt(configPath, tokenPath string) tea.Msg {
+	configDeleted, tokenDeleted, err := RemoveLogin(configPath, tokenPath)
+	if err != nil {
+		return StatusMsg{Message: fmt.Sprintf("Logout failed: %v", err), IsError: true}
+	}
+	if !configDeleted && !tokenDeleted {
+		return StatusMsg{Message: "Already logged out (no saved credentials found)", IsError: false}
+	}
 	return StatusMsg{
 		Message: "Logged out successfully",
 		IsError: false,
 	}
+}
+
+// RemoveLogin deletes a login config and token file under the token file
+// lock, so a refresh or a discovery in flight in any process cannot write
+// them back. It reports which of the two existed and went, and the first
+// error other than a file already absent.
+func RemoveLogin(configPath, tokenPath string) (configDeleted, tokenDeleted bool, err error) {
+	unlock, err := tokenfile.Lock(tokenPath)
+	if err != nil {
+		return false, false, err
+	}
+	defer unlock()
+	configDeleted, err = removeIfPresent(configPath)
+	if err != nil {
+		return false, false, err
+	}
+	tokenDeleted, err = removeIfPresent(tokenPath)
+	if err != nil {
+		return configDeleted, false, err
+	}
+	return configDeleted, tokenDeleted, nil
+}
+
+func removeIfPresent(path string) (bool, error) {
+	err := os.Remove(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // addToWindowsPath adds a directory to the user PATH environment variable

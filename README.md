@@ -167,10 +167,18 @@ without a token). A token file with no access token is skipped the same way. A b
 backend rejects on a request is refreshed on the spot; if the provider rejects that refresh
 too, or the refreshed bearer is still rejected, that identity is retired and the next
 reserve serves the same request. A login started from the TUI after a failover logs in the
-identity the TUI is on, not the one it was launched with. Token files are written under a
-lock shared across processes (`kiro-auth-token*.json.lock`): a refresh or a profile discovery
-writes back only over the credentials it started from, so a login or a logout that lands
-meanwhile, from the proxy or from another `claude2kiro`, always wins. When
+identity the TUI is on, not the one it was launched with. Token files are written under an
+operating-system lock shared across processes (`kiro-auth-token*.json.lock`, an empty file
+that only ever carries the lock; it stays behind and is safe to leave there). A refresh
+holds it through its call to the provider, so two processes renewing the same file do it
+in turn and the second starts from what the first wrote; a login or a logout that arrives
+meanwhile, from the proxy, the TUI or a `claude2kiro login`/`logout`/`refresh` in another
+terminal, waits for that write and then wins: the refresh publishes only what the file
+still holds. A writer that cannot get the lock in 45 s writes nothing and says so. A bearer
+the backend rejects while another process has already replaced it on disk is not refreshed
+again and the identity is not retired: the file's credentials are adopted. The proxy
+notices a token file written by another process on the next request, not at the cache's
+one-minute expiry. When
 every listed identity is exhausted or unusable the client gets a non-retryable error
 naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
 so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.

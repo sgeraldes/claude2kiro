@@ -143,24 +143,30 @@ func retireIdentity(failed identityRef, reason string) (TokenData, identityRef, 
 }
 
 // recoverFromInvalidBearer is what a handler does with a 403 "invalid bearer"
-// from identity ident. If the proxy already moved on, the current identity's
-// pair is adopted. Otherwise the bearer is refreshed once, past the freshness
+// for the bearer rejected of identity ident. If the proxy already moved on,
+// the current identity's pair is adopted. If the identity's file no longer
+// holds the rejected bearer (a login or a refresh in another process replaced
+// it while the request was out), the file's credentials are adopted without
+// a refresh. Otherwise the bearer is refreshed once, past the freshness
 // shortcut (the backend just said it is no good): a refresh the provider
 // rejects for good, or a bearer still rejected after a refresh, retires the
 // identity and moves to the next reserve when canSwitch allows. moved tells
 // the caller the pair belongs to another identity.
-func recoverFromInvalidBearer(ident identityRef, refreshedFor map[string]bool, canSwitch bool) (TokenData, identityRef, bool, error) {
+func recoverFromInvalidBearer(ident identityRef, rejected TokenData, refreshedFor map[string]bool, canSwitch bool) (TokenData, identityRef, bool, error) {
 	if currentIdentity() != ident {
 		tok, id, err := tokenForRequest()
 		return tok, id, true, err
 	}
 	if !refreshedFor[ident.Name] {
-		refreshedFor[ident.Name] = true
-		err := renewToken(true)
+		adopted, err := renewTokenPast(true, &rejected)
 		if err == nil {
+			// Credentials that were never refreshed here may still be
+			// refreshed once if the backend rejects them too.
+			refreshedFor[ident.Name] = !adopted
 			tok, id, terr := tokenForRequest()
 			return tok, id, false, terr
 		}
+		refreshedFor[ident.Name] = true
 		if !isPermanentRefreshError(err) || !canSwitch {
 			return TokenData{}, identityRef{}, false, err
 		}

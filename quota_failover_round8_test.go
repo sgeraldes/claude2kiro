@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,17 +15,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 )
 
 // Seventh verification pass of the quota failover: every writer of a token
-// file re-reads it under a lock shared across processes and writes only
-// over the credentials it started from. A login that lands during a refresh
-// or a discovery, in this process or another, wins; a logout is final.
+// file takes a lock shared across processes, and a refresh holds it through
+// its HTTP call. A login or a logout that arrives during a refresh, in this
+// process or another, waits for the refresh's write and then wins: the
+// refresh publishes nothing over it.
 
-// N23: a refresh started from X does not write over a login Y that landed
-// while the provider was answering, from this process or from a child.
+// N23: a login Y that arrives while a refresh of X waits for the provider
+// ends on disk and in the cache, from this process or from a child.
 func TestRefreshDoesNotOverwriteALoginThatLandedMeanwhile(t *testing.T) {
 	for _, method := range []string{"IdC", "Social"} {
 		for _, child := range []bool{false, true} {
@@ -53,14 +56,25 @@ func TestRefreshDoesNotOverwriteALoginThatLandedMeanwhile(t *testing.T) {
 				go func() { done <- renewToken(true) }()
 				<-entered
 				y := TokenData{AccessToken: "user-Y", RefreshToken: "ry", AuthMethod: method, ProfileArn: "arn:Y", ExpiresAt: farFuture()}
+				var loginDone func() error
 				if child {
-					loginFromChildProcess(t, y)
-				} else if err := saveToken(&y); err != nil {
-					t.Fatal(err)
+					loginDone = startChildLogin(t, y)
+				} else {
+					ch := make(chan error, 1)
+					go func() { ch <- saveToken(&y) }()
+					loginDone = func() error { return <-ch }
+				}
+				// the login waits for the refresh's lock: X is still there
+				time.Sleep(300 * time.Millisecond)
+				if disk := readIdentityToken(t, ""); disk.AccessToken != "user-X" {
+					t.Fatalf("the login did not wait for the refresh in flight: %+v", disk)
 				}
 				close(release)
-				if err := <-done; err == nil {
-					t.Fatal("the refresh must report that the file changed hands")
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				if err := loginDone(); err != nil {
+					t.Fatal(err)
 				}
 				if disk := readIdentityToken(t, ""); disk.AccessToken != "user-Y" || disk.RefreshToken != "ry" {
 					t.Fatalf("login Y was overwritten by the refresh of X: %+v", disk)
@@ -111,8 +125,9 @@ func TestDiscoveryDoesNotAttachItsArnToAChildProcessLogin(t *testing.T) {
 	}
 }
 
-// N20: a logout that lands while a refresh waits for the provider is final:
-// the refresh writes nothing and nothing is served afterwards.
+// N20: a logout that arrives while a refresh waits for the provider is
+// final: it waits for the refresh's write, removes the file, and nothing is
+// published or served afterwards. From this process and from a child.
 func TestRefreshDoesNotUndoALogout(t *testing.T) {
 	for _, method := range []string{"IdC", "Social"} {
 		for _, child := range []bool{false, true} {
@@ -140,24 +155,26 @@ func TestRefreshDoesNotUndoALogout(t *testing.T) {
 				done := make(chan error, 1)
 				go func() { done <- renewToken(true) }()
 				<-entered
+				var logoutDone func() error
 				if child {
-					// a `claude2kiro logout` in another process: the file goes while
-					// the provider is still answering
-					if err := os.Remove(identityFile("")); err != nil {
-						t.Fatal(err)
-					}
-					close(release)
-					if err := <-done; err == nil {
-						t.Fatal("the refresh must report that the file is gone")
-					}
+					// a `claude2kiro logout` in another process
+					logoutDone = startChildLogout(t)
 				} else {
-					logoutDone := make(chan struct{})
-					go func() { logoutCmd(); close(logoutDone) }()
-					// the logout waits for the refresh's mutex: release the provider
-					// so the refresh finishes, then the logout runs
-					close(release)
-					<-done
-					<-logoutDone
+					ch := make(chan error, 1)
+					go func() { logoutCmd(); ch <- nil }()
+					logoutDone = func() error { return <-ch }
+				}
+				// the logout waits for the refresh's lock: X is still there
+				time.Sleep(300 * time.Millisecond)
+				if disk := readIdentityToken(t, ""); disk.AccessToken != "user-X" {
+					t.Fatalf("the logout did not wait for the refresh in flight: %+v", disk)
+				}
+				close(release)
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				if err := logoutDone(); err != nil {
+					t.Fatal(err)
 				}
 				if _, err := os.Stat(identityFile("")); err == nil {
 					t.Fatal("the token file exists after the logout")
@@ -180,7 +197,7 @@ func TestMergeDoesNotRecreateAFileAnotherProcessRemoved(t *testing.T) {
 	if err := os.Remove(identityFile("")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := mergeProfileArn(identityFile(""), x, "arn:X"); ok {
+	if _, ok := mergeProfileArn("", identityFile(""), x, "arn:X"); ok {
 		t.Fatal("the merge wrote over a removed file")
 	}
 	if _, err := os.Stat(identityFile("")); err == nil {
@@ -188,39 +205,48 @@ func TestMergeDoesNotRecreateAFileAnotherProcessRemoved(t *testing.T) {
 	}
 }
 
-// The file lock is taken and released, waits for another holder, and
-// expires when a holder died with it.
+// The file lock is taken and released, a second holder waits for the
+// first, and one that waits past its deadline gets an error, never the lock.
 func TestTokenFileLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kiro-auth-token.json")
-	unlock := tokenfile.Lock(path)
+	unlock, err := tokenfile.Lock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(path + ".lock"); err != nil {
 		t.Fatal("lock file not created")
 	}
+	// a contender that gives up before the holder is done
+	if _, err := tokenfile.LockFor(path, 100*time.Millisecond); !errors.Is(err, tokenfile.ErrBusy) {
+		t.Fatalf("a second holder got the lock, or another error: %v", err)
+	}
 	started := time.Now()
-	second := make(chan struct{})
-	go func() { u := tokenfile.Lock(path); u(); close(second) }()
+	second := make(chan error, 1)
+	go func() {
+		u, err := tokenfile.Lock(path)
+		if err == nil {
+			u()
+		}
+		second <- err
+	}()
 	time.Sleep(200 * time.Millisecond)
 	unlock()
-	<-second
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
 	if time.Since(started) < 150*time.Millisecond {
 		t.Fatal("the second holder did not wait for the first")
 	}
-	if _, err := os.Stat(path + ".lock"); err == nil {
-		t.Fatal("lock file left behind")
-	}
-	// a stale lock from a dead process
-	if err := os.WriteFile(path+".lock", nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-time.Minute)
+	// the lock file is only ever a lock: an old one is not an obstacle
+	old := time.Now().Add(-time.Hour)
 	if err := os.Chtimes(path+".lock", old, old); err != nil {
 		t.Fatal(err)
 	}
-	u := tokenfile.Lock(path)
-	u()
-	if _, err := os.Stat(path + ".lock"); err == nil {
-		t.Fatal("a stale lock was not taken over and released")
+	u, err := tokenfile.Lock(path)
+	if err != nil {
+		t.Fatal(err)
 	}
+	u()
 }
 
 // Observation of the sixth pass: success and failure no longer compete; the
@@ -263,22 +289,87 @@ func TestLoginOutcomeIsSettledOnce(t *testing.T) {
 // in a child of the test binary.
 func loginFromChildProcess(t *testing.T, tok TokenData) {
 	t.Helper()
-	if os.Getenv("CLAUDE2KIRO_TEST_CHILD_LOGIN") != "" {
-		t.Skip("child")
+	if err := startChildLogin(t, tok)(); err != nil {
+		t.Fatal(err)
 	}
+}
+
+// startChildLogin starts the child login and returns the function that
+// waits for it.
+func startChildLogin(t *testing.T, tok TokenData) func() error {
+	t.Helper()
 	data, err := json.Marshal(tok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run", "^TestChildLoginHelper$")
-	cmd.Env = append(os.Environ(), "CLAUDE2KIRO_TEST_CHILD_LOGIN="+string(data), "HOME="+os.Getenv("HOME"), "USERPROFILE="+os.Getenv("USERPROFILE"))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("child login: %v\n%s", err, out)
+	return startChildHelper(t, "^TestChildLoginHelper$", "CLAUDE2KIRO_TEST_CHILD_LOGIN="+string(data), "child-login-done")
+}
+
+// startChildLogout runs `logout` in a child process and returns the
+// function that waits for it.
+func startChildLogout(t *testing.T) func() error {
+	t.Helper()
+	return startChildHelper(t, "^TestChildLogoutHelper$", "CLAUDE2KIRO_TEST_CHILD_LOGOUT=1", "child-logout-done")
+}
+
+// startChildRefresh runs a forced refresh in a child process and returns
+// the function that waits for it.
+func startChildRefresh(t *testing.T) func() error {
+	t.Helper()
+	return startChildHelper(t, "^TestChildRefreshHelper$", "CLAUDE2KIRO_TEST_CHILD_REFRESH="+config.Get().Advanced.KiroRefreshEndpoint, "child-refresh-done")
+}
+
+func startChildHelper(t *testing.T, run, env, marker string) func() error {
+	t.Helper()
+	if os.Getenv("CLAUDE2KIRO_TEST_CHILD_LOGIN") != "" || os.Getenv("CLAUDE2KIRO_TEST_CHILD_LOGOUT") != "" || os.Getenv("CLAUDE2KIRO_TEST_CHILD_REFRESH") != "" {
+		t.Skip("child")
 	}
-	if !strings.Contains(string(out), "child-login-done") {
-		t.Fatalf("child login did not run:\n%s", out)
+	cmd := exec.Command(os.Args[0], "-test.run", run)
+	cmd.Env = append(os.Environ(), env, "HOME="+os.Getenv("HOME"), "USERPROFILE="+os.Getenv("USERPROFILE"))
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
+	return func() error {
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("child %s: %v\n%s", marker, err, out.String())
+		}
+		if !strings.Contains(out.String(), marker) {
+			return fmt.Errorf("child %s did not run:\n%s", marker, out.String())
+		}
+		return nil
+	}
+}
+
+// TestChildLogoutHelper is the body of the child logout above: the `logout`
+// command's operation.
+func TestChildLogoutHelper(t *testing.T) {
+	if os.Getenv("CLAUDE2KIRO_TEST_CHILD_LOGOUT") == "" {
+		t.Skip("not a child")
+	}
+	if _, _, err := cmd.RemoveLogin(cmd.LoginFiles()); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("child-logout-done")
+}
+
+// TestChildRefreshHelper is the body of the child refresh above: the
+// `refresh` command's operation against the parent's fake provider.
+func TestChildRefreshHelper(t *testing.T) {
+	endpoint := os.Getenv("CLAUDE2KIRO_TEST_CHILD_REFRESH")
+	if endpoint == "" {
+		t.Skip("not a child")
+	}
+	cfg := *config.Get()
+	cfg.Advanced.SSOOIDCTokenEndpoint = endpoint
+	cfg.Advanced.KiroRefreshEndpoint = endpoint
+	withConfig(t, &cfg)
+	if err := renewToken(true); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("child-refresh-done")
 }
 
 // TestChildLoginHelper is the body of the child process above.

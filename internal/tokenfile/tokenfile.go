@@ -2,48 +2,74 @@
 //
 // The proxy refreshes a token while a `claude2kiro login` or `logout` in
 // another process may replace or remove the same file. Memory counters cannot
-// see that, so every writer takes a lock file next to the token (created
-// exclusively, removed when done) and re-reads the file under it before
-// deciding what to write. A lock left behind by a crashed process expires.
+// see that, so every writer takes the lock of the token file and re-reads the
+// file under it before deciding what to write.
+//
+// The lock is the operating system's (flock on Unix, LockFileEx on Windows)
+// on a file next to the token, <token>.lock. The kernel drops it when the
+// holder exits, however it exits, so there is no stale lock to expire, no
+// owner to lose and nothing to delete: the .lock file stays, empty, and only
+// ever holds a lock. Two handles in one process contend like two processes
+// do, so a path must never take the lock it already holds.
 package tokenfile
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
 const (
-	lockSuffix   = ".lock"
-	lockWait     = 3 * time.Second
-	lockStale    = 15 * time.Second
+	lockSuffix = ".lock"
+	// DefaultWait is how long a writer waits for a holder in another
+	// process. A refresh holds the lock through its HTTP call, bounded by the
+	// proxy's HTTP timeout (30 s by default), so the wait exceeds that.
+	DefaultWait  = 45 * time.Second
 	lockInterval = 20 * time.Millisecond
 )
 
+// ErrBusy is returned when another holder kept the lock for the whole wait.
+var ErrBusy = errors.New("the token file is locked by another claude2kiro process")
+
 // Lock takes the lock of the token file at path and returns the function
-// that releases it. It waits a few seconds for a holder in another process;
-// after that it proceeds anyway, so a lost lock never blocks a login.
-func Lock(path string) func() {
+// that releases it. It waits DefaultWait for a holder in another process and
+// returns an error after that: a caller that does not hold the lock writes
+// nothing.
+func Lock(path string) (func(), error) {
+	return LockFor(path, DefaultWait)
+}
+
+// LockFor is Lock with an explicit wait.
+func LockFor(path string, wait time.Duration) (func(), error) {
 	if path == "" {
-		return func() {}
+		return func() {}, nil
 	}
 	lock := path + lockSuffix
-	deadline := time.Now().Add(lockWait)
+	if err := os.MkdirAll(filepath.Dir(lock), 0o700); err != nil {
+		return nil, fmt.Errorf("token lock: %w", err)
+	}
+	f, err := os.OpenFile(lock, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("token lock: %w", err)
+	}
+	deadline := time.Now().Add(wait)
 	for {
-		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		err := tryLock(f)
 		if err == nil {
+			return func() {
+				_ = unlock(f)
+				_ = f.Close()
+			}, nil
+		}
+		if !isBusy(err) {
 			_ = f.Close()
-			return func() { _ = os.Remove(lock) }
+			return nil, fmt.Errorf("token lock %s: %w", lock, err)
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return func() {}
-		}
-		if info, serr := os.Stat(lock); serr == nil && time.Since(info.ModTime()) > lockStale {
-			_ = os.Remove(lock) // a process that died with the lock
-			continue
-		}
-		if time.Now().After(deadline) {
-			return func() {}
+		if !time.Now().Before(deadline) {
+			_ = f.Close()
+			return nil, fmt.Errorf("%w (%s, waited %s)", ErrBusy, lock, wait)
 		}
 		time.Sleep(lockInterval)
 	}
