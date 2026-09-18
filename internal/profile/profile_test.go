@@ -112,3 +112,114 @@ func TestNameFromEnvIsValidated(t *testing.T) {
 		t.Fatalf("env name: %q %v", n, err)
 	}
 }
+
+// Identity switching: when the launched profile's credit pool is exhausted the
+// proxy moves its token, login config and credit history to a fallback
+// identity, while the port marker and config stay with the launched profile so
+// `run` still attaches to the right proxy.
+
+func TestSwitchToMovesOnlyTheIdentityFiles(t *testing.T) {
+	withName(t, "", func() {
+		t.Cleanup(ResetIdentity)
+		if err := SwitchTo("kiro2"); err != nil {
+			t.Fatal(err)
+		}
+		if got := TokenFileName(); got != "kiro-auth-token.kiro2.json" {
+			t.Fatalf("token: %q", got)
+		}
+		if got := LoginConfigFileName(); got != "claude2kiro-login-config.kiro2.json" {
+			t.Fatalf("login config: %q", got)
+		}
+		if got := CreditHistoryFileName(); got != "credit-history.kiro2.jsonl" {
+			t.Fatalf("credit history: %q", got)
+		}
+		if got := ProxyPortFileName(); got != "proxy.port" {
+			t.Fatalf("port marker must follow the launched profile: %q", got)
+		}
+		home := t.TempDir()
+		if got := ConfigSavePath(home); got != filepath.Join(home, ".claude2kiro", "config.yaml") {
+			t.Fatalf("config must follow the launched profile: %q", got)
+		}
+		if got := Label(); got != "default" {
+			t.Fatalf("label must stay the launched profile: %q", got)
+		}
+		if got := Active(); got != "kiro2" {
+			t.Fatalf("active: %q", got)
+		}
+		if got := ActiveLabel(); got != "kiro2" {
+			t.Fatalf("active label: %q", got)
+		}
+	})
+}
+
+func TestSwitchToTheLaunchedProfileIsANoOp(t *testing.T) {
+	withName(t, "agentes", func() {
+		t.Cleanup(ResetIdentity)
+		if err := SwitchTo("agentes"); err != nil {
+			t.Fatal(err)
+		}
+		if got := TokenFileName(); got != "kiro-auth-token.agentes.json" {
+			t.Fatalf("token: %q", got)
+		}
+		if got := ActiveLabel(); got != "agentes" {
+			t.Fatalf("active label: %q", got)
+		}
+	})
+}
+
+func TestSwitchToDefaultFromNamedProfile(t *testing.T) {
+	withName(t, "agentes", func() {
+		t.Cleanup(ResetIdentity)
+		if err := SwitchTo(""); err != nil {
+			t.Fatal(err)
+		}
+		if got := TokenFileName(); got != "kiro-auth-token.json" {
+			t.Fatalf("token: %q", got)
+		}
+		if got := ActiveLabel(); got != DefaultLabel {
+			t.Fatalf("active label: %q", got)
+		}
+		if got := ProxyPortFileName(); got != "proxy.agentes.port" {
+			t.Fatalf("port marker: %q", got)
+		}
+	})
+}
+
+func TestSwitchToRejectsInvalidNamesAndKeepsTheCurrentIdentity(t *testing.T) {
+	withName(t, "", func() {
+		t.Cleanup(ResetIdentity)
+		if err := SwitchTo("kiro2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := SwitchTo("../other"); err == nil {
+			t.Fatal("expected an error")
+		}
+		if got := Active(); got != "kiro2" {
+			t.Fatalf("active after rejected switch: %q", got)
+		}
+	})
+}
+
+func TestResetIdentityReturnsToTheLaunchedProfile(t *testing.T) {
+	withName(t, "", func() {
+		if err := SwitchTo("kiro2"); err != nil {
+			t.Fatal(err)
+		}
+		ResetIdentity()
+		if got := Active(); got != "" {
+			t.Fatalf("active: %q", got)
+		}
+		if got := TokenFileName(); got != "kiro-auth-token.json" {
+			t.Fatalf("token: %q", got)
+		}
+	})
+}
+
+func TestTokenFileNameFor(t *testing.T) {
+	if got := TokenFileNameFor(""); got != "kiro-auth-token.json" {
+		t.Fatalf("default: %q", got)
+	}
+	if got := TokenFileNameFor("kiro2"); got != "kiro-auth-token.kiro2.json" {
+		t.Fatalf("named: %q", got)
+	}
+}

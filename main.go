@@ -2196,6 +2196,11 @@ func main() {
 	case "login":
 		var config *LoginConfig
 
+		// --no-browser prints the sign-in URL instead of opening the default
+		// browser: needed to log a second identity in from a private window
+		// while the default browser is signed in as the first one.
+		os.Args = extractNoBrowserFlag(os.Args)
+
 		// If no method specified, show interactive menu or use saved config
 		if len(os.Args) == 2 {
 			savedConfig, err := readLoginConfig()
@@ -2360,19 +2365,21 @@ func main() {
 			openCreditsDashboard()
 			return
 		}
+		// `credits --all` prints every identity the proxy can fall back to
+		// (the launched profile plus auth.fallback_profiles), so the reserve
+		// is visible before the primary pool runs dry.
+		if len(os.Args) > 2 && (os.Args[2] == "--all" || os.Args[2] == "-a") {
+			if !printAllIdentitiesCredits() {
+				os.Exit(1)
+			}
+			return
+		}
 		info := cmd.GetCreditsInfo()
 		if info.Error != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", info.Error)
 			os.Exit(1)
 		}
-		pct := 0.0
-		if info.CreditsLimit > 0 {
-			pct = info.CreditsUsed / info.CreditsLimit * 100
-		}
-		fmt.Printf("Plan:      %s\n", info.SubscriptionName)
-		fmt.Printf("Used:      %.1f / %.0f (%.0f%%)\n", info.CreditsUsed, info.CreditsLimit, pct)
-		fmt.Printf("Remaining: %.1f\n", info.CreditsRemaining)
-		fmt.Printf("Resets in: %d days\n", info.DaysUntilReset)
+		printCreditsInfo(info)
 	case "desktop":
 		launchDesktop()
 	case "help", "--help", "-h":
@@ -3142,6 +3149,11 @@ func detectLiveProxy() (string, bool) {
 // profileHeader carries the profile a proxy serves in its /health answer.
 const profileHeader = "X-Claude2Kiro-Profile"
 
+// identityHeader carries the identity whose credits a proxy is spending right
+// now: the launched profile until a quota failover moved it (see
+// identity_failover.go). Informational; attach decisions use profileHeader.
+const identityHeader = "X-Claude2Kiro-Identity"
+
 // proxyServesThisProfile decides whether a /health answer with the given
 // profile header belongs to the active profile.
 func proxyServesThisProfile(header string) bool {
@@ -3572,6 +3584,7 @@ func printUsage() {
 	fmt.Println("      builderid                       - Login with AWS Builder ID")
 	fmt.Println("      idc [start-url] [region]        - Login with Enterprise Identity Center")
 	fmt.Println("    Tip: Just run 'claude2kiro login' for interactive selection")
+	fmt.Println("    --no-browser                    - Print the sign-in URL instead of opening the default browser")
 	fmt.Println("")
 	fmt.Println("  claude2kiro read           - Read and display token")
 	fmt.Println("  claude2kiro refresh        - Refresh the access token")
@@ -3585,7 +3598,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro test [msg] [model]  - Send test request to Kiro backend (debug tool)")
 	fmt.Println("  claude2kiro claude              - Configure Claude Code settings (global)")
 	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
-	fmt.Println("  claude2kiro credits [--web]     - Show Kiro credit usage (--web opens live dashboard)")
+	fmt.Println("  claude2kiro credits [--web|--all] - Show Kiro credit usage (--web opens live dashboard, --all every identity)")
 	fmt.Println("  claude2kiro models              - List models available via Kiro (live)")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
@@ -4174,6 +4187,7 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 	// profile never attaches to it through a stale port marker.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(profileHeader, profile.Label())
+		w.Header().Set(identityHeader, profile.ActiveLabel())
 		w.WriteHeader(http.StatusOK)
 		io.Copy(w, strings.NewReader("OK"))
 	})
@@ -4505,6 +4519,28 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// without this the proxy fails instantly and Claude Code re-sends the
 		// whole ~240k-token request, adding load and desynchronizing into waves.
 		overloaded := isTransientOverload(resp.StatusCode, body)
+
+		// The identity's monthly credit pool is gone (402). Move to the next
+		// configured fallback identity and resend with its bearer and
+		// profileArn; the client never sees the 402. With nothing left to
+		// switch to, the error is terminal: no retry can succeed this month.
+		if isMonthlyQuotaExceeded(resp.StatusCode, body) && attempt < maxAttempts-1 {
+			reason := quotaReason(body)
+			fallback, ferr := switchToFallbackIdentity()
+			if ferr != nil {
+				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel(), reason, ferr))
+				sendNonRetryableErrorEvent(w, flusher, quotaExhaustedMessage(reason, ferr))
+				return ""
+			}
+			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+			token = fallback
+			cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, fallback).ProfileArn
+			if cwReqBody, err = jsonStr.Marshal(cwReq); err != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", err)
+				return ""
+			}
+			continue
+		}
 
 		// Transparent recovery from an expired/invalid bearer token: the token
 		// lapsed mid-session (common on long runs). Refresh once and retry with
@@ -5093,8 +5129,28 @@ func generateState() (string, error) {
 	return fmt.Sprintf("%x", stateBytes), nil
 }
 
+// noBrowser is set by `login --no-browser`: openBrowser then only prints the URL.
+var noBrowser bool
+
+// extractNoBrowserFlag removes --no-browser from args and records it.
+func extractNoBrowserFlag(args []string) []string {
+	kept := args[:0:0]
+	for _, a := range args {
+		if a == "--no-browser" {
+			noBrowser = true
+			continue
+		}
+		kept = append(kept, a)
+	}
+	return kept
+}
+
 // openBrowser opens the specified URL in the default browser
 func openBrowser(url string) error {
+	if noBrowser {
+		fmt.Printf("Open this URL in the browser signed in as the identity you want:\n%s\n", url)
+		return nil
+	}
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
@@ -5125,6 +5181,66 @@ func proxyReachable(baseURL string) bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// printCreditsInfo prints one identity's credit snapshot.
+func printCreditsInfo(info cmd.CreditsInfo) {
+	pct := 0.0
+	if info.CreditsLimit > 0 {
+		pct = info.CreditsUsed / info.CreditsLimit * 100
+	}
+	fmt.Printf("Plan:      %s\n", info.SubscriptionName)
+	fmt.Printf("Used:      %.1f / %.0f (%.0f%%)\n", info.CreditsUsed, info.CreditsLimit, pct)
+	fmt.Printf("Remaining: %.1f\n", info.CreditsRemaining)
+	fmt.Printf("Resets in: %d days\n", info.DaysUntilReset)
+}
+
+// printAllIdentitiesCredits prints the credit snapshot of the launched profile
+// and of every configured fallback, in failover order. Identities that were
+// never logged in are listed as such. Returns false when any lookup failed.
+func printAllIdentitiesCredits() bool {
+	defer profile.ResetIdentity()
+	ok := true
+	names := append([]string{profile.Name()}, config.Get().Auth.FallbackProfiles...)
+	for i, raw := range names {
+		name, err := profile.Validate(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			ok = false
+			continue
+		}
+		label := name
+		if label == "" {
+			label = profile.DefaultLabel
+		}
+		role := "primary"
+		if i > 0 {
+			role = fmt.Sprintf("fallback %d", i)
+		}
+		fmt.Printf("== %s (%s)\n", label, role)
+		if !identityHasToken(name) {
+			hint := "claude2kiro login"
+			if name != "" {
+				hint = "CLAUDE2KIRO_PROFILE=" + name + " " + hint
+			}
+			fmt.Printf("not logged in: %s\n\n", hint)
+			continue
+		}
+		if err := profile.SwitchTo(name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			ok = false
+			continue
+		}
+		info := cmd.GetCreditsInfo()
+		if info.Error != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", info.Error)
+			ok = false
+		} else {
+			printCreditsInfo(info)
+		}
+		fmt.Println()
+	}
+	return ok
 }
 
 // openCreditsDashboard opens the live web dashboard, telling the user to start
@@ -6445,24 +6561,66 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	}
 
 	// Set request headers (same as streaming - Kiro always returns binary event stream)
-	proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("Accept", "text/event-stream")
-	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
-
-	// Send request
-	resp, err := proxyHttpClient.Do(proxyReq)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
-		return http.StatusInternalServerError
+	setKiroHeaders := func(req *http.Request, tok TokenData) {
+		req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 	}
-	defer resp.Body.Close()
+	setKiroHeaders(proxyReq, token)
 
-	// Read response
-	cwRespBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-		return http.StatusInternalServerError
+	// Send request. A 402 means this identity's monthly credit pool is gone:
+	// move to the next fallback identity (see identity_failover.go) and resend
+	// once per identity, so the client never sees the 402 while a pool is left.
+	var resp *http.Response
+	var cwRespBody []byte
+	for {
+		resp, err = proxyHttpClient.Do(proxyReq)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
+			return http.StatusInternalServerError
+		}
+
+		// Read response
+		cwRespBody, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
+			return http.StatusInternalServerError
+		}
+
+		if !isMonthlyQuotaExceeded(resp.StatusCode, cwRespBody) {
+			break
+		}
+		reason := quotaReason(cwRespBody)
+		fallback, ferr := switchToFallbackIdentity()
+		if ferr != nil {
+			if lg != nil {
+				lg.LogError(fmt.Sprintf("Credits exhausted (non-stream) identity=%s reason=%s: %v", profile.ActiveLabel(), reason, ferr))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":  "error",
+				"error": map[string]any{"type": "invalid_request_error", "message": quotaExhaustedMessage(reason, ferr)},
+			})
+			return resp.StatusCode
+		}
+		if lg != nil {
+			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s, non-stream) — switched to identity %s, retrying transparently", reason, profile.ActiveLabel()))
+		}
+		token = fallback
+		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, fallback).ProfileArn
+		if cwReqBody, err = jsonStr.Marshal(cwReq); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to serialize request: %v", err), http.StatusInternalServerError)
+			return http.StatusInternalServerError
+		}
+		proxyReq, err = http.NewRequest(http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to create retry request: %v", err), http.StatusInternalServerError)
+			return http.StatusInternalServerError
+		}
+		setKiroHeaders(proxyReq, fallback)
 	}
 
 	// Surface backend errors as real Anthropic error envelopes. An error JSON

@@ -132,6 +132,38 @@ is used when it exists (give the second identity its own `server.port` there), o
 the shared `config.yaml`. With the variable unset nothing changes: the historical file
 names stay in place.
 
+The default browser is usually already signed in as the first identity, and Identity
+Center would then bind the new token to that user. Sign the second one in from a private
+window: `--no-browser` prints the URL instead of opening anything.
+
+```bash
+CLAUDE2KIRO_PROFILE=agentes claude2kiro login --no-browser idc https://d5.awsapps.com/start us-east-1
+```
+
+#### Failover when a pool runs out
+
+Once both identities are logged in, list the spare ones in `~/.claude2kiro/config.yaml`
+and the proxy switches on its own when the active pool answers `402 MONTHLY_REQUEST_COUNT`:
+
+```yaml
+auth:
+  fallback_profiles: [agentes]
+```
+
+The request that hit the 402 is resent with the fallback identity's token and
+`profileArn`; the client never sees the error. The switch is sticky for the life of the
+proxy (an empty pool stays empty until its monthly reset), and only the token, login
+config and credit history move: the port marker and the config stay with the profile the
+proxy was started as, so `run` keeps attaching to the right proxy. `/health` reports the
+identity in use in `X-Claude2Kiro-Identity`. When every listed identity is exhausted the
+client gets a non-retryable error naming them all. Failover is deliberately not load
+balancing: spreading requests over two monthly pools empties both on the same day, while
+a spare pool that only starts when the first one is gone is a real reserve.
+
+```bash
+claude2kiro credits --all   # every identity, in failover order, with its remaining pool
+```
+
 ### `claude2kiro run`
 
 ```bash

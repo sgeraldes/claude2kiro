@@ -19,7 +19,16 @@ type Config struct {
 	Display  DisplayConfig  `yaml:"display"`
 	Network  NetworkConfig  `yaml:"network"`
 	Advanced AdvancedConfig `yaml:"advanced"`
+	Auth     AuthConfig     `yaml:"auth,omitempty"`
 	Filter   FilterConfig   `yaml:"filter,omitempty"`
+}
+
+// AuthConfig holds identity settings. One Kiro subscription is one Identity
+// Center user and one monthly credit pool; FallbackProfiles lists the profiles
+// (see internal/profile, logged in with CLAUDE2KIRO_PROFILE=<name>) the proxy
+// switches to, in order, when the active pool answers 402 MONTHLY_REQUEST_COUNT.
+type AuthConfig struct {
+	FallbackProfiles []string `yaml:"fallback_profiles,omitempty"`
 }
 
 // ServerConfig holds server-related settings

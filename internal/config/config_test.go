@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
 
 func TestDefaultEnablesStableConversationID(t *testing.T) {
 	if !Default().Advanced.StableConversationID {
@@ -24,5 +29,28 @@ func TestDefaultRequestDietSettingsAreConservative(t *testing.T) {
 	}
 	if cfg.Advanced.AggressiveCachePoints {
 		t.Fatal("aggressive_cache_points should default to false")
+	}
+}
+
+func TestAuthFallbackProfilesParseAndDefaultEmpty(t *testing.T) {
+	if got := Default().Auth.FallbackProfiles; len(got) != 0 {
+		t.Fatalf("default fallback profiles must be empty, got %v", got)
+	}
+	cfg := Default()
+	if err := yaml.Unmarshal([]byte("auth:\n  fallback_profiles: [kiro2, ops]\n"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Auth.FallbackProfiles; len(got) != 2 || got[0] != "kiro2" || got[1] != "ops" {
+		t.Fatalf("parsed: %v", got)
+	}
+}
+
+func TestAuthBlockIsOmittedWhenEmpty(t *testing.T) {
+	data, err := yaml.Marshal(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "auth:") {
+		t.Fatalf("an empty auth block must not be written:\n%s", data)
 	}
 }
