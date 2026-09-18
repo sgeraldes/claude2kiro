@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -1951,14 +1952,13 @@ func discoverProfileArn(accessToken string) string {
 	// Kiro IDE's stored profile belongs to whoever is signed into the IDE,
 	// which may or may not be this bearer's user. It is only trusted for the
 	// launched identity and only when the API, asked with this very bearer,
-	// lists that same profile; if the API cannot answer, the IDE value is the
-	// best available. A fallback identity never borrows it.
+	// lists that same profile. If the API cannot answer (error, empty list)
+	// the ARN stays unresolved and discovery runs again on the next read: a
+	// profile of someone else must never be persisted as this user's. A
+	// fallback identity never borrows the IDE's profile.
 	profiles := fetchProfilesFromAPI(accessToken)
 	if profile.Active() == profile.Name() {
 		if arn := readKiroProfileArn(); arn != "" {
-			if len(profiles) == 0 {
-				return arn
-			}
 			for _, p := range profiles {
 				if p.Arn == arn {
 					return arn
@@ -4117,9 +4117,9 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			if cfg.Advanced.ComparisonMode {
 				capture = &capturedKiroEvents
 			}
-			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, token, lg, sessionID, reqResult.RequestID, capture)
+			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, lg, sessionID, reqResult.RequestID, capture)
 		} else {
-			responseStatus = handleNonStreamRequest(w, anthropicReq, token, lg, sessionID, reqResult.RequestID)
+			responseStatus = handleNonStreamRequest(w, anthropicReq, lg, sessionID, reqResult.RequestID)
 		}
 
 		// Log response
@@ -4429,7 +4429,7 @@ func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Dur
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
 // capturedEvents: optional pointer to slice for capturing SSE events (for comparison mode)
-func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
+func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -4444,10 +4444,10 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
 
-	// The token the caller read may already belong to a previous identity
-	// (another request failed over meanwhile). Build everything from the
-	// current token and the identity it was read for, as one pair; without
-	// that pair nothing is sent (see identity_failover.go).
+	// Build everything from the current token and the identity it was read
+	// for, as one pair; without that pair nothing is sent (see
+	// identity_failover.go). The dispatcher's earlier read may already belong
+	// to a previous identity (another request failed over meanwhile).
 	token, ident, err := tokenForRequest()
 	if err != nil {
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("Token unavailable: %v. Please re-login", err))
@@ -6274,6 +6274,7 @@ func saveTokenTo(tokenPath string, token *TokenData) error {
 	if err := os.WriteFile(tokenPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
+	tokenWriteGen.Add(1)
 
 	return nil
 }
@@ -6540,13 +6541,16 @@ func tryRefreshToken() error {
 	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
+	tokenWriteGen.Add(1)
 	// An IdC token that never had its profileArn resolved (a reserve refreshed
 	// straight from a stale login) gets it now, with the bearer that works.
 	if newToken.AuthMethod == "IdC" && newToken.ProfileArn == "" {
 		if arn := discoverProfileArn(newToken.AccessToken); arn != "" {
 			newToken.ProfileArn = arn
 			if data, merr := jsonStr.MarshalIndent(newToken, "", "  "); merr == nil {
-				_ = os.WriteFile(tokenPath, data, 0600)
+				if os.WriteFile(tokenPath, data, 0600) == nil {
+					tokenWriteGen.Add(1)
+				}
 			}
 		}
 	}
@@ -6613,6 +6617,11 @@ var (
 	cachedIdentity  string
 	cachedTokenTime time.Time
 	tokenMutex      sync.Mutex
+	// tokenWriteGen counts token file writes (refresh, login, ARN merge). A
+	// reader that started before a write must not publish what it read: by
+	// the time its discovery call returns, the bearer it holds may have been
+	// replaced on disk and in the cache by a completed refresh.
+	tokenWriteGen atomic.Uint64
 )
 
 func getToken() (TokenData, error) {
@@ -6631,24 +6640,33 @@ func getToken() (TokenData, error) {
 	if tokenPath == "" {
 		return TokenData{}, fmt.Errorf("failed to get user home directory")
 	}
-	token, err := readTokenFile(tokenPath)
-	if err != nil {
-		return TokenData{}, err
-	}
-
-	// Discover and persist the IdC/Enterprise profile ARN once. The Kiro backend
-	// associates requests with a CodeWhisperer profile; for IdC users it must be
-	// their own account-specific profile. The discovery call runs outside every
-	// lock and its result is merged into whatever the file holds by then (a
-	// refresh may have rotated the tokens meanwhile), never written as a whole.
-	if token.AuthMethod == "IdC" && token.ProfileArn == "" {
-		if arn := discoverProfileArn(token.AccessToken); arn != "" {
-			token = mergeProfileArn(tokenPath, token, arn)
+	for attempt := 0; attempt < 3; attempt++ {
+		gen := tokenWriteGen.Load()
+		token, err := readTokenFile(tokenPath)
+		if err != nil {
+			return TokenData{}, err
 		}
-	}
 
-	publishToken(name, token)
-	return token, nil
+		// Discover and persist the IdC/Enterprise profile ARN once. The Kiro
+		// backend associates requests with a CodeWhisperer profile; for IdC
+		// users it must be their own account-specific profile. The discovery
+		// call runs outside every lock and its result is merged into whatever
+		// the file holds by then (a refresh may have rotated the tokens
+		// meanwhile), never written as a whole.
+		if token.AuthMethod == "IdC" && token.ProfileArn == "" {
+			if arn := discoverProfileArn(token.AccessToken); arn != "" {
+				token, gen = mergeProfileArn(tokenPath, token, arn)
+			}
+		}
+		if tokenWriteGen.Load() == gen {
+			publishToken(name, token)
+			return token, nil
+		}
+		// The file was written while this read was out: what was read is
+		// stale, read again.
+	}
+	// Writes kept landing: hand out what is on disk now, without caching it.
+	return readTokenFile(tokenPath)
 }
 
 // readTokenFile parses one identity's token file.
@@ -6668,8 +6686,9 @@ func readTokenFile(tokenPath string) (TokenData, error) {
 // tokenPath, keeping whatever access/refresh tokens the file holds now. It is
 // serialized with token refreshes so the two writers never interleave. The
 // returned token is the merged on-disk state (or the given token plus the ARN
-// when the file could not be re-read).
-func mergeProfileArn(tokenPath string, token TokenData, arn string) TokenData {
+// when the file could not be re-read), with the write generation that state
+// belongs to.
+func mergeProfileArn(tokenPath string, token TokenData, arn string) (TokenData, uint64) {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
 	current, err := readTokenFile(tokenPath)
@@ -6680,7 +6699,7 @@ func mergeProfileArn(tokenPath string, token TokenData, arn string) TokenData {
 		current.ProfileArn = arn
 		_ = saveTokenTo(tokenPath, &current) // best-effort
 	}
-	return current
+	return current, tokenWriteGen.Load()
 }
 
 // publishToken installs a freshly written token in the cache for the identity
@@ -6697,9 +6716,10 @@ func publishToken(name string, token TokenData) {
 // handleNonStreamRequest handles non-streaming requests. It returns the HTTP
 // status it wrote so the caller's response log reflects backend errors instead
 // of a hardcoded 200 (streaming has no such choice: SSE commits 200 up front).
-func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, token TokenData, lg *logger.Logger, sessionID, requestID string) int {
+func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string) int {
 	// Token and the identity it was read for, as one pair (see
-	// identity_failover.go); the caller's token may be from a previous identity.
+	// identity_failover.go). The dispatcher's own read of the token is only
+	// for the proactive refresh; it may belong to a previous identity by now.
 	token, ident, err := tokenForRequest()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Token unavailable: %v. Please re-login", err), http.StatusInternalServerError)

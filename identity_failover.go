@@ -49,6 +49,9 @@ var (
 	// exhaustedIdentities remembers which identities answered 402 in this
 	// process, by profile name ("" = default), so they are never retried.
 	exhaustedIdentities = map[string]bool{}
+	// identityFailures remembers reserves that could not be used for another
+	// reason (unreadable token file, refresh rejected), with the reason.
+	identityFailures = map[string]string{}
 )
 
 // currentIdentity is the identity the proxy is on right now.
@@ -138,7 +141,7 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 	var chosen *identityRef
 	for _, raw := range candidates {
 		name, err := profile.Validate(raw)
-		if err != nil || exhaustedIdentities[name] || !identityHasToken(name) {
+		if err != nil || exhaustedIdentities[name] || identityFailures[name] != "" || !identityHasToken(name) {
 			continue
 		}
 		if err := profile.SwitchTo(name); err != nil {
@@ -147,10 +150,21 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 		identityGen++
 		invalidateTokenCache()
 		modelCatalog.Invalidate()
-		if _, err := getToken(); err != nil {
+		tok, err := getToken()
+		if err != nil {
 			// The file exists but cannot be read: not a usable reserve.
-			exhaustedIdentities[name] = true
+			identityFailures[name] = fmt.Sprintf("token file unreadable: %v", err)
 			continue
+		}
+		// A reserve that was logged in days ago may hold an expired access
+		// token; renew it before choosing it. A reserve whose refresh is
+		// rejected (revoked login) is skipped so the next one gets its turn,
+		// instead of being handed to the caller only to answer 403.
+		if tokenIsStale(tok) {
+			if err := tryRefreshToken(); err != nil {
+				identityFailures[name] = fmt.Sprintf("refresh failed: %v", err)
+				continue
+			}
 		}
 		chosen = &identityRef{Name: name, Gen: identityGen}
 		break
@@ -159,17 +173,11 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 		// Nothing left: stay on the identity that failed so the caller reports it.
 		_ = profile.SwitchTo(failed.Name)
 		invalidateTokenCache()
-		err := fmt.Errorf("every configured identity is out of Kiro credits: %s", strings.Join(exhaustedLabels(), ", "))
+		err := fmt.Errorf("every configured identity is unavailable: %s", strings.Join(exhaustedLabels(), ", "))
 		identityMu.Unlock()
 		return TokenData{}, failed, err
 	}
 	identityMu.Unlock()
-
-	// A reserve that was logged in days ago may hold an expired access token;
-	// renew it now so the retry does not bounce on a 403 as well.
-	if tok, err := getToken(); err == nil && tokenIsStale(tok) {
-		_ = tryRefreshToken()
-	}
 	return tokenForRequest()
 }
 
@@ -185,16 +193,22 @@ func tokenIsStale(tok TokenData) bool {
 	return time.Until(expiresAt) <= 5*time.Minute
 }
 
-// exhaustedLabels lists the identities that answered 402 in this process.
-// Caller holds identityMu.
+// exhaustedLabels lists the identities that answered 402 in this process and
+// the reserves that failed for another reason, with that reason. Caller holds
+// identityMu.
 func exhaustedLabels() []string {
-	names := make([]string, 0, len(exhaustedIdentities))
-	for name := range exhaustedIdentities {
+	label := func(name string) string {
 		if name == "" {
-			names = append(names, profile.DefaultLabel)
-		} else {
-			names = append(names, name)
+			return profile.DefaultLabel
 		}
+		return name
+	}
+	names := make([]string, 0, len(exhaustedIdentities)+len(identityFailures))
+	for name := range exhaustedIdentities {
+		names = append(names, label(name)+" (out of credits)")
+	}
+	for name, reason := range identityFailures {
+		names = append(names, label(name)+" ("+reason+")")
 	}
 	sort.Strings(names)
 	return names
@@ -221,6 +235,7 @@ func quotaExhaustedMessage(reason string, err error) string {
 func resetIdentityState() {
 	identityMu.Lock()
 	exhaustedIdentities = map[string]bool{}
+	identityFailures = map[string]string{}
 	identityGen++
 	identityMu.Unlock()
 	profile.ResetIdentity()

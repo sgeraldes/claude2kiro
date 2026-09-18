@@ -72,7 +72,7 @@ func (r *Recorder) track() string {
 	r.path = p
 	r.mu.Unlock()
 	if changed {
-		r.load()
+		r.load(p)
 	}
 	return p
 }
@@ -92,8 +92,7 @@ func (r *Recorder) Start() {
 		return
 	}
 	r.startOnce.Do(func() {
-		r.track()
-		r.load()
+		r.load(r.track())
 		// Sample off the calling goroutine: read() is a network call, and Start
 		// runs inline in buildServerMux (TUI/server/run), so a slow Kiro API must
 		// not delay server startup. Loaded file history already fills the chart.
@@ -133,17 +132,24 @@ func (r *Recorder) sampleOnce() {
 		Plan:      rd.Plan,
 	}
 
-	r.appendLine(s)
+	// Everything below is bound to the file the reading was taken for. The
+	// recorder may move to another identity's file at any moment (a History
+	// call after a switch does that); a sample of A is written to A's file or
+	// dropped, never to whichever file is current by then.
+	r.appendLine(before, s)
 
 	// Refresh memory from the file rather than only appending to our own
 	// slice: several proxies (a persistent server plus `run` instances) may
 	// sample to the same file, and re-reading makes each process's
 	// /credits/history converge on the union of everyone's samples.
-	if !r.reload() {
-		// File unreadable — keep the sample in memory so History still works.
+	if !r.reload(before) {
+		// File unreadable: keep the sample in memory so History still works,
+		// as long as memory still belongs to that file.
 		r.mu.Lock()
-		r.snap = append(r.snap, s)
-		r.prune()
+		if r.path == before {
+			r.snap = append(r.snap, s)
+			r.prune()
+		}
 		r.mu.Unlock()
 	}
 }
@@ -178,22 +184,26 @@ func (r *Recorder) History() []Snapshot {
 	return out
 }
 
-// load reads the JSONL file into memory at startup, pruning stale points. If
-// pruning dropped lines, the file is compacted once. This is the only full
-// rewrite: steady-state persistence is append-only (see appendLine), so
-// concurrent proxies sampling to the same file can't clobber each other.
-func (r *Recorder) load() {
-	snaps, ok := r.readFile()
+// load reads the JSONL file at path into memory (at startup and when the
+// recorder moves to another file), pruning stale points. If pruning dropped
+// lines, the file is compacted once. This is the only full rewrite:
+// steady-state persistence is append-only (see appendLine), so concurrent
+// proxies sampling to the same file can't clobber each other. Memory is only
+// replaced while the recorder is still bound to path.
+func (r *Recorder) load(path string) {
+	snaps, ok := r.readFile(path)
+	r.mu.Lock()
+	if r.path != path {
+		r.mu.Unlock()
+		return
+	}
 	if !ok {
 		// No file for this identity yet: an empty series, not the previous
 		// identity's points.
-		r.mu.Lock()
 		r.snap = nil
 		r.mu.Unlock()
 		return
 	}
-
-	r.mu.Lock()
 	r.snap = snaps
 	r.prune()
 	pruned := len(snaps) - len(r.snap)
@@ -202,27 +212,30 @@ func (r *Recorder) load() {
 	r.mu.Unlock()
 
 	if pruned > 0 {
-		r.rewrite(kept)
+		r.rewrite(path, kept)
 	}
 }
 
-// reload refreshes the in-memory history from the file without rewriting it.
-// Returns false when the file can't be read.
-func (r *Recorder) reload() bool {
-	snaps, ok := r.readFile()
+// reload refreshes the in-memory history from the file at path without
+// rewriting it, if the recorder is still bound to that file. Returns false
+// when the file can't be read.
+func (r *Recorder) reload(path string) bool {
+	snaps, ok := r.readFile(path)
 	if !ok {
 		return false
 	}
 	r.mu.Lock()
-	r.snap = snaps
-	r.prune()
+	if r.path == path {
+		r.snap = snaps
+		r.prune()
+	}
 	r.mu.Unlock()
 	return true
 }
 
-// readFile parses the JSONL file, skipping malformed lines, oldest first.
-func (r *Recorder) readFile() ([]Snapshot, bool) {
-	f, err := os.Open(r.currentPath())
+// readFile parses the JSONL file at path, skipping malformed lines, oldest first.
+func (r *Recorder) readFile(path string) ([]Snapshot, bool) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
 	}
@@ -245,12 +258,11 @@ func (r *Recorder) readFile() ([]Snapshot, bool) {
 	return snaps, true
 }
 
-// appendLine appends one snapshot as a JSONL line. O_APPEND lands each line
-// atomically, so multiple proxies writing to the same file interleave instead
-// of overwriting each other (the previous whole-file rewrite dropped every
-// sample the other process had recorded). Best-effort.
-func (r *Recorder) appendLine(s Snapshot) {
-	path := r.currentPath()
+// appendLine appends one snapshot as a JSONL line to the file at path.
+// O_APPEND lands each line atomically, so multiple proxies writing to the same
+// file interleave instead of overwriting each other (the previous whole-file
+// rewrite dropped every sample the other process had recorded). Best-effort.
+func (r *Recorder) appendLine(path string, s Snapshot) {
 	if path == "" {
 		return
 	}
@@ -269,10 +281,9 @@ func (r *Recorder) appendLine(s Snapshot) {
 	f.Write(append(data, '\n'))
 }
 
-// rewrite atomically replaces the JSONL file with the given snapshots. Only
-// used by load() to compact stale lines at startup. Best-effort.
-func (r *Recorder) rewrite(snaps []Snapshot) {
-	path := r.currentPath()
+// rewrite atomically replaces the JSONL file at path with the given
+// snapshots. Only used by load() to compact stale lines. Best-effort.
+func (r *Recorder) rewrite(path string, snaps []Snapshot) {
 	if path == "" {
 		return
 	}

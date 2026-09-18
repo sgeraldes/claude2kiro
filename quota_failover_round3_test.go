@@ -47,8 +47,7 @@ func TestFirstRequestUsesTheCurrentIdentityNotTheCallersToken(t *testing.T) {
 			backend := newFakeQuotaBackend(t, "primary-token")
 			failoverConfig(t, backend.server.URL, "kiro2")
 
-			stale, err := getToken() // primary
-			if err != nil {
+			if _, err := getToken(); err != nil { // primary, primes the cache
 				t.Fatal(err)
 			}
 			if _, next, err := switchToFallbackIdentity(currentIdentity()); err != nil || next.Name != "kiro2" {
@@ -57,9 +56,9 @@ func TestFirstRequestUsesTheCurrentIdentityNotTheCallersToken(t *testing.T) {
 
 			rec := httptest.NewRecorder()
 			if stream {
-				handleStreamRequestWithLogger(rec, testRequest(), stale, logger.NewLogger(50), "sess", "req", nil)
+				handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
 			} else {
-				handleNonStreamRequest(rec, testRequest(), stale, nil, "sess", "req")
+				handleNonStreamRequest(rec, testRequest(), nil, "sess", "req")
 			}
 			bearers, arns := backend.seen()
 			if len(bearers) != 1 || bearers[0] != "kiro2-token" || arns[0] != "arn:kiro2" {
@@ -81,8 +80,7 @@ func TestUnreadableActiveTokenSendsNothing(t *testing.T) {
 	withIdentities(t, map[string]TokenData{"": primaryToken()})
 	backend := newFakeQuotaBackend(t)
 	failoverConfig(t, backend.server.URL)
-	stale, err := getToken()
-	if err != nil {
+	if _, err := getToken(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(tokenFilePathFor(""), []byte("{not json"), 0o600); err != nil {
@@ -91,9 +89,9 @@ func TestUnreadableActiveTokenSendsNothing(t *testing.T) {
 	invalidateTokenCache()
 
 	rec := httptest.NewRecorder()
-	handleStreamRequestWithLogger(rec, testRequest(), stale, logger.NewLogger(50), "sess", "req", nil)
+	handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
 	rec2 := httptest.NewRecorder()
-	status := handleNonStreamRequest(rec2, testRequest(), stale, nil, "sess", "req")
+	status := handleNonStreamRequest(rec2, testRequest(), nil, "sess", "req")
 
 	if bearers, _ := backend.seen(); len(bearers) != 0 {
 		t.Fatalf("nothing must reach the backend without a valid token: %v", bearers)

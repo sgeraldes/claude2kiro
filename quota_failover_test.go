@@ -183,22 +183,20 @@ func testRequest() AnthropicRequest {
 func streamOnce(t *testing.T) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	tok, err := getToken()
-	if err != nil {
+	if _, err := getToken(); err != nil {
 		t.Fatal(err)
 	}
-	handleStreamRequestWithLogger(rec, testRequest(), tok, logger.NewLogger(50), "sess", "req", nil)
+	handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
 	return rec
 }
 
 func nonStreamOnce(t *testing.T) (*httptest.ResponseRecorder, int) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	tok, err := getToken()
-	if err != nil {
+	if _, err := getToken(); err != nil {
 		t.Fatal(err)
 	}
-	status := handleNonStreamRequest(rec, testRequest(), tok, logger.NewLogger(50), "sess", "req")
+	status := handleNonStreamRequest(rec, testRequest(), logger.NewLogger(50), "sess", "req")
 	return rec, status
 }
 
@@ -349,8 +347,7 @@ func TestLate402FromOldIdentityDoesNotExhaustTheFallback(t *testing.T) {
 	failoverConfig(t, backend.server.URL, "kiro2")
 
 	backend.hold = make(chan struct{})
-	tok, err := getToken()
-	if err != nil {
+	if _, err := getToken(); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -361,7 +358,7 @@ func TestLate402FromOldIdentityDoesNotExhaustTheFallback(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			statuses[i] = handleNonStreamRequest(rec, testRequest(), tok, nil, "sess", "req")
+			statuses[i] = handleNonStreamRequest(rec, testRequest(), nil, "sess", "req")
 			bodies[i] = rec
 		}()
 	}
@@ -431,8 +428,7 @@ func TestDiscoveryFinishingAfterSwitchWritesToItsOwnFile(t *testing.T) {
 	if got := readIdentityToken(t, "").ProfileArn; got != "arn:discovered" {
 		t.Fatalf("discovery must land in the primary's file, got %q", got)
 	}
-	tok, err := getToken()
-	if err != nil || tok.AccessToken != "kiro2-token" {
+	if tok, err := getToken(); err != nil || tok.AccessToken != "kiro2-token" {
 		t.Fatalf("active token after switch: %+v %v", tok, err)
 	}
 }
@@ -553,15 +549,14 @@ func TestLate403AfterSwitchAdoptsFallbackBearerAndArn(t *testing.T) {
 
 	// The proxy moves to kiro2 while this request's first attempt is parked.
 	backend.hold = make(chan struct{})
-	tok, err := getToken()
-	if err != nil {
+	if _, err := getToken(); err != nil {
 		t.Fatal(err)
 	}
 	ident := currentIdentity()
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		handleStreamRequestWithLogger(rec, testRequest(), tok, logger.NewLogger(50), "sess", "req", nil)
+		handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
 		done <- rec
 	}()
 	backend.waitForRequests(t, 1)

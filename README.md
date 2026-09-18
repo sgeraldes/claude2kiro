@@ -159,8 +159,11 @@ switch is sticky for the life of the proxy: an empty pool stays empty until its 
 reset, so restart the proxy (or the run) to go back to the primary. Only the token, login
 config and credit history move: the port marker and the config stay with the profile the
 proxy was started as, so `run` keeps attaching to the right proxy. `/health` reports the
-identity in use in `X-Claude2Kiro-Identity`. When every listed identity is exhausted the
-client gets a non-retryable error naming them all. Failover is deliberately not load
+identity in use in `X-Claude2Kiro-Identity`. A reserve whose stale token cannot be
+refreshed (its login was revoked) is skipped for the next one. When every listed identity
+is exhausted or unusable the client gets a non-retryable error naming each one with its
+reason (`out of credits`, `refresh failed: …`), so you know which login to redo with
+`CLAUDE2KIRO_PROFILE=<name> claude2kiro login`. Failover is deliberately not load
 balancing: spreading requests over two monthly pools empties both on the same day, while
 a spare pool that only starts when the first one is gone is a real reserve.
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,6 +51,10 @@ func TestConcurrentSubagents_DistinctConversationIds(t *testing.T) {
 	}))
 	defer fake.Close()
 
+	// The handler reads the active identity's token itself; give it one in an
+	// isolated home so the test does not depend on the machine's Kiro login.
+	withIdentities(t, map[string]TokenData{"": primaryToken()})
+
 	cfg := *config.Get()
 	cfg.Advanced.StableConversationID = true
 	cfg.Advanced.CodeWhispererEndpoint = fake.URL
@@ -73,15 +78,22 @@ func TestConcurrentSubagents_DistinctConversationIds(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	bodies := make([]string, n)
 	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			handleStreamRequestWithLogger(rec, req, TokenData{}, lg, "sess", "req", nil)
+			handleStreamRequestWithLogger(rec, req, lg, "sess", "req", nil)
+			bodies[i] = rec.Body.String()
 		}(i)
 	}
 	wg.Wait()
+	for i, body := range bodies {
+		if strings.Contains(body, `"type":"error"`) {
+			t.Fatalf("request %d answered an error: %s", i, body)
+		}
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
