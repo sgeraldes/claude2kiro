@@ -184,9 +184,16 @@ when another login (another account) took its slot; a rotation of the same login
 nothing. The proxy checks a cached token against the file's content on every request, so a
 token file written by another process is noticed on the next request, not at the cache's
 one-minute expiry; while the file cannot be read at all the cached token is not served. On
-Windows the proxy reads the file with delete sharing, so its readers never block a login or
-a refresh in another process, and a writer waits up to a second for a program that holds
-the file without it. When
+Windows the proxy reads the file with delete sharing and replaces it with `ReplaceFile`, so
+its own readers do not block a login or a refresh in another process; a program that holds
+the file without delete sharing (an editor) makes a writer wait up to a second. A refresh
+whose write still fails then keeps the token the provider issued in
+`kiro-auth-token*.json.renewed` (the refresh token it came from is spent and is never sent
+again): the next request, refresh or recovery of that identity moves it into place; a
+login or a logout discards it. An identity's `loginId` is written by this proxy's login; a
+file Kiro itself writes has none and is told apart by its access token, so a rotation of
+such a file counts as a new login once. A 402 marks the login that made the request, so a
+login that took the slot meanwhile is not the one marked out of credits. When
 every listed identity is exhausted or unusable the client gets a non-retryable error
 naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
 so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.

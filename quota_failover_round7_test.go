@@ -191,7 +191,7 @@ func TestTUILoginEnvironmentNamesTheActiveIdentity(t *testing.T) {
 	withIdentities(t, map[string]TokenData{"": primaryToken(), "kiro2": fallbackToken()})
 	backend := newFakeQuotaBackend(t, "primary-token")
 	failoverConfig(t, backend.server.URL, "kiro2")
-	if _, next, err := switchToFallbackIdentity(currentIdentity()); err != nil || next.Name != "kiro2" {
+	if _, next, err := switchToFallbackIdentity(currentIdentity(), primaryToken()); err != nil || next.Name != "kiro2" {
 		t.Fatalf("switch: %v %+v", err, next)
 	}
 	if got := profile.Active(); got != "kiro2" {

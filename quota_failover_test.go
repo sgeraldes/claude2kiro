@@ -442,7 +442,7 @@ func TestDiscoveryFinishingAfterSwitchWritesToItsOwnFile(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		close(release)
 	}()
-	if _, next, err := switchToFallbackIdentity(ident); err != nil || next.Name != "kiro2" {
+	if _, next, err := switchToFallbackIdentity(ident, readIdentityToken(t, "")); err != nil || next.Name != "kiro2" {
 		t.Fatalf("switch: %v %+v", err, next)
 	}
 	<-done
@@ -585,7 +585,7 @@ func TestLate403AfterSwitchAdoptsFallbackBearerAndArn(t *testing.T) {
 		done <- rec
 	}()
 	backend.waitForRequests(t, 1)
-	if _, next, err := switchToFallbackIdentity(ident); err != nil || next.Name != "kiro2" {
+	if _, next, err := switchToFallbackIdentity(ident, readIdentityToken(t, "")); err != nil || next.Name != "kiro2" {
 		t.Fatalf("switch: %v %+v", err, next)
 	}
 	backend.release()

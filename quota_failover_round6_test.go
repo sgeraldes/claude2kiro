@@ -34,7 +34,7 @@ func TestUnreadableReserveIsReconsideredOnTheNextFailover(t *testing.T) {
 	backend := newFakeQuotaBackend(t, "primary-token")
 	failoverConfig(t, backend.server.URL, "b")
 
-	_, _, err := switchToFallbackIdentity(currentIdentity())
+	_, _, err := switchToFallbackIdentity(currentIdentity(), primaryToken())
 	if err == nil || !strings.Contains(err.Error(), "b (token file unreadable") {
 		t.Fatalf("first selection must fail on the damaged file, got: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestUnreadableReserveIsReconsideredOnTheNextFailover(t *testing.T) {
 	}
 
 	writeIdentityToken(t, "b", good)
-	tok, next, err := switchToFallbackIdentity(currentIdentity())
+	tok, next, err := switchToFallbackIdentity(currentIdentity(), primaryToken())
 	if err != nil || next.Name != "b" || tok.AccessToken != "good-token" {
 		t.Fatalf("the repaired reserve must be taken: %v %+v %q", err, next, tok.AccessToken)
 	}
@@ -133,7 +133,7 @@ func TestRollbackReferenceIsStableUnderConcurrentSelections(t *testing.T) {
 			defer wg.Done()
 			for range 20 {
 				ref := currentIdentity()
-				_, back, err := switchToFallbackIdentity(ref)
+				_, back, err := switchToFallbackIdentity(ref, primaryToken())
 				if err == nil {
 					continue
 				}

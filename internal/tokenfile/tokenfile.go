@@ -74,3 +74,11 @@ func LockFor(path string, wait time.Duration) (func(), error) {
 		time.Sleep(lockInterval)
 	}
 }
+
+// RenewedPath is the file next to a token file where a refresh keeps the
+// token the provider issued when the token file itself could not be
+// replaced (a program held it without delete sharing). The next writer or
+// reader moves it into place; a login or a logout discards it.
+func RenewedPath(path string) string {
+	return path + ".renewed"
+}

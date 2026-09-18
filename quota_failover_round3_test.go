@@ -50,7 +50,7 @@ func TestFirstRequestUsesTheCurrentIdentityNotTheCallersToken(t *testing.T) {
 			if _, err := getToken(); err != nil { // primary, primes the cache
 				t.Fatal(err)
 			}
-			if _, next, err := switchToFallbackIdentity(currentIdentity()); err != nil || next.Name != "kiro2" {
+			if _, next, err := switchToFallbackIdentity(currentIdentity(), primaryToken()); err != nil || next.Name != "kiro2" {
 				t.Fatalf("switch: %v %+v", err, next)
 			}
 
@@ -190,7 +190,7 @@ func TestLate403OnTheLastAttemptStillAdoptsTheFallback(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, next, err := switchToFallbackIdentity(ident); err != nil || next.Name != "kiro2" {
+	if _, next, err := switchToFallbackIdentity(ident, readIdentityToken(t, "")); err != nil || next.Name != "kiro2" {
 		t.Fatalf("switch: %v %+v", err, next)
 	}
 	close(hold)
@@ -303,7 +303,7 @@ func TestCatalogIsInvalidatedOnIdentitySwitch(t *testing.T) {
 		t.Fatalf("precondition: one fetch, got %d", fetches)
 	}
 
-	if _, _, err := switchToFallbackIdentity(currentIdentity()); err != nil {
+	if _, _, err := switchToFallbackIdentity(currentIdentity(), primaryToken()); err != nil {
 		t.Fatal(err)
 	}
 	modelCatalog.Models()

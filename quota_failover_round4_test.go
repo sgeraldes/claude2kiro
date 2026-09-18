@@ -196,7 +196,7 @@ func TestExhaustedMessageNamesEveryUnusableIdentity(t *testing.T) {
 	cfg.Auth.FallbackProfiles = []string{"bad"}
 	withConfig(t, &cfg)
 
-	_, _, err := switchToFallbackIdentity(currentIdentity())
+	_, _, err := switchToFallbackIdentity(currentIdentity(), primaryToken())
 	if err == nil {
 		t.Fatal("expected an error with nothing usable left")
 	}

@@ -121,7 +121,7 @@ func TestTransientRefreshFailureIsRetriedOnTheNextFailover(t *testing.T) {
 	cfg.Auth.FallbackProfiles = []string{"b"}
 	withConfig(t, &cfg)
 
-	_, _, err := switchToFallbackIdentity(currentIdentity())
+	_, _, err := switchToFallbackIdentity(currentIdentity(), primaryToken())
 	if err == nil || !strings.Contains(err.Error(), "b (refresh failed for now") {
 		t.Fatalf("first selection must fail and name the passing failure, got: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestTransientRefreshFailureIsRetriedOnTheNextFailover(t *testing.T) {
 	}
 
 	down.Store(false)
-	tok, next, err := switchToFallbackIdentity(currentIdentity())
+	tok, next, err := switchToFallbackIdentity(currentIdentity(), primaryToken())
 	if err != nil || next.Name != "b" || tok.AccessToken != "b-fresh" {
 		t.Fatalf("second selection must reach the recovered reserve: %v %+v %q", err, next, tok.AccessToken)
 	}
@@ -200,7 +200,7 @@ func TestRollbackAfterRejectedCandidatesDropsTheirCaches(t *testing.T) {
 	withConfig(t, &cfg)
 
 	before := currentIdentity()
-	_, after, err := switchToFallbackIdentity(before)
+	_, after, err := switchToFallbackIdentity(before, readIdentityToken(t, ""))
 	if err == nil {
 		t.Fatal("expected an error with nothing usable left")
 	}

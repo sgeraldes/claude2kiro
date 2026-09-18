@@ -401,6 +401,7 @@ func RemoveLogin(configPath, tokenPath string) (configDeleted, tokenDeleted bool
 	if err != nil {
 		return configDeleted, false, err
 	}
+	_, _ = removeIfPresent(tokenfile.RenewedPath(tokenPath)) // a renewed token waiting for the file goes with the login
 	return configDeleted, tokenDeleted, nil
 }
 

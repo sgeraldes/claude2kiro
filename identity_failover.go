@@ -133,16 +133,6 @@ func identityLoggedInAgain(name, key string) bool {
 	return loginKey(tok) != key
 }
 
-// currentLoginKey is the loginKey of what an identity's file holds now, "?"
-// when it cannot be read.
-func currentLoginKey(name string) string {
-	tok, err := readTokenFile(tokenFilePathFor(name))
-	if err != nil {
-		return "?"
-	}
-	return loginKey(tok)
-}
-
 // tokenFilePathFor is the token file of a given profile name ("" = default).
 func tokenFilePathFor(name string) string {
 	homeDir, err := os.UserHomeDir()
@@ -159,8 +149,10 @@ func tokenFilePathFor(name string) string {
 // configured fallback that is logged in and not exhausted, refreshing its
 // token when it is stale. With nothing left it returns an error naming every
 // exhausted identity; the proxy stays where it was.
-func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error) {
-	return switchAway(failed, "", "")
+// used is the token the request that got the 402 was sent with: its login
+// is the one out of credits, whatever the file holds by now.
+func switchToFallbackIdentity(failed identityRef, used TokenData) (TokenData, identityRef, error) {
+	return switchAway(failed, "", loginKey(used))
 }
 
 // retireIdentity is switchToFallbackIdentity for an identity whose bearer the
@@ -234,7 +226,7 @@ func switchAway(failed identityRef, reason, login string) (TokenData, identityRe
 		return tokenForRequest()
 	}
 	if reason == "" {
-		exhaustedIdentities[failed.Name] = currentLoginKey(failed.Name)
+		exhaustedIdentities[failed.Name] = login
 	} else {
 		identityFailures[failed.Name] = reason
 		retiredLogin[failed.Name] = login
