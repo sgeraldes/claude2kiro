@@ -132,6 +132,84 @@ is used when it exists (give the second identity its own `server.port` there), o
 the shared `config.yaml`. With the variable unset nothing changes: the historical file
 names stay in place.
 
+The default browser is usually already signed in as the first identity, and Identity
+Center would then bind the new token to that user. Sign the second one in from a private
+window: `--no-browser` prints the URL instead of opening anything.
+
+```bash
+CLAUDE2KIRO_PROFILE=agentes claude2kiro login --no-browser idc https://d5.awsapps.com/start us-east-1
+```
+
+#### Failover when a pool runs out
+
+Once both identities are logged in, list the spare ones in the config file the proxy
+reads (`~/.claude2kiro/config.yaml`, or `config.<profile>.yaml` when the proxy was started
+under a named profile and that file exists) and the proxy switches on its own when the
+active pool answers `402 MONTHLY_REQUEST_COUNT`. `""` names the unnamed profile, so a
+proxy started as `agentes` can fall back to it with `fallback_profiles: [""]`:
+
+```yaml
+auth:
+  fallback_profiles: [agentes]
+```
+
+The request that hit the 402 is resent with the fallback identity's token and
+`profileArn` (refreshed first if it went stale); the client never sees the error. The
+switch is sticky for the life of the proxy: an empty pool stays empty until its monthly
+reset, so restart the proxy (or the run) to go back to the primary. Only the token, login
+config and credit history move: the port marker and the config stay with the profile the
+proxy was started as, so `run` keeps attaching to the right proxy. `/health` reports the
+identity in use in `X-Claude2Kiro-Identity`. A reserve whose stale token cannot be
+refreshed is skipped for the next one: for good when the identity provider rejected it
+(revoked login, `invalid_grant`), only for this failover when the refresh failed for a
+passing reason (network, 5xx, a file another process is replacing, a refresh that answered
+without a token). A token file with no access token is skipped the same way. A bearer the
+backend rejects on a request is refreshed on the spot; if the provider rejects that refresh
+too, or the refreshed bearer is still rejected, that identity is retired and the next
+reserve serves the same request. A login started from the TUI after a failover logs in the
+identity the TUI is on, not the one it was launched with. Token files are written under an
+operating-system lock shared across processes (`kiro-auth-token*.json.lock`, an empty file
+that only ever carries the lock; it stays behind and is safe to leave there). A refresh
+holds it through its call to the provider, so two processes renewing the same file do it
+in turn and the second starts from what the first wrote; a login or a logout that arrives
+meanwhile, from the proxy, the TUI or a `claude2kiro login`/`logout`/`refresh` in another
+terminal, waits for that write and then wins: the refresh publishes only what the file
+still holds. A writer that cannot get the lock in 45 s writes nothing and says so. A bearer
+the backend rejects while another process has already replaced it on disk is not refreshed
+again and the identity is not retired: the file's credentials are adopted, and they keep
+their own refresh (the refresh budget of a request follows the credentials it refreshed,
+not the identity). A login writes a `loginId` into its token file and a refresh keeps it,
+so an identity that is out of credits or retired is tried again on the next failover only
+when another login (another account) took its slot; a rotation of the same login changes
+nothing. The proxy checks a cached token against the file's content on every request, so a
+token file written by another process is noticed on the next request, not at the cache's
+one-minute expiry; while the file cannot be read at all the cached token is not served. On
+Windows the proxy reads the file with delete sharing and replaces it with `ReplaceFile`, so
+its own readers do not block a login or a refresh in another process; a program that holds
+the file without delete sharing (an editor) makes a writer wait up to a second. A refresh
+whose write still fails then keeps the token the provider issued in
+`kiro-auth-token*.json.renewed`, with the credentials it replaces (the refresh token among
+them is spent and is never sent again): the next request, refresh or recovery of that
+identity applies it, once, only over those credentials, and adopts it without spending its
+own refresh; a file that moved on (a login, a later rotation) makes the record stale, and a
+login or a logout discards it. While such a record exists but cannot be read or removed
+(a program holds it), that identity's requests and refreshes fail instead of spending the
+file's refresh token, until it can. An identity's `loginId` is written by this proxy's login; a
+file Kiro itself writes has none and is told apart by its access token, so a rotation of
+such a file counts as a new login once. A 402 marks the login that made the request, so a
+login that took the slot meanwhile is not the one marked out of credits. When
+every listed identity is exhausted or unusable the client gets a non-retryable error
+naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
+so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.
+`network.http_timeout` must be positive; a zero value falls back to the default, since the
+failover holds the identity lock while a reserve is refreshed. Failover is deliberately not load
+balancing: spreading requests over two monthly pools empties both on the same day, while
+a spare pool that only starts when the first one is gone is a real reserve.
+
+```bash
+claude2kiro credits --all   # every identity, in failover order, with its remaining pool
+```
+
 ### `claude2kiro run`
 
 ```bash
@@ -269,7 +347,7 @@ Claude2Kiro is useful if you:
 
 **Dashboard and server** both start a persistent proxy on a fixed port (default 8080). Additional Claude Code sessions attach automatically via `claude2kiro run`, or explicitly with `claude2kiro remote`. All requests are logged to the same files on disk.
 
-The proxy is stateless — it reads the auth token from disk on every request and holds no session data in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
+The proxy keeps no session data: it reads the auth token from disk on every request (a short-lived cache is checked against the file each time) and holds only the identity failover state in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
 
 ## License
 

@@ -119,6 +119,7 @@ type Catalog struct {
 	models    []KiroModel
 	ids       map[string]bool
 	fetchedAt time.Time
+	gen       uint64 // bumped by Invalidate; a fetch started before it is discarded
 
 	fetchMu sync.Mutex // serializes refresh to avoid a fetch stampede
 	ttl     time.Duration
@@ -133,6 +134,25 @@ type Catalog struct {
 // the auth token + config and calls Fetch).
 func NewCatalog(ttl time.Duration, fetch func() ([]KiroModel, error)) *Catalog {
 	return &Catalog{ttl: ttl, fetch: fetch, ids: map[string]bool{}}
+}
+
+// Invalidate forgets the cached list so the next use refetches. The proxy
+// calls it when it moves to another Kiro identity: the models one account can
+// use are not necessarily the ones another can, so the previous list is
+// dropped outright (a failed fetch for the new identity leaves the catalog
+// empty, never serving the old identity's models). A fetch that was already in
+// flight for the previous identity is discarded when it lands, so it cannot
+// publish that identity's list as the new one's.
+func (c *Catalog) Invalidate() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.fetchedAt = time.Time{}
+	c.models = nil
+	c.ids = map[string]bool{}
+	c.gen++
+	c.mu.Unlock()
 }
 
 // SetOnChange registers a callback invoked whenever a refresh produces a model
@@ -168,17 +188,36 @@ func (c *Catalog) refreshIfStale() {
 	// Another goroutine may have refreshed while we waited for the fetch lock.
 	c.mu.RLock()
 	fresh = len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
+	gen := c.gen
 	c.mu.RUnlock()
 	if fresh {
 		return
 	}
 
-	models, err := c.fetch()
-	if err != nil {
-		// Keep serving stale-but-usable data; only the first fetch failure
-		// (with nothing cached) leaves the catalog empty.
-		_ = hadData
-		return
+	var models []KiroModel
+	confirmed := false
+	for attempt := 0; attempt < 3 && !confirmed; attempt++ {
+		var err error
+		models, err = c.fetch()
+		if err != nil {
+			// Keep serving stale-but-usable data; only the first fetch failure
+			// (with nothing cached) leaves the catalog empty.
+			_ = hadData
+			return
+		}
+		c.mu.RLock()
+		current := c.gen
+		c.mu.RUnlock()
+		if current == gen {
+			confirmed = true
+			break
+		}
+		// Invalidated while the fetch was out (identity switch): that list
+		// belongs to the previous identity. Fetch again for the current one.
+		gen = current
+	}
+	if !confirmed {
+		return // identities kept changing; the next use fetches again
 	}
 
 	ids := make(map[string]bool, len(models))
@@ -189,6 +228,10 @@ func (c *Catalog) refreshIfStale() {
 	fp := Fingerprint(models)
 
 	c.mu.Lock()
+	if c.gen != gen {
+		c.mu.Unlock()
+		return
+	}
 	c.models = models
 	c.ids = ids
 	c.fetchedAt = time.Now()

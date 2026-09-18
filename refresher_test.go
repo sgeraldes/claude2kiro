@@ -13,8 +13,8 @@ func TestStartTokenRefresher(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	t.Setenv("USERPROFILE", tmp)
-	cachedToken = nil
-	t.Cleanup(func() { cachedToken = nil })
+	invalidateTokenCache()
+	t.Cleanup(invalidateTokenCache)
 
 	stop := startTokenRefresher(logger.NewLogger(10))
 	// Must be safe to call, and idempotent (a defer plus an explicit stop must

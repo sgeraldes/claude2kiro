@@ -62,14 +62,14 @@ claude2kiro run
 ### Windows
 
 ```powershell
-& 'C:/Program Files/Go/bin/go.exe' build -o claude2kiro.exe main.go
+& 'C:/Program Files/Go/bin/go.exe' build -o claude2kiro.exe .
 & 'C:/Program Files/Go/bin/go.exe' build -o claude2kiro-launcher.exe ./cmd/launcher
 ```
 
 ### Any platform with Go installed
 
 ```bash
-go build -o claude2kiro main.go
+go build -o claude2kiro .
 go build -o claude2kiro-launcher ./cmd/launcher
 ```
 

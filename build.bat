@@ -25,7 +25,7 @@ set VERSION=%BASE%.%DATETIME%
 echo Building Claude2Kiro v%VERSION%...
 
 REM Build with version injected
-go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=%VERSION%" -o claude2kiro.exe main.go
+go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=%VERSION%" -o claude2kiro.exe .
 
 IF %ERRORLEVEL% NEQ 0 (
     echo Build failed!

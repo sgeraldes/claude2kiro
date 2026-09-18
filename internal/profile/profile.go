@@ -14,6 +14,13 @@
 //	config          read: ~/.claude2kiro/config.<profile>.yaml when it exists, else config.yaml
 //	                save: always ~/.claude2kiro/config.<profile>.yaml
 //
+// Two names matter at run time. The launched profile (Name) is what the
+// process was started as and never changes: it owns the port marker and the
+// config, so `run` keeps attaching to the right proxy. The active identity
+// (Active) is whose token, login config and credit history are in use; it
+// starts equal to the launched profile and moves to a fallback profile via
+// SwitchTo when a credit pool is exhausted (auth.fallback_profiles).
+//
 // The default profile (variable unset or empty) keeps the historical file names,
 // so nothing changes for an existing install. The client registration cache is
 // keyed by clientIdHash already and is shared on purpose.
@@ -44,6 +51,10 @@ var validName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 var (
 	once sync.Once
 	name string
+
+	// active is the identity override set by SwitchTo; nil follows Name().
+	activeMu sync.RWMutex
+	active   *string
 )
 
 // Validate returns the profile name a raw value denotes, or an error when the
@@ -56,6 +67,12 @@ func Validate(raw string) (string, error) {
 	}
 	if !validName.MatchString(raw) {
 		return "", fmt.Errorf("%s=%q is not a valid profile name: use letters, digits, '-' or '_' (max 64)", EnvVar, raw)
+	}
+	// "default" is how the unnamed profile presents itself (/health headers,
+	// messages); a profile literally called that would be indistinguishable
+	// from it wherever the label is compared.
+	if raw == DefaultLabel {
+		return "", fmt.Errorf("%s=%q is reserved for the unnamed profile; pick another name", EnvVar, raw)
 	}
 	return raw, nil
 }
@@ -83,10 +100,49 @@ func Label() string {
 	return DefaultLabel
 }
 
-// suffixed inserts ".<profile>" before the extension of base when a profile is
-// active: "kiro-auth-token.json" -> "kiro-auth-token.agentes.json".
-func suffixed(base string) string {
-	n := Name()
+// Active returns the identity whose token, login config and credit history are
+// in use: the launched profile unless SwitchTo moved it. "" is the default.
+func Active() string {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if active != nil {
+		return *active
+	}
+	return Name()
+}
+
+// ActiveLabel is the active identity to show: its name, or "default".
+func ActiveLabel() string {
+	if a := Active(); a != "" {
+		return a
+	}
+	return DefaultLabel
+}
+
+// SwitchTo makes raw the active identity for token, login config and credit
+// history. The port marker and the config keep following the launched
+// profile. An invalid name is refused and the current identity is kept.
+func SwitchTo(raw string) error {
+	n, err := Validate(raw)
+	if err != nil {
+		return err
+	}
+	activeMu.Lock()
+	active = &n
+	activeMu.Unlock()
+	return nil
+}
+
+// ResetIdentity returns the active identity to the launched profile.
+func ResetIdentity() {
+	activeMu.Lock()
+	active = nil
+	activeMu.Unlock()
+}
+
+// withSuffix inserts ".<name>" before the extension of base when name is not
+// empty: "kiro-auth-token.json" -> "kiro-auth-token.agentes.json".
+func withSuffix(base, n string) string {
 	if n == "" {
 		return base
 	}
@@ -94,17 +150,34 @@ func suffixed(base string) string {
 	return strings.TrimSuffix(base, ext) + "." + n + ext
 }
 
-// TokenFileName is the file name of the Kiro token for the active profile.
-func TokenFileName() string { return suffixed("kiro-auth-token.json") }
+// suffixed names a file of the launched profile.
+func suffixed(base string) string { return withSuffix(base, Name()) }
 
-// LoginConfigFileName is the file name of the saved login choice for the active profile.
-func LoginConfigFileName() string { return suffixed("claude2kiro-login-config.json") }
+// identitySuffixed names a file of the active identity.
+func identitySuffixed(base string) string { return withSuffix(base, Active()) }
 
-// ProxyPortFileName is the file name of the live-proxy port marker for the active profile.
+// TokenFileName is the file name of the Kiro token for the active identity.
+func TokenFileName() string { return identitySuffixed("kiro-auth-token.json") }
+
+// TokenFileNameFor is the file name of the Kiro token for a given profile name
+// ("" for the default), used to check which fallback identities are logged in.
+func TokenFileNameFor(n string) string { return withSuffix("kiro-auth-token.json", n) }
+
+// LoginConfigFileName is the file name of the saved login choice for the active identity.
+func LoginConfigFileName() string { return identitySuffixed("claude2kiro-login-config.json") }
+
+// LoginConfigFileNameFor is LoginConfigFileName for a given profile name.
+func LoginConfigFileNameFor(n string) string { return withSuffix("claude2kiro-login-config.json", n) }
+
+// ProxyPortFileName is the file name of the live-proxy port marker for the launched profile.
 func ProxyPortFileName() string { return suffixed("proxy.port") }
 
-// CreditHistoryFileName is the file name of the credit history for the active profile.
-func CreditHistoryFileName() string { return suffixed("credit-history.jsonl") }
+// CreditHistoryFileName is the file name of the credit history for the active identity.
+func CreditHistoryFileName() string { return identitySuffixed("credit-history.jsonl") }
+
+// CreditHistoryFileNameFor is the file name of the credit history of a given
+// profile name ("" for the default).
+func CreditHistoryFileNameFor(n string) string { return withSuffix("credit-history.jsonl", n) }
 
 // ConfigSavePath is where the active profile's configuration is written:
 // config.<profile>.yaml for a named profile, config.yaml for the default. A

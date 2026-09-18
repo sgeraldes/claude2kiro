@@ -16,23 +16,23 @@ mkdir -p dist
 
 # Windows AMD64
 echo "Building Windows AMD64..."
-GOOS=windows GOARCH=amd64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-windows-amd64.exe main.go
+GOOS=windows GOARCH=amd64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-windows-amd64.exe .
 
 # Linux AMD64
 echo "Building Linux AMD64..."
-GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-linux-amd64 main.go
+GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-linux-amd64 .
 
 # Linux ARM64
 echo "Building Linux ARM64..."
-GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-linux-arm64 main.go
+GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-linux-arm64 .
 
 # macOS AMD64 (Intel)
 echo "Building macOS AMD64..."
-GOOS=darwin GOARCH=amd64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-darwin-amd64 main.go
+GOOS=darwin GOARCH=amd64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-darwin-amd64 .
 
 # macOS ARM64 (Apple Silicon)
 echo "Building macOS ARM64..."
-GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-darwin-arm64 main.go
+GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/sgeraldes/claude2kiro/internal/tui/menu.Version=${VERSION}" -o dist/claude2kiro-darwin-arm64 .
 
 echo
 echo "Build successful! Binaries in dist/"

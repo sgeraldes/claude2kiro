@@ -24,23 +24,28 @@ type Snapshot struct {
 }
 
 // Reading is the live credit figure supplied by the caller's snapshot function.
+// Path, when set, is the history file the reading belongs to: the caller
+// resolved the identity it read for, and the recorder files the sample there
+// rather than under whatever identity is current by the time it writes.
 type Reading struct {
 	Used      float64
 	Limit     float64
 	Remaining float64
 	Plan      string
+	Path      string
 	Err       error
 }
 
 // Recorder periodically appends credit snapshots to a JSONL file and serves the
 // recent history back. It is safe for concurrent use.
 type Recorder struct {
-	path     string
+	pathFn   func() string
 	interval time.Duration
 	maxAge   time.Duration
 	read     func() Reading
 
 	mu   sync.RWMutex
+	path string // file the in-memory history belongs to
 	snap []Snapshot
 
 	startOnce sync.Once
@@ -50,7 +55,43 @@ type Recorder struct {
 // maxAge of history in the file at path. read returns the current credit figure
 // (typically a wrapper over cmd.GetCreditsInfo).
 func NewRecorder(path string, interval, maxAge time.Duration, read func() Reading) *Recorder {
-	return &Recorder{path: path, interval: interval, maxAge: maxAge, read: read}
+	return NewRecorderFor(func() string { return path }, interval, maxAge, read)
+}
+
+// NewRecorderFor is NewRecorder with the file resolved on every sample. The
+// proxy's history follows the identity whose credits it is reading (see the
+// quota failover in the main package), so the file can change while the
+// recorder runs; when it does, the in-memory history is reloaded from the new
+// file so two identities' balances are never shown as one series.
+func NewRecorderFor(pathFn func() string, interval, maxAge time.Duration, read func() Reading) *Recorder {
+	return &Recorder{pathFn: pathFn, path: pathFn(), interval: interval, maxAge: maxAge, read: read}
+}
+
+// track points the recorder at the file for the current identity, reloading
+// memory when the file changed since the last sample. Returns the path.
+func (r *Recorder) track() string {
+	p := r.pathFn()
+	r.mu.Lock()
+	changed := p != r.path
+	if changed {
+		// Path and series move together: until the new file is loaded the
+		// series is empty, never the previous identity's points under the
+		// new path.
+		r.path = p
+		r.snap = nil
+	}
+	r.mu.Unlock()
+	if changed {
+		r.load(p)
+	}
+	return p
+}
+
+// currentPath is the file the recorder is bound to right now.
+func (r *Recorder) currentPath() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.path
 }
 
 // Start loads existing history and launches the background sampling loop. It is
@@ -61,7 +102,7 @@ func (r *Recorder) Start() {
 		return
 	}
 	r.startOnce.Do(func() {
-		r.load()
+		r.load(r.track())
 		// Sample off the calling goroutine: read() is a network call, and Start
 		// runs inline in buildServerMux (TUI/server/run), so a slow Kiro API must
 		// not delay server startup. Loaded file history already fills the chart.
@@ -82,8 +123,20 @@ func (r *Recorder) loop() {
 
 // sampleOnce records one reading if it's valid (no error and a real limit).
 func (r *Recorder) sampleOnce() {
+	// Resolve the identity's file before reading and check it did not move
+	// while the read was out: a reading of identity B must not be appended
+	// to identity A's file.
+	before := r.track()
 	rd := r.read()
 	if rd.Err != nil || rd.Limit <= 0 {
+		return
+	}
+	// The reading's own file wins: it was resolved with the reading. Without
+	// one, the file is the one resolved before the read, provided nothing
+	// moved meanwhile.
+	if rd.Path != "" {
+		before = rd.Path
+	} else if r.pathFn() != before {
 		return
 	}
 	s := Snapshot{
@@ -94,17 +147,24 @@ func (r *Recorder) sampleOnce() {
 		Plan:      rd.Plan,
 	}
 
-	r.appendLine(s)
+	// Everything below is bound to the file the reading was taken for. The
+	// recorder may move to another identity's file at any moment (a History
+	// call after a switch does that); a sample of A is written to A's file or
+	// dropped, never to whichever file is current by then.
+	r.appendLine(before, s)
 
 	// Refresh memory from the file rather than only appending to our own
 	// slice: several proxies (a persistent server plus `run` instances) may
 	// sample to the same file, and re-reading makes each process's
 	// /credits/history converge on the union of everyone's samples.
-	if !r.reload() {
-		// File unreadable — keep the sample in memory so History still works.
+	if !r.reload(before) {
+		// File unreadable: keep the sample in memory so History still works,
+		// as long as memory still belongs to that file.
 		r.mu.Lock()
-		r.snap = append(r.snap, s)
-		r.prune()
+		if r.path == before {
+			r.snap = append(r.snap, s)
+			r.prune()
+		}
 		r.mu.Unlock()
 	}
 }
@@ -129,6 +189,9 @@ func (r *Recorder) History() []Snapshot {
 	if r == nil {
 		return nil
 	}
+	// The view follows the identity the proxy is on right now, even between
+	// samples: after a switch the previous identity's series is never shown.
+	r.track()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]Snapshot, len(r.snap))
@@ -136,17 +199,26 @@ func (r *Recorder) History() []Snapshot {
 	return out
 }
 
-// load reads the JSONL file into memory at startup, pruning stale points. If
-// pruning dropped lines, the file is compacted once. This is the only full
-// rewrite: steady-state persistence is append-only (see appendLine), so
-// concurrent proxies sampling to the same file can't clobber each other.
-func (r *Recorder) load() {
-	snaps, ok := r.readFile()
-	if !ok {
+// load reads the JSONL file at path into memory (at startup and when the
+// recorder moves to another file), pruning stale points. If pruning dropped
+// lines, the file is compacted once. This is the only full rewrite:
+// steady-state persistence is append-only (see appendLine), so concurrent
+// proxies sampling to the same file can't clobber each other. Memory is only
+// replaced while the recorder is still bound to path.
+func (r *Recorder) load(path string) {
+	snaps, ok := r.readFile(path)
+	r.mu.Lock()
+	if r.path != path {
+		r.mu.Unlock()
 		return
 	}
-
-	r.mu.Lock()
+	if !ok {
+		// No file for this identity yet: an empty series, not the previous
+		// identity's points.
+		r.snap = nil
+		r.mu.Unlock()
+		return
+	}
 	r.snap = snaps
 	r.prune()
 	pruned := len(snaps) - len(r.snap)
@@ -155,27 +227,30 @@ func (r *Recorder) load() {
 	r.mu.Unlock()
 
 	if pruned > 0 {
-		r.rewrite(kept)
+		r.rewrite(path, kept)
 	}
 }
 
-// reload refreshes the in-memory history from the file without rewriting it.
-// Returns false when the file can't be read.
-func (r *Recorder) reload() bool {
-	snaps, ok := r.readFile()
+// reload refreshes the in-memory history from the file at path without
+// rewriting it, if the recorder is still bound to that file. Returns false
+// when the file can't be read.
+func (r *Recorder) reload(path string) bool {
+	snaps, ok := r.readFile(path)
 	if !ok {
 		return false
 	}
 	r.mu.Lock()
-	r.snap = snaps
-	r.prune()
+	if r.path == path {
+		r.snap = snaps
+		r.prune()
+	}
 	r.mu.Unlock()
 	return true
 }
 
-// readFile parses the JSONL file, skipping malformed lines, oldest first.
-func (r *Recorder) readFile() ([]Snapshot, bool) {
-	f, err := os.Open(r.path)
+// readFile parses the JSONL file at path, skipping malformed lines, oldest first.
+func (r *Recorder) readFile(path string) ([]Snapshot, bool) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
 	}
@@ -198,22 +273,22 @@ func (r *Recorder) readFile() ([]Snapshot, bool) {
 	return snaps, true
 }
 
-// appendLine appends one snapshot as a JSONL line. O_APPEND lands each line
-// atomically, so multiple proxies writing to the same file interleave instead
-// of overwriting each other (the previous whole-file rewrite dropped every
-// sample the other process had recorded). Best-effort.
-func (r *Recorder) appendLine(s Snapshot) {
-	if r.path == "" {
+// appendLine appends one snapshot as a JSONL line to the file at path.
+// O_APPEND lands each line atomically, so multiple proxies writing to the same
+// file interleave instead of overwriting each other (the previous whole-file
+// rewrite dropped every sample the other process had recorded). Best-effort.
+func (r *Recorder) appendLine(path string, s Snapshot) {
+	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(r.path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return
 	}
 	data, err := json.Marshal(s)
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
@@ -221,16 +296,16 @@ func (r *Recorder) appendLine(s Snapshot) {
 	f.Write(append(data, '\n'))
 }
 
-// rewrite atomically replaces the JSONL file with the given snapshots. Only
-// used by load() to compact stale lines at startup. Best-effort.
-func (r *Recorder) rewrite(snaps []Snapshot) {
-	if r.path == "" {
+// rewrite atomically replaces the JSONL file at path with the given
+// snapshots. Only used by load() to compact stale lines. Best-effort.
+func (r *Recorder) rewrite(path string, snaps []Snapshot) {
+	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(r.path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return
 	}
-	tmp := r.path + ".tmp"
+	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return
@@ -244,7 +319,7 @@ func (r *Recorder) rewrite(snaps []Snapshot) {
 	}
 	w.Flush()
 	f.Close()
-	if err := os.Rename(tmp, r.path); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp) // don't leave the temp file behind (e.g. Windows rename contention)
 	}
 }

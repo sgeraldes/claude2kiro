@@ -18,6 +18,7 @@ import (
 	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/profile"
+	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 	"github.com/sgeraldes/claude2kiro/internal/tui/messages"
 )
@@ -91,7 +92,7 @@ func GetClientRegistrationPath(clientIdHash string) string {
 func GetToken() (TokenData, error) {
 	tokenPath := GetTokenFilePath()
 
-	data, err := os.ReadFile(tokenPath)
+	data, err := tokenfile.ReadFile(tokenPath)
 	if err != nil {
 		return TokenData{}, fmt.Errorf("failed to read token file: %v", err)
 	}
@@ -273,44 +274,6 @@ func RefreshTokenSocial(currentToken TokenData) (TokenData, error) {
 	}, nil
 }
 
-// TryRefreshToken attempts to refresh the token without exiting on failure
-func TryRefreshToken() error {
-	tokenPath := GetTokenFilePath()
-
-	data, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return fmt.Errorf("failed to read token file: %v", err)
-	}
-
-	var currentToken TokenData
-	if err := json.Unmarshal(data, &currentToken); err != nil {
-		return fmt.Errorf("failed to parse token file: %v", err)
-	}
-
-	var newToken TokenData
-
-	if currentToken.AuthMethod == "IdC" {
-		newToken, err = RefreshTokenIdC(currentToken)
-	} else {
-		newToken, err = RefreshTokenSocial(currentToken)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	newData, err := json.MarshalIndent(newToken, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to serialize new token: %v", err)
-	}
-
-	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
-		return fmt.Errorf("failed to write token file: %v", err)
-	}
-
-	return nil
-}
-
 // Message types for TUI commands
 
 // LoginResultMsg carries the result of a login attempt
@@ -347,22 +310,6 @@ func LoginCmd() tea.Msg {
 	return StatusMsg{
 		Message: "Login requires running 'claude2kiro login' separately for now",
 		IsError: false,
-	}
-}
-
-// RefreshTokenCmd returns a function that refreshes the token
-func RefreshTokenCmd() tea.Msg {
-	err := TryRefreshToken()
-	if err != nil {
-		return RefreshResultMsg{
-			Success: false,
-			Err:     err,
-		}
-	}
-
-	return RefreshResultMsg{
-		Success:   true,
-		ExpiresAt: GetTokenExpiry(),
 	}
 }
 
@@ -403,18 +350,70 @@ func ExportEnvCmd() tea.Msg {
 	}
 }
 
-// LogoutCmd returns a function that logs out
+// LoginFilesFor returns the login config and token file paths of the
+// identity name ("" = default), so a caller that read the active name once
+// gets both files of that same identity.
+func LoginFilesFor(name string) (configPath, tokenPath string) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", ""
+	}
+	dir := filepath.Join(homeDir, ".aws", "sso", "cache")
+	return filepath.Join(dir, profile.LoginConfigFileNameFor(name)), filepath.Join(dir, profile.TokenFileNameFor(name))
+}
+
+// LogoutCmd logs the active identity out.
 func LogoutCmd() tea.Msg {
-	configPath := filepath.Join(filepath.Dir(GetTokenFilePath()), profile.LoginConfigFileName())
-	tokenPath := GetTokenFilePath()
+	return LogoutAt(LoginFilesFor(profile.Active()))
+}
 
-	os.Remove(configPath)
-	os.Remove(tokenPath)
-
+// LogoutAt removes the given login config and token files. The caller
+// resolves the paths, so a logout started on one identity ends on it.
+func LogoutAt(configPath, tokenPath string) tea.Msg {
+	configDeleted, tokenDeleted, err := RemoveLogin(configPath, tokenPath)
+	if err != nil {
+		return StatusMsg{Message: fmt.Sprintf("Logout failed: %v", err), IsError: true}
+	}
+	if !configDeleted && !tokenDeleted {
+		return StatusMsg{Message: "Already logged out (no saved credentials found)", IsError: false}
+	}
 	return StatusMsg{
 		Message: "Logged out successfully",
 		IsError: false,
 	}
+}
+
+// RemoveLogin deletes a login config and token file under the token file
+// lock, so a refresh or a discovery in flight in any process cannot write
+// them back. It reports which of the two existed and went, and the first
+// error other than a file already absent.
+func RemoveLogin(configPath, tokenPath string) (configDeleted, tokenDeleted bool, err error) {
+	unlock, err := tokenfile.Lock(tokenPath)
+	if err != nil {
+		return false, false, err
+	}
+	defer unlock()
+	configDeleted, err = removeIfPresent(configPath)
+	if err != nil {
+		return false, false, err
+	}
+	tokenDeleted, err = removeIfPresent(tokenPath)
+	if err != nil {
+		return configDeleted, false, err
+	}
+	_, _ = removeIfPresent(tokenfile.RenewedPath(tokenPath)) // a renewed token waiting for the file goes with the login
+	return configDeleted, tokenDeleted, nil
+}
+
+func removeIfPresent(path string) (bool, error) {
+	err := os.Remove(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // addToWindowsPath adds a directory to the user PATH environment variable

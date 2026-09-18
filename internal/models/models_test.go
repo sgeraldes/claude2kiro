@@ -392,3 +392,44 @@ func TestRenderModelsAPIEmpty(t *testing.T) {
 		t.Error("empty list should have null first_id/last_id")
 	}
 }
+
+// R04: a fetch that was already in flight when the catalog was invalidated
+// (identity switch) belongs to the previous identity; its result is dropped
+// and the list is fetched again for the current one.
+func TestCatalogDiscardsAFetchThatPredatesInvalidate(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls int32
+	var mu sync.Mutex
+	c := NewCatalog(10*time.Minute, func() ([]KiroModel, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			close(entered)
+			<-release
+			return []KiroModel{{ModelID: "only-A"}}, nil
+		}
+		return []KiroModel{{ModelID: "only-B"}}, nil
+	})
+	done := make(chan []KiroModel, 1)
+	go func() { done <- c.Models() }()
+	<-entered
+	c.Invalidate()
+	close(release)
+	got := <-done
+
+	if len(got) != 1 || got[0].ModelID != "only-B" {
+		t.Fatalf("the list published after the switch must be the current identity's: %+v", got)
+	}
+	if !c.Has("only-B") || c.Has("only-A") {
+		t.Fatalf("ids: only-B=%v only-A=%v", c.Has("only-B"), c.Has("only-A"))
+	}
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("fetches=%d, want 2 (the pre-switch result was discarded and refetched)", n)
+	}
+}

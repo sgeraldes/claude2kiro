@@ -17,6 +17,9 @@ import (
 func setTestHome(t *testing.T, dir string) {
 	t.Helper()
 	config.Set(config.Default())
+	// An exported CLAUDE_CONFIG_DIR (an isolated profile in the developer's
+	// shell) would redirect seeding out of the temp home; empty means unset.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	if runtime.GOOS == "windows" {
 		t.Setenv("USERPROFILE", dir)
 	} else {

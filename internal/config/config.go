@@ -19,7 +19,16 @@ type Config struct {
 	Display  DisplayConfig  `yaml:"display"`
 	Network  NetworkConfig  `yaml:"network"`
 	Advanced AdvancedConfig `yaml:"advanced"`
+	Auth     AuthConfig     `yaml:"auth,omitempty"`
 	Filter   FilterConfig   `yaml:"filter,omitempty"`
+}
+
+// AuthConfig holds identity settings. One Kiro subscription is one Identity
+// Center user and one monthly credit pool; FallbackProfiles lists the profiles
+// (see internal/profile, logged in with CLAUDE2KIRO_PROFILE=<name>) the proxy
+// switches to, in order, when the active pool answers 402 MONTHLY_REQUEST_COUNT.
+type AuthConfig struct {
+	FallbackProfiles []string `yaml:"fallback_profiles,omitempty"`
 }
 
 // ServerConfig holds server-related settings
@@ -81,6 +90,7 @@ type AdvancedConfig struct {
 	ProfilesEndpoint      string `yaml:"profiles_endpoint"` // ListAvailableProfiles (IdC profileArn discovery)
 	KiroAuthEndpoint      string `yaml:"kiro_auth_endpoint"`
 	KiroRefreshEndpoint   string `yaml:"kiro_refresh_endpoint"`
+	SSOOIDCTokenEndpoint  string `yaml:"sso_oidc_token_endpoint,omitempty"` // Override for the IdC token refresh URL (default https://oidc.<region>.amazonaws.com/token); tests point it at a local server
 	KiroUsageURL          string `yaml:"kiro_usage_url"`
 	AWSRegion             string `yaml:"aws_region"`
 	ComparisonMode        bool   `yaml:"comparison_mode"`         // Debug: send to both Anthropic and Kiro
@@ -216,8 +226,19 @@ func Load() (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return Default(), err // Return defaults on parse error
 	}
+	cfg.normalize()
 
 	return cfg, nil
+}
+
+// normalize replaces values that would break the proxy with their defaults.
+// An HTTP timeout of zero means no timeout at all for net/http, and the
+// failover holds the identity lock during a refresh: with no timeout a stuck
+// identity provider would hold every request.
+func (c *Config) normalize() {
+	if c.Network.HTTPTimeout <= 0 {
+		c.Network.HTTPTimeout = Default().Network.HTTPTimeout
+	}
 }
 
 // Save saves the configuration to file
@@ -280,6 +301,9 @@ func Get() *Config {
 
 // Set installs a new current configuration (atomic pointer swap).
 func Set(cfg *Config) {
+	if cfg != nil {
+		cfg.normalize()
+	}
 	currentMu.Lock()
 	current = cfg
 	currentMu.Unlock()
