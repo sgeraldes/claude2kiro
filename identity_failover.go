@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/profile"
@@ -23,22 +24,67 @@ import (
 // fallback that has a token file, rebuilds the request with that identity's
 // bearer and profileArn, and retries. The client never sees the 402.
 //
+// Every token a handler sends is paired with the identityRef it was read
+// under. A response is only allowed to act on the identity that produced it:
+// a late 402 or 403 from identity A, arriving after another request already
+// moved the proxy to B, adopts B's token instead of touching B's state. The
+// generation counter is what makes "already moved" detectable.
+//
 // The switch is sticky for the life of the process: a pool that is empty today
 // stays empty until its monthly reset, and the proxy has no way to learn that
 // reset except by trying, which would put every request through a dead
 // identity first. Restart the proxy (or the run) to go back to the primary.
 
+// identityRef names an identity at a point in time. Gen changes on every
+// switch, so two refs with the same Name but different Gen are different
+// eras of the proxy and a stale ref never acts on the current identity.
+type identityRef struct {
+	Name string
+	Gen  uint64
+}
+
 var (
-	identityMu sync.Mutex
+	identityMu  sync.Mutex
+	identityGen uint64
 	// exhaustedIdentities remembers which identities answered 402 in this
 	// process, by profile name ("" = default), so they are never retried.
 	exhaustedIdentities = map[string]bool{}
 )
 
+// currentIdentity is the identity the proxy is on right now.
+func currentIdentity() identityRef {
+	identityMu.Lock()
+	defer identityMu.Unlock()
+	return identityRef{Name: profile.Active(), Gen: identityGen}
+}
+
+// tokenForRequest reads the active identity's token and returns it together
+// with the identity it belongs to. If a switch lands in the middle of the read
+// the pair would be inconsistent, so the read is repeated until the identity
+// observed before and after is the same.
+func tokenForRequest() (TokenData, identityRef, error) {
+	var lastErr error
+	for range 3 {
+		before := currentIdentity()
+		tok, err := getToken()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if currentIdentity() == before {
+			return tok, before, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("identity kept changing while reading the token")
+	}
+	return TokenData{}, identityRef{}, lastErr
+}
+
 // isMonthlyQuotaExceeded reports whether an upstream answer means this
-// identity cannot serve requests any more. Kiro uses 402 for the monthly credit
-// pool (reason MONTHLY_REQUEST_COUNT) and for a missing subscription; neither
-// can be fixed by retrying with the same token.
+// identity cannot serve requests any more. Kiro answers 402 with reason
+// MONTHLY_REQUEST_COUNT when the monthly credit pool is gone (verified against
+// the DFX5 account on 2026-09-17); no retry with the same token can succeed.
 func isMonthlyQuotaExceeded(status int, body []byte) bool {
 	return status == 402
 }
@@ -58,58 +104,88 @@ func quotaReason(body []byte) string {
 // identityHasToken reports whether a profile was ever logged in on this
 // machine, i.e. its token file exists.
 func identityHasToken(name string) bool {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return false
-	}
-	_, err = os.Stat(filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileNameFor(name)))
+	_, err := os.Stat(tokenFilePathFor(name))
 	return err == nil
 }
 
-// switchToFallbackIdentity marks the active identity exhausted and moves to the
-// next configured fallback that is logged in and not exhausted. It returns the
-// new identity's token, or an error naming every identity that is out of
-// credits when none is left. Concurrent requests that hit 402 at the same time
-// serialize here, so only the first one performs the switch; the others find
-// the identity already moved and simply retry with the new token.
-func switchToFallbackIdentity() (TokenData, error) {
+// tokenFilePathFor is the token file of a given profile name ("" = default).
+func tokenFilePathFor(name string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileNameFor(name))
+}
+
+// switchToFallbackIdentity is called with the identity whose token answered
+// 402. If the proxy already moved past that identity (another request hit the
+// 402 first), it returns the current identity's token without touching any
+// state. Otherwise it marks the identity exhausted and moves to the next
+// configured fallback that is logged in and not exhausted, refreshing its
+// token when it is stale. With nothing left it returns an error naming every
+// exhausted identity; the proxy stays where it was.
+func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error) {
 	identityMu.Lock()
-	defer identityMu.Unlock()
+	if failed.Gen != identityGen || failed.Name != profile.Active() {
+		// Someone else already switched: adopt the current identity.
+		identityMu.Unlock()
+		return tokenForRequest()
+	}
+	exhaustedIdentities[failed.Name] = true
 
 	cfg := config.Get()
-	current := profile.Active()
-	exhaustedIdentities[current] = true
-
 	candidates := append([]string{profile.Name()}, cfg.Auth.FallbackProfiles...)
+	var chosen *identityRef
 	for _, raw := range candidates {
 		name, err := profile.Validate(raw)
-		if err != nil {
-			continue
-		}
-		if exhaustedIdentities[name] || !identityHasToken(name) {
+		if err != nil || exhaustedIdentities[name] || !identityHasToken(name) {
 			continue
 		}
 		if err := profile.SwitchTo(name); err != nil {
 			continue
 		}
+		identityGen++
 		invalidateTokenCache()
-		tok, err := getToken()
-		if err != nil {
-			// The file exists but cannot be read: do not leave the proxy on a
-			// broken identity, try the next one.
+		if _, err := getToken(); err != nil {
+			// The file exists but cannot be read: not a usable reserve.
 			exhaustedIdentities[name] = true
 			continue
 		}
-		return tok, nil
+		chosen = &identityRef{Name: name, Gen: identityGen}
+		break
 	}
+	if chosen == nil {
+		// Nothing left: stay on the identity that failed so the caller reports it.
+		_ = profile.SwitchTo(failed.Name)
+		invalidateTokenCache()
+		err := fmt.Errorf("every configured identity is out of Kiro credits: %s", strings.Join(exhaustedLabels(), ", "))
+		identityMu.Unlock()
+		return TokenData{}, failed, err
+	}
+	identityMu.Unlock()
 
-	// Nothing left: stay on the current identity so the caller reports it.
-	_ = profile.SwitchTo(current)
-	invalidateTokenCache()
-	return TokenData{}, fmt.Errorf("every configured identity is out of Kiro credits: %s", strings.Join(exhaustedLabels(), ", "))
+	// A reserve that was logged in days ago may hold an expired access token;
+	// renew it now so the retry does not bounce on a 403 as well.
+	if tok, err := getToken(); err == nil && tokenIsStale(tok) {
+		_ = tryRefreshToken()
+	}
+	return tokenForRequest()
+}
+
+// tokenIsStale reports whether the access token is expired or about to be.
+func tokenIsStale(tok TokenData) bool {
+	if tok.ExpiresAt == "" {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, tok.ExpiresAt)
+	if err != nil {
+		return false
+	}
+	return time.Until(expiresAt) <= 5*time.Minute
 }
 
 // exhaustedLabels lists the identities that answered 402 in this process.
+// Caller holds identityMu.
 func exhaustedLabels() []string {
 	names := make([]string, 0, len(exhaustedIdentities))
 	for name := range exhaustedIdentities {
@@ -128,14 +204,15 @@ func exhaustedLabels() []string {
 func invalidateTokenCache() {
 	tokenMutex.Lock()
 	cachedToken = nil
+	cachedIdentity = ""
 	tokenMutex.Unlock()
 }
 
 // quotaExhaustedMessage is what the client sees when no identity can serve.
 func quotaExhaustedMessage(reason string, err error) string {
 	return fmt.Sprintf("Kiro credits exhausted (%s): %v. Log in another subscribed identity with "+
-		"CLAUDE2KIRO_PROFILE=<name> claude2kiro login and list it under auth.fallback_profiles in ~/.claude2kiro/config.yaml, "+
-		"or wait for the monthly reset (claude2kiro credits --all).", reason, err)
+		"CLAUDE2KIRO_PROFILE=<name> claude2kiro login and list it under auth.fallback_profiles in the config file "+
+		"this proxy reads, or wait for the monthly reset (claude2kiro credits --all).", reason, err)
 }
 
 // resetIdentityState returns the proxy to the launched identity and forgets
@@ -143,6 +220,7 @@ func quotaExhaustedMessage(reason string, err error) string {
 func resetIdentityState() {
 	identityMu.Lock()
 	exhaustedIdentities = map[string]bool{}
+	identityGen++
 	identityMu.Unlock()
 	profile.ResetIdentity()
 	invalidateTokenCache()

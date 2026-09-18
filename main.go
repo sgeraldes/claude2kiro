@@ -873,8 +873,8 @@ func creditHistoryFilePath() string {
 
 // creditRecorder samples Kiro credit usage every 15 minutes and keeps 30 days of
 // history so the web dashboard can chart usage, burn rate, and projected runout.
-var creditRecorder = creditshist.NewRecorder(
-	creditHistoryFilePath(),
+var creditRecorder = creditshist.NewRecorderFor(
+	creditHistoryFilePath, // follows the active identity after a quota failover
 	15*time.Minute,
 	30*24*time.Hour,
 	func() creditshist.Reading {
@@ -914,7 +914,10 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 // returned function stops the goroutine.
 func startTokenRefresher(lg *logger.Logger) func() {
 	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		refresh := func() {
 			if err := refreshTokenIfStale(); err != nil {
 				lg.LogError(fmt.Sprintf("Background token refresh failed: %v", err))
@@ -933,7 +936,15 @@ func startTokenRefresher(lg *logger.Logger) func() {
 		}
 	}()
 	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	// stop closes the channel and waits for the goroutine, so nothing the
+	// caller tears down afterwards (token cache, env, temp dirs) is still in
+	// use by a refresh in flight.
+	return func() {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
 }
 
 // refreshTokenIfStale refreshes the saved token when it is expired or expiring
@@ -1937,8 +1948,13 @@ func selectProfileArn(profiles []kiroProfile) string {
 // IDE's stored profile (authoritative), then via the ListAvailableProfiles API
 // with a conservative selection. Returns "" if none can be determined safely.
 func discoverProfileArn(accessToken string) string {
-	if arn := readKiroProfileArn(); arn != "" {
-		return arn
+	// Kiro IDE's stored profile belongs to whoever is signed into the IDE,
+	// which is the launched identity at best. A fallback identity must not
+	// borrow it: ask the API with its own bearer.
+	if profile.Active() == profile.Name() {
+		if arn := readKiroProfileArn(); arn != "" {
+			return arn
+		}
 	}
 	return selectProfileArn(fetchProfilesFromAPI(accessToken))
 }
@@ -4469,10 +4485,34 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	var resp *http.Response
 	var lastErr error
 
+	// Every attempt goes out with a token and the identity it was read for
+	// (see identity_failover.go). A 402 or 403 acts on that identity only.
+	ident := currentIdentity()
+	if tok, id, terr := tokenForRequest(); terr == nil {
+		token, ident = tok, id
+	}
+	// adopt switches the request to another token: bearer for the header and
+	// profileArn in the body, everything else (conversationId, history) kept.
+	adopt := func(tok TokenData, id identityRef) error {
+		token, ident = tok, id
+		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		body, merr := jsonStr.Marshal(cwReq)
+		if merr != nil {
+			return merr
+		}
+		cwReqBody = body
+		return nil
+	}
+
 	const maxAttempts = 5
-	refreshedOnce := false // one transparent token refresh per request (see 403 branch)
-	for attempt := range maxAttempts {
-		if attempt > 0 {
+	// Identity switches do not spend the transient-error budget and do not
+	// wait for the backoff; they are bounded by the number of identities.
+	maxSwitches := len(cfg.Auth.FallbackProfiles) + 1
+	switches := 0
+	skipBackoff := false
+	refreshedFor := map[string]bool{} // one transparent token refresh per identity per request
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 || skipBackoff {
 			// Recreate request for retry (body was consumed)
 			proxyReq, err = http.NewRequest(
 				http.MethodPost,
@@ -4487,7 +4527,10 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			proxyReq.Header.Set("Content-Type", "application/json")
 			proxyReq.Header.Set("Accept", "text/event-stream")
 			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
-			time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
+			if !skipBackoff {
+				time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
+			}
+			skipBackoff = false
 		}
 
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
@@ -4503,6 +4546,33 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// Read error body
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+
+		// The identity's monthly credit pool is gone (402). Move to the next
+		// configured fallback identity and resend with its bearer and
+		// profileArn; the client never sees the 402. Classified before the
+		// attempt budget on purpose: a 402 is never a transient error, and a
+		// switch must not be lost because earlier attempts were retried.
+		if isMonthlyQuotaExceeded(resp.StatusCode, body) {
+			reason := quotaReason(body)
+			fallback, next, ferr := switchToFallbackIdentity(ident)
+			if ferr != nil || switches >= maxSwitches {
+				if ferr == nil {
+					ferr = fmt.Errorf("identity switches exhausted after %d", switches)
+				}
+				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel(), reason, ferr))
+				sendNonRetryableErrorEvent(w, flusher, quotaExhaustedMessage(reason, ferr))
+				return ""
+			}
+			switches++
+			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+			if err := adopt(fallback, next); err != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", err)
+				return ""
+			}
+			attempt--
+			skipBackoff = true
+			continue
+		}
 
 		// Permanent 400s cannot succeed when resent unchanged. Classify the known
 		// structured reasons once and reuse them in both retry and error handling.
@@ -4520,47 +4590,41 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		// whole ~240k-token request, adding load and desynchronizing into waves.
 		overloaded := isTransientOverload(resp.StatusCode, body)
 
-		// The identity's monthly credit pool is gone (402). Move to the next
-		// configured fallback identity and resend with its bearer and
-		// profileArn; the client never sees the 402. With nothing left to
-		// switch to, the error is terminal: no retry can succeed this month.
-		if isMonthlyQuotaExceeded(resp.StatusCode, body) && attempt < maxAttempts-1 {
-			reason := quotaReason(body)
-			fallback, ferr := switchToFallbackIdentity()
-			if ferr != nil {
-				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel(), reason, ferr))
-				sendNonRetryableErrorEvent(w, flusher, quotaExhaustedMessage(reason, ferr))
-				return ""
-			}
-			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
-			token = fallback
-			cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, fallback).ProfileArn
-			if cwReqBody, err = jsonStr.Marshal(cwReq); err != nil {
-				sendErrorEvent(w, flusher, "Failed to serialize request", err)
-				return ""
-			}
-			continue
-		}
-
 		// Transparent recovery from an expired/invalid bearer token: the token
-		// lapsed mid-session (common on long runs). Refresh once and retry with
-		// the new token so the client never sees the 403 — previously the proxy
-		// refreshed but bounced "please retry" back to the caller, which had to
-		// intervene manually. Only once per request, so a genuinely dead refresh
-		// token can't spin a refresh loop; a still-403 after refresh falls
+		// lapsed mid-session (common on long runs). If the proxy already moved
+		// to another identity while this request was in flight, adopt that
+		// identity's token instead of refreshing a bearer nobody uses any more.
+		// Otherwise refresh once per identity and retry with the new token so
+		// the client never sees the 403; a still-403 after refresh falls
 		// through to the terminal error path below.
-		if resp.StatusCode == 403 && isInvalidBearerToken(body) && !refreshedOnce && attempt < maxAttempts-1 {
-			refreshedOnce = true
-			if err := tryRefreshToken(); err != nil {
-				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], err))
-				// Fall through to the terminal 403 handler, which surfaces a
-				// clear "refresh failed, please re-login" to the client.
-			} else {
-				if refreshed, gerr := getToken(); gerr == nil {
-					token = refreshed // next iteration rebuilds the request with the new token
+		if resp.StatusCode == 403 && isInvalidBearerToken(body) && attempt < maxAttempts-1 {
+			if cur := currentIdentity(); cur != ident {
+				if tok, id, terr := tokenForRequest(); terr == nil {
+					lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+					if err := adopt(tok, id); err != nil {
+						sendErrorEvent(w, flusher, "Failed to serialize request", err)
+						return ""
+					}
+					attempt--
+					skipBackoff = true
+					continue
 				}
-				lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
-				continue
+			} else if !refreshedFor[ident.Name] {
+				refreshedFor[ident.Name] = true
+				if err := tryRefreshToken(); err != nil {
+					lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], err))
+					// Fall through to the terminal 403 handler, which surfaces a
+					// clear "refresh failed, please re-login" to the client.
+				} else {
+					if tok, id, terr := tokenForRequest(); terr == nil {
+						if err := adopt(tok, id); err != nil {
+							sendErrorEvent(w, flusher, "Failed to serialize request", err)
+							return ""
+						}
+					}
+					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
+					continue
+				}
 			}
 		}
 
@@ -4852,13 +4916,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 // getTokenFilePath returns the cross-platform token file path
 func getTokenFilePath() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Printf("Failed to get user home directory: %v\n", err)
+	path := tokenFilePathFor(profile.Active())
+	if path == "" {
+		fmt.Println("Failed to get user home directory")
 		os.Exit(1)
 	}
-
-	return filepath.Join(homeDir, ".aws", "sso", "cache", profile.TokenFileName())
+	return path
 }
 
 // getLoginConfigPath returns the path for login config file
@@ -5219,15 +5282,24 @@ func printAllIdentitiesCredits() bool {
 		}
 		fmt.Printf("== %s (%s)\n", label, role)
 		if !identityHasToken(name) {
-			hint := "claude2kiro login"
-			if name != "" {
-				hint = "CLAUDE2KIRO_PROFILE=" + name + " " + hint
+			// Select the profile explicitly even for the default one, so a shell
+			// that exported CLAUDE2KIRO_PROFILE does not log the wrong identity in.
+			hint := "CLAUDE2KIRO_PROFILE=" + name + " claude2kiro login"
+			if name == "" {
+				hint = "CLAUDE2KIRO_PROFILE= claude2kiro login"
 			}
 			fmt.Printf("not logged in: %s\n\n", hint)
 			continue
 		}
 		if err := profile.SwitchTo(name); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			ok = false
+			continue
+		}
+		invalidateTokenCache()
+		// A reserve logged in days ago may hold an expired access token.
+		if err := refreshTokenIfStale(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s: %v\n", label, err)
 			ok = false
 			continue
 		}
@@ -6157,8 +6229,14 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 
 // saveToken saves the token to the token file
 func saveToken(token *TokenData) error {
-	tokenPath := getTokenFilePath()
+	return saveTokenTo(getTokenFilePath(), token)
+}
 
+// saveTokenTo writes token to an explicit file. Token operations capture the
+// path of the identity they started with and write back there, so a refresh
+// or discovery for identity A that finishes after a failover to B never lands
+// in B's file.
+func saveTokenTo(tokenPath string, token *TokenData) error {
 	// Ensure directory exists
 	dir := filepath.Dir(tokenPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -6320,6 +6398,7 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 		ExpiresAt:    expiresAt.Format(time.RFC3339),
 		AuthMethod:   currentToken.AuthMethod,
 		Provider:     currentToken.Provider,
+		ProfileArn:   currentToken.ProfileArn,
 		ClientIdHash: currentToken.ClientIdHash,
 		Region:       currentToken.Region,
 		StartUrl:     currentToken.StartUrl,
@@ -6384,11 +6463,16 @@ func tryRefreshToken() error {
 	tokenRefreshMutex.Lock()
 	defer tokenRefreshMutex.Unlock()
 
-	tokenMutex.Lock()
-	cachedToken = nil
-	tokenMutex.Unlock()
+	invalidateTokenCache()
 
-	tokenPath := getTokenFilePath()
+	// Capture the identity and its file up front: everything below writes
+	// back to this path and publishes under this name, whatever the active
+	// identity is by the time the HTTP call returns.
+	identityName := profile.Active()
+	tokenPath := tokenFilePathFor(identityName)
+	if tokenPath == "" {
+		return fmt.Errorf("failed to get user home directory")
+	}
 
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
@@ -6430,6 +6514,7 @@ func tryRefreshToken() error {
 	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
+	publishToken(identityName, newToken)
 
 	fmt.Println("Token refreshed successfully")
 	return nil
@@ -6480,9 +6565,16 @@ func setClaude() {
 	fmt.Println("Claude config file updated successfully")
 }
 
-// getToken retrieves the current token
+// getToken retrieves the current token.
+//
+// The cache is keyed by the identity it was read for: after a failover the
+// active identity changes and a cached token of the previous one must not be
+// handed out. The token file path is captured once at the start so that the
+// profileArn discovery below writes back to the file it read from, even if
+// the active identity moved while the discovery call was in flight.
 var (
 	cachedToken     *TokenData
+	cachedIdentity  string
 	cachedTokenTime time.Time
 	tokenMutex      sync.Mutex
 )
@@ -6491,12 +6583,17 @@ func getToken() (TokenData, error) {
 	tokenMutex.Lock()
 	defer tokenMutex.Unlock()
 
+	name := profile.Active()
+
 	// Use cache if it's fresh (less than 1 minute old, to pick up manual file edits)
-	if cachedToken != nil && time.Since(cachedTokenTime) < time.Minute {
+	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < time.Minute {
 		return *cachedToken, nil
 	}
 
-	tokenPath := getTokenFilePath()
+	tokenPath := tokenFilePathFor(name)
+	if tokenPath == "" {
+		return TokenData{}, fmt.Errorf("failed to get user home directory")
+	}
 
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
@@ -6515,14 +6612,26 @@ func getToken() (TokenData, error) {
 	if token.AuthMethod == "IdC" && token.ProfileArn == "" {
 		if arn := discoverProfileArn(token.AccessToken); arn != "" {
 			token.ProfileArn = arn
-			_ = saveToken(&token) // best-effort
+			_ = saveTokenTo(tokenPath, &token) // best-effort, to the file we read
 		}
 	}
 
 	cachedToken = &token
+	cachedIdentity = name
 	cachedTokenTime = time.Now()
 
 	return token, nil
+}
+
+// publishToken installs a freshly written token in the cache for the identity
+// it belongs to, so readers between the write and the next cache expiry do not
+// keep handing out the previous bearer.
+func publishToken(name string, token TokenData) {
+	tokenMutex.Lock()
+	cachedToken = &token
+	cachedIdentity = name
+	cachedTokenTime = time.Now()
+	tokenMutex.Unlock()
 }
 
 // handleNonStreamRequest handles non-streaming requests. It returns the HTTP
@@ -6567,13 +6676,52 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 	}
+
+	// Token and the identity it was read for (see identity_failover.go).
+	ident := currentIdentity()
+	if tok, id, terr := tokenForRequest(); terr == nil {
+		token, ident = tok, id
+	}
 	setKiroHeaders(proxyReq, token)
 
+	logInfo := func(msg string) {
+		if lg != nil {
+			lg.LogInfo(msg)
+		}
+	}
+	logError := func(msg string) {
+		if lg != nil {
+			lg.LogError(msg)
+		}
+	}
+	// adopt rebuilds the outgoing request for another identity's token.
+	adopt := func(tok TokenData, id identityRef) error {
+		token, ident = tok, id
+		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		body, merr := jsonStr.Marshal(cwReq)
+		if merr != nil {
+			return merr
+		}
+		cwReqBody = body
+		req, rerr := http.NewRequest(http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
+		if rerr != nil {
+			return rerr
+		}
+		setKiroHeaders(req, tok)
+		proxyReq = req
+		return nil
+	}
+
 	// Send request. A 402 means this identity's monthly credit pool is gone:
-	// move to the next fallback identity (see identity_failover.go) and resend
-	// once per identity, so the client never sees the 402 while a pool is left.
+	// move to the next fallback identity and resend, once per identity, so the
+	// client never sees the 402 while a pool is left. A 403 for an expired
+	// bearer is refreshed once per identity, or replaced by the current
+	// identity's token when the proxy already moved on.
 	var resp *http.Response
 	var cwRespBody []byte
+	maxSwitches := len(cfg.Auth.FallbackProfiles) + 1
+	switches := 0
+	refreshedFor := map[string]bool{}
 	for {
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
@@ -6589,38 +6737,56 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			return http.StatusInternalServerError
 		}
 
-		if !isMonthlyQuotaExceeded(resp.StatusCode, cwRespBody) {
-			break
-		}
-		reason := quotaReason(cwRespBody)
-		fallback, ferr := switchToFallbackIdentity()
-		if ferr != nil {
-			if lg != nil {
-				lg.LogError(fmt.Sprintf("Credits exhausted (non-stream) identity=%s reason=%s: %v", profile.ActiveLabel(), reason, ferr))
+		if isMonthlyQuotaExceeded(resp.StatusCode, cwRespBody) {
+			reason := quotaReason(cwRespBody)
+			fallback, next, ferr := switchToFallbackIdentity(ident)
+			if ferr != nil || switches >= maxSwitches {
+				if ferr == nil {
+					ferr = fmt.Errorf("identity switches exhausted after %d", switches)
+				}
+				logError(fmt.Sprintf("Credits exhausted (non-stream) identity=%s reason=%s: %v", profile.ActiveLabel(), reason, ferr))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":  "error",
+					"error": map[string]any{"type": "invalid_request_error", "message": quotaExhaustedMessage(reason, ferr)},
+				})
+				return resp.StatusCode
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"type":  "error",
-				"error": map[string]any{"type": "invalid_request_error", "message": quotaExhaustedMessage(reason, ferr)},
-			})
-			return resp.StatusCode
+			switches++
+			logInfo(fmt.Sprintf("Credits exhausted (%s, non-stream) — switched to identity %s, retrying transparently", reason, profile.ActiveLabel()))
+			if err := adopt(fallback, next); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
+				return http.StatusInternalServerError
+			}
+			continue
 		}
-		if lg != nil {
-			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s, non-stream) — switched to identity %s, retrying transparently", reason, profile.ActiveLabel()))
+
+		if resp.StatusCode == 403 && isInvalidBearerToken(cwRespBody) {
+			if cur := currentIdentity(); cur != ident {
+				if tok, id, terr := tokenForRequest(); terr == nil {
+					logInfo(fmt.Sprintf("403 from identity %s after failover (non-stream) — retrying with identity %s", ident.Name, profile.ActiveLabel()))
+					if err := adopt(tok, id); err != nil {
+						http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
+						return http.StatusInternalServerError
+					}
+					continue
+				}
+			} else if !refreshedFor[ident.Name] {
+				refreshedFor[ident.Name] = true
+				if rerr := tryRefreshToken(); rerr != nil {
+					logError(fmt.Sprintf("Token refresh on 403 failed (non-stream): %v", rerr))
+				} else if tok, id, terr := tokenForRequest(); terr == nil {
+					logInfo("Token refreshed after 403 (non-stream) — retrying transparently")
+					if err := adopt(tok, id); err != nil {
+						http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
+						return http.StatusInternalServerError
+					}
+					continue
+				}
+			}
 		}
-		token = fallback
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, fallback).ProfileArn
-		if cwReqBody, err = jsonStr.Marshal(cwReq); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to serialize request: %v", err), http.StatusInternalServerError)
-			return http.StatusInternalServerError
-		}
-		proxyReq, err = http.NewRequest(http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to create retry request: %v", err), http.StatusInternalServerError)
-			return http.StatusInternalServerError
-		}
-		setKiroHeaders(proxyReq, fallback)
+		break
 	}
 
 	// Surface backend errors as real Anthropic error envelopes. An error JSON

@@ -142,8 +142,11 @@ CLAUDE2KIRO_PROFILE=agentes claude2kiro login --no-browser idc https://d5.awsapp
 
 #### Failover when a pool runs out
 
-Once both identities are logged in, list the spare ones in `~/.claude2kiro/config.yaml`
-and the proxy switches on its own when the active pool answers `402 MONTHLY_REQUEST_COUNT`:
+Once both identities are logged in, list the spare ones in the config file the proxy
+reads (`~/.claude2kiro/config.yaml`, or `config.<profile>.yaml` when the proxy was started
+under a named profile and that file exists) and the proxy switches on its own when the
+active pool answers `402 MONTHLY_REQUEST_COUNT`. `""` names the unnamed profile, so a
+proxy started as `agentes` can fall back to it with `fallback_profiles: [""]`:
 
 ```yaml
 auth:
@@ -151,8 +154,9 @@ auth:
 ```
 
 The request that hit the 402 is resent with the fallback identity's token and
-`profileArn`; the client never sees the error. The switch is sticky for the life of the
-proxy (an empty pool stays empty until its monthly reset), and only the token, login
+`profileArn` (refreshed first if it went stale); the client never sees the error. The
+switch is sticky for the life of the proxy: an empty pool stays empty until its monthly
+reset, so restart the proxy (or the run) to go back to the primary. Only the token, login
 config and credit history move: the port marker and the config stay with the profile the
 proxy was started as, so `run` keeps attaching to the right proxy. `/health` reports the
 identity in use in `X-Claude2Kiro-Identity`. When every listed identity is exhausted the

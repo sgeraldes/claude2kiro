@@ -35,12 +35,13 @@ type Reading struct {
 // Recorder periodically appends credit snapshots to a JSONL file and serves the
 // recent history back. It is safe for concurrent use.
 type Recorder struct {
-	path     string
+	pathFn   func() string
 	interval time.Duration
 	maxAge   time.Duration
 	read     func() Reading
 
 	mu   sync.RWMutex
+	path string // file the in-memory history belongs to
 	snap []Snapshot
 
 	startOnce sync.Once
@@ -50,7 +51,37 @@ type Recorder struct {
 // maxAge of history in the file at path. read returns the current credit figure
 // (typically a wrapper over cmd.GetCreditsInfo).
 func NewRecorder(path string, interval, maxAge time.Duration, read func() Reading) *Recorder {
-	return &Recorder{path: path, interval: interval, maxAge: maxAge, read: read}
+	return NewRecorderFor(func() string { return path }, interval, maxAge, read)
+}
+
+// NewRecorderFor is NewRecorder with the file resolved on every sample. The
+// proxy's history follows the identity whose credits it is reading (see the
+// quota failover in the main package), so the file can change while the
+// recorder runs; when it does, the in-memory history is reloaded from the new
+// file so two identities' balances are never shown as one series.
+func NewRecorderFor(pathFn func() string, interval, maxAge time.Duration, read func() Reading) *Recorder {
+	return &Recorder{pathFn: pathFn, path: pathFn(), interval: interval, maxAge: maxAge, read: read}
+}
+
+// track points the recorder at the file for the current identity, reloading
+// memory when the file changed since the last sample. Returns the path.
+func (r *Recorder) track() string {
+	p := r.pathFn()
+	r.mu.Lock()
+	changed := p != r.path
+	r.path = p
+	r.mu.Unlock()
+	if changed {
+		r.load()
+	}
+	return p
+}
+
+// currentPath is the file the recorder is bound to right now.
+func (r *Recorder) currentPath() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.path
 }
 
 // Start loads existing history and launches the background sampling loop. It is
@@ -61,7 +92,7 @@ func (r *Recorder) Start() {
 		return
 	}
 	r.startOnce.Do(func() {
-		r.load()
+		r.track()
 		// Sample off the calling goroutine: read() is a network call, and Start
 		// runs inline in buildServerMux (TUI/server/run), so a slow Kiro API must
 		// not delay server startup. Loaded file history already fills the chart.
@@ -82,8 +113,15 @@ func (r *Recorder) loop() {
 
 // sampleOnce records one reading if it's valid (no error and a real limit).
 func (r *Recorder) sampleOnce() {
+	// Resolve the identity's file before reading and check it did not move
+	// while the read was out: a reading of identity B must not be appended
+	// to identity A's file.
+	before := r.track()
 	rd := r.read()
 	if rd.Err != nil || rd.Limit <= 0 {
+		return
+	}
+	if r.pathFn() != before {
 		return
 	}
 	s := Snapshot{
@@ -175,7 +213,7 @@ func (r *Recorder) reload() bool {
 
 // readFile parses the JSONL file, skipping malformed lines, oldest first.
 func (r *Recorder) readFile() ([]Snapshot, bool) {
-	f, err := os.Open(r.path)
+	f, err := os.Open(r.currentPath())
 	if err != nil {
 		return nil, false
 	}
@@ -203,17 +241,18 @@ func (r *Recorder) readFile() ([]Snapshot, bool) {
 // of overwriting each other (the previous whole-file rewrite dropped every
 // sample the other process had recorded). Best-effort.
 func (r *Recorder) appendLine(s Snapshot) {
-	if r.path == "" {
+	path := r.currentPath()
+	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(r.path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return
 	}
 	data, err := json.Marshal(s)
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
@@ -224,13 +263,14 @@ func (r *Recorder) appendLine(s Snapshot) {
 // rewrite atomically replaces the JSONL file with the given snapshots. Only
 // used by load() to compact stale lines at startup. Best-effort.
 func (r *Recorder) rewrite(snaps []Snapshot) {
-	if r.path == "" {
+	path := r.currentPath()
+	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(r.path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return
 	}
-	tmp := r.path + ".tmp"
+	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return
@@ -244,7 +284,7 @@ func (r *Recorder) rewrite(snaps []Snapshot) {
 	}
 	w.Flush()
 	f.Close()
-	if err := os.Rename(tmp, r.path); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp) // don't leave the temp file behind (e.g. Windows rename contention)
 	}
 }

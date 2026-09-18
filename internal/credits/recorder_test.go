@@ -1,6 +1,7 @@
 package credits
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -125,3 +126,34 @@ var errTest = testErr("boom")
 type testErr string
 
 func (e testErr) Error() string { return string(e) }
+
+// The proxy's history follows the identity it is reading credits for: when
+// the resolved file changes between samples, the in-memory history is
+// reloaded from the new file and the new reading is appended there.
+func TestRecorderFollowsTheResolvedFile(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "a.jsonl")
+	rd := Reading{Used: 100, Limit: 1000, Remaining: 900, Plan: "A"}
+	r := NewRecorderFor(func() string { return current }, time.Hour, 24*time.Hour, func() Reading { return rd })
+
+	r.sampleOnce()
+	if h := r.History(); len(h) != 1 || h[0].Plan != "A" {
+		t.Fatalf("history on a: %+v", h)
+	}
+
+	current = filepath.Join(dir, "b.jsonl")
+	rd = Reading{Used: 5, Limit: 1000, Remaining: 995, Plan: "B"}
+	r.sampleOnce()
+	h := r.History()
+	if len(h) != 1 || h[0].Plan != "B" {
+		t.Fatalf("history must be b's alone after the switch: %+v", h)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b.jsonl")); err != nil {
+		t.Fatalf("b's file not written: %v", err)
+	}
+	a := NewRecorder(filepath.Join(dir, "a.jsonl"), time.Hour, 24*time.Hour, func() Reading { return Reading{} })
+	a.load()
+	if h := a.History(); len(h) != 1 || h[0].Plan != "A" {
+		t.Fatalf("a's file must keep only a's sample: %+v", h)
+	}
+}

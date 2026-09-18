@@ -68,6 +68,12 @@ func Validate(raw string) (string, error) {
 	if !validName.MatchString(raw) {
 		return "", fmt.Errorf("%s=%q is not a valid profile name: use letters, digits, '-' or '_' (max 64)", EnvVar, raw)
 	}
+	// "default" is how the unnamed profile presents itself (/health headers,
+	// messages); a profile literally called that would be indistinguishable
+	// from it wherever the label is compared.
+	if raw == DefaultLabel {
+		return "", fmt.Errorf("%s=%q is reserved for the unnamed profile; pick another name", EnvVar, raw)
+	}
 	return raw, nil
 }
 

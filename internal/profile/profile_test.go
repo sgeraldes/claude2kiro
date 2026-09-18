@@ -28,7 +28,7 @@ func TestValidateAcceptsSimpleNamesAndEmpty(t *testing.T) {
 }
 
 func TestValidateRejectsAnythingThatCouldResolveToAnotherIdentity(t *testing.T) {
-	for _, raw := range []string{"../", "a/b", "foo.bar", "evil name", "x\\y", ".", "..", "tab\tx", "ñandu", string(make([]byte, 65))} {
+	for _, raw := range []string{"../", "a/b", "foo.bar", "evil name", "x\\y", ".", "..", "tab\tx", "ñandu", "default", string(make([]byte, 65))} {
 		if _, err := Validate(raw); err == nil {
 			t.Errorf("%q: expected an error", raw)
 		}

@@ -52,6 +52,15 @@ claude2kiro login idc d5
 claude2kiro login idc my-company
 ```
 
+`--no-browser` prints the sign-in URL instead of opening the default browser, so a second
+identity can be signed in from a private window while the default browser holds the first
+one's session. Set `CLAUDE2KIRO_PROFILE=<name>` to keep that identity's token, login
+config and credit history under their own file names:
+
+```bash
+CLAUDE2KIRO_PROFILE=agentes claude2kiro login --no-browser idc d5
+```
+
 ### `claude2kiro run`
 
 Starts the local proxy and launches Claude Code through it.
@@ -154,7 +163,7 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro remote [args...]` | Launch Claude Code against an already-running proxy |
 | `claude2kiro desktop` | Windows: install/configure/launch Claude Desktop routed through the proxy |
 | `claude2kiro server [port]` | Run the proxy without launching Claude Code |
-| `claude2kiro credits [--web]` | Show credit usage (`--web` opens the live dashboard) |
+| `claude2kiro credits [--web\|--all]` | Show credit usage (`--web` opens the live dashboard, `--all` lists every identity in failover order) |
 | `claude2kiro update` | Download the latest release |
 | `claude2kiro logout` | Remove saved credentials |
 
@@ -169,8 +178,20 @@ If installed via the quick installers, Claude2Kiro uses a launcher plus a versio
 
 ## Configuration
 
-Settings are saved in `~/.claude2kiro/config.yaml`. 
-You can edit them directly, or press `p` (Settings) in the TUI dashboard.
+Settings are saved in `~/.claude2kiro/config.yaml`; a process started with
+`CLAUDE2KIRO_PROFILE=<name>` reads `~/.claude2kiro/config.<name>.yaml` instead when that
+file exists (and always saves there). You can edit them directly, or press `p` (Settings)
+in the TUI dashboard.
+
+Failover between Kiro identities lives here too. Once a second identity is logged in,
+list it in the config file the proxy actually reads and the proxy switches to it on its
+own when the active pool answers `402 MONTHLY_REQUEST_COUNT` (sticky until the proxy is
+restarted; `""` names the unnamed profile):
+
+```yaml
+auth:
+  fallback_profiles: [agentes]
+```
 
 Some useful settings:
 - **Auto-Start Server**: automatically start the proxy server when the app is launched.
