@@ -172,6 +172,10 @@ func ProxyPortFileName() string { return suffixed("proxy.port") }
 // CreditHistoryFileName is the file name of the credit history for the active identity.
 func CreditHistoryFileName() string { return identitySuffixed("credit-history.jsonl") }
 
+// CreditHistoryFileNameFor is the file name of the credit history of a given
+// profile name ("" for the default).
+func CreditHistoryFileNameFor(n string) string { return withSuffix("credit-history.jsonl", n) }
+
 // ConfigSavePath is where the active profile's configuration is written:
 // config.<profile>.yaml for a named profile, config.yaml for the default. A
 // named profile never writes the shared file, so a Settings change under one

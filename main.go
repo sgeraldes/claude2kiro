@@ -872,6 +872,15 @@ func creditHistoryFilePath() string {
 	return filepath.Join(homeDir, ".claude2kiro", profile.CreditHistoryFileName())
 }
 
+// creditHistoryFilePathFor is the credit history file of a given identity.
+func creditHistoryFilePathFor(name string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude2kiro", profile.CreditHistoryFileNameFor(name))
+}
+
 // creditRecorder samples Kiro credit usage every 15 minutes and keeps 30 days of
 // history so the web dashboard can chart usage, burn rate, and projected runout.
 var creditRecorder = creditshist.NewRecorderFor(
@@ -879,15 +888,17 @@ var creditRecorder = creditshist.NewRecorderFor(
 	15*time.Minute,
 	30*24*time.Hour,
 	func() creditshist.Reading {
-		// The reading belongs to the identity in force while it was taken.
-		// If the proxy moved (even away and back) meanwhile, the figures may
-		// be another pool's: drop them rather than file them under this one.
+		// The reading belongs to the identity in force while it was taken,
+		// and is filed under that identity's history. If the proxy moved
+		// (even away and back) during the read, the figures may be another
+		// pool's: drop them rather than file them under this one.
 		before := currentIdentity()
 		info := cmd.GetCreditsInfo()
 		if currentIdentity() != before {
 			return creditshist.Reading{Err: fmt.Errorf("identity changed while reading credits")}
 		}
 		return creditshist.Reading{
+			Path:      creditHistoryFilePathFor(before.Name),
 			Used:      info.CreditsUsed,
 			Limit:     info.CreditsLimit,
 			Remaining: info.CreditsRemaining,
@@ -5724,6 +5735,9 @@ func loginSocial(provider string) {
 	// Channel to receive the auth code
 	authCodeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
+	// The first terminal result wins; a stray or repeated callback after it
+	// must not block its handler (Shutdown waits for handlers) nor the login.
+	fail := loginFailer(errChan)
 
 	// Create HTTP server for callback with local mux (avoid polluting DefaultServeMux)
 	mux := http.NewServeMux()
@@ -5732,7 +5746,7 @@ func loginSocial(provider string) {
 		// Validate state
 		receivedState := r.URL.Query().Get("state")
 		if receivedState != state {
-			errChan <- fmt.Errorf("state mismatch: expected %s, got %s", state, receivedState)
+			fail(fmt.Errorf("state mismatch: expected %s, got %s", state, receivedState))
 			http.Error(w, "Invalid state parameter", http.StatusBadRequest)
 			return
 		}
@@ -5740,7 +5754,7 @@ func loginSocial(provider string) {
 		// Check for error
 		if errParam := r.URL.Query().Get("error"); errParam != "" {
 			errDesc := r.URL.Query().Get("error_description")
-			errChan <- fmt.Errorf("OAuth error: %s - %s", errParam, errDesc)
+			fail(fmt.Errorf("OAuth error: %s - %s", errParam, errDesc))
 			http.Error(w, fmt.Sprintf("Authentication failed: %s", errDesc), http.StatusBadRequest)
 			return
 		}
@@ -5748,7 +5762,7 @@ func loginSocial(provider string) {
 		// Get auth code
 		code := r.URL.Query().Get("code")
 		if code == "" {
-			errChan <- fmt.Errorf("no authorization code received")
+			fail(fmt.Errorf("no authorization code received"))
 			http.Error(w, "No authorization code received", http.StatusBadRequest)
 			return
 		}
@@ -5787,7 +5801,7 @@ func loginSocial(provider string) {
 	// Start server in goroutine
 	go func() {
 		if err := server.Serve(listener); err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("callback server error: %v", err)
+			fail(fmt.Errorf("callback server error: %v", err))
 		}
 	}()
 
@@ -6024,6 +6038,7 @@ func loginIdC(provider, startUrl, region string) {
 	// Channel to receive the auth code
 	authCodeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
+	fail := loginFailer(errChan)
 
 	// Create HTTP server for callback
 	mux := http.NewServeMux()
@@ -6033,7 +6048,7 @@ func loginIdC(provider, startUrl, region string) {
 		// Validate state
 		receivedState := r.URL.Query().Get("state")
 		if receivedState != state {
-			errChan <- fmt.Errorf("state mismatch")
+			fail(fmt.Errorf("state mismatch"))
 			http.Error(w, "Invalid state parameter", http.StatusBadRequest)
 			return
 		}
@@ -6041,7 +6056,7 @@ func loginIdC(provider, startUrl, region string) {
 		// Check for error
 		if errParam := r.URL.Query().Get("error"); errParam != "" {
 			errDesc := r.URL.Query().Get("error_description")
-			errChan <- fmt.Errorf("OAuth error: %s - %s", errParam, errDesc)
+			fail(fmt.Errorf("OAuth error: %s - %s", errParam, errDesc))
 			http.Error(w, fmt.Sprintf("Authentication failed: %s", errDesc), http.StatusBadRequest)
 			return
 		}
@@ -6049,7 +6064,7 @@ func loginIdC(provider, startUrl, region string) {
 		// Get auth code
 		code := r.URL.Query().Get("code")
 		if code == "" {
-			errChan <- fmt.Errorf("no authorization code received")
+			fail(fmt.Errorf("no authorization code received"))
 			http.Error(w, "No authorization code received", http.StatusBadRequest)
 			return
 		}
@@ -6068,7 +6083,7 @@ func loginIdC(provider, startUrl, region string) {
 	// Start server in goroutine
 	go func() {
 		if err := server.Serve(listener); err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("callback server error: %v", err)
+			fail(fmt.Errorf("callback server error: %v", err))
 		}
 	}()
 
@@ -6354,7 +6369,7 @@ func refreshToken() {
 		os.Exit(1)
 	}
 
-	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
+	if err := writeFileAtomic(tokenPath, newData, 0600); err != nil {
 		fmt.Printf("Failed to write token file: %v\n", err)
 		os.Exit(1)
 	}
@@ -6426,6 +6441,12 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 		return TokenData{}, fmt.Errorf("failed to parse response: %v", err)
 	}
 
+	if tokenResp.AccessToken == "" {
+		return TokenData{}, fmt.Errorf("token refresh answered without an access token")
+	}
+	if tokenResp.RefreshToken == "" {
+		tokenResp.RefreshToken = currentToken.RefreshToken // no rotation: keep the one that works
+	}
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 
 	return TokenData{
@@ -6482,6 +6503,12 @@ func refreshTokenSocial(currentToken TokenData) (TokenData, error) {
 		return TokenData{}, fmt.Errorf("failed to parse response: %v", err)
 	}
 
+	if refreshResp.AccessToken == "" {
+		return TokenData{}, fmt.Errorf("token refresh answered without an access token")
+	}
+	if refreshResp.RefreshToken == "" {
+		refreshResp.RefreshToken = currentToken.RefreshToken // no rotation: keep the one that works
+	}
 	return TokenData{
 		AccessToken:  refreshResp.AccessToken,
 		RefreshToken: refreshResp.RefreshToken,
@@ -6540,6 +6567,9 @@ func tryRefreshToken() error {
 
 	if err != nil {
 		return err
+	}
+	if newToken.AccessToken == "" {
+		return fmt.Errorf("token refresh produced no access token; keeping the previous credentials")
 	}
 
 	newData, err := jsonStr.MarshalIndent(newToken, "", "  ")
@@ -6610,6 +6640,20 @@ func setClaude() {
 		os.Exit(1)
 	}
 	fmt.Println("Claude config file updated successfully")
+}
+
+// loginFailer reports a login failure on errChan without ever blocking: the
+// channel holds one result and the first terminal result is the login's
+// outcome; anything after it is dropped, so a callback that arrives late
+// (a retried browser tab, a stray request) finishes its handler and lets the
+// server shut down.
+func loginFailer(errChan chan<- error) func(error) {
+	return func(err error) {
+		select {
+		case errChan <- err:
+		default:
+		}
+	}
 }
 
 // refreshTokenCmd is the TUI's token refresh: the same writer as the proxy's

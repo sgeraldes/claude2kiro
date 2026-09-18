@@ -162,7 +162,8 @@ proxy was started as, so `run` keeps attaching to the right proxy. `/health` rep
 identity in use in `X-Claude2Kiro-Identity`. A reserve whose stale token cannot be
 refreshed is skipped for the next one: for good when the identity provider rejected it
 (revoked login, `invalid_grant`), only for this failover when the refresh failed for a
-passing reason (network, 5xx). A token file with no access token is skipped too. When
+passing reason (network, 5xx, a file another process is replacing, a refresh that answered
+without a token). A token file with no access token is skipped the same way. When
 every listed identity is exhausted or unusable the client gets a non-retryable error
 naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
 so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.

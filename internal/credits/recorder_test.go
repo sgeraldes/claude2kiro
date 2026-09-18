@@ -238,3 +238,29 @@ func TestRecorderSampleStaysBoundToItsFile(t *testing.T) {
 		t.Fatalf("a: %+v", h)
 	}
 }
+
+// H09 (ABA): a reading that names the file it belongs to is filed there,
+// even when the recorder resolved another path before the read and that
+// path is current again afterwards.
+func TestRecorderFilesAReadingUnderItsOwnPath(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.jsonl")
+	b := filepath.Join(dir, "b.jsonl")
+	current := b // the recorder believes it is on b (a provisional candidate)
+	r := NewRecorderFor(func() string { return current }, time.Hour, 24*time.Hour, func() Reading {
+		// the read itself ran as a: the reading says so
+		return Reading{Used: 11, Limit: 100, Remaining: 89, Plan: "A", Path: a}
+	})
+	r.sampleOnce()
+
+	if _, err := os.Stat(b); err == nil {
+		t.Fatal("a reading of a was filed under b")
+	}
+	snaps, ok := r.readFile(a)
+	if !ok || len(snaps) != 1 || snaps[0].Plan != "A" {
+		t.Fatalf("a.jsonl must hold the reading: %+v ok=%v", snaps, ok)
+	}
+	if h := r.History(); len(h) != 0 {
+		t.Fatalf("b's series must stay empty: %+v", h)
+	}
+}

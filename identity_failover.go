@@ -50,8 +50,10 @@ var (
 	// exhaustedIdentities remembers which identities answered 402 in this
 	// process, by profile name ("" = default), so they are never retried.
 	exhaustedIdentities = map[string]bool{}
-	// identityFailures remembers reserves that could not be used for another
-	// reason (unreadable token file, refresh rejected), with the reason.
+	// identityFailures remembers reserves the identity provider rejected for
+	// good (refresh answered 400/401/403), with the reason. Everything else
+	// that made a reserve unusable (unreadable file, empty token, a refresh
+	// that failed for a passing reason) is tried again on the next failover.
 	identityFailures = map[string]string{}
 )
 
@@ -154,13 +156,15 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 		modelCatalog.Invalidate()
 		tok, err := getToken()
 		if err != nil {
-			// The file exists but cannot be read: not a usable reserve.
-			identityFailures[name] = fmt.Sprintf("token file unreadable: %v", err)
+			// The file cannot be read right now (another process may be
+			// replacing it, or it is damaged): skip it this time, look again
+			// on the next failover.
+			transient[name] = fmt.Sprintf("token file unreadable: %v", err)
 			continue
 		}
 		if tok.AccessToken == "" {
-			// Parseable JSON is not a credential.
-			identityFailures[name] = "token file has no access token"
+			// Parseable JSON is not a credential; a login may fix it later.
+			transient[name] = "token file has no access token"
 			continue
 		}
 		// A reserve that was logged in days ago may hold an expired access
@@ -189,9 +193,10 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 		identityGen++
 		invalidateTokenCache()
 		modelCatalog.Invalidate()
+		back := identityRef{Name: failed.Name, Gen: identityGen}
 		err := fmt.Errorf("every configured identity is unavailable: %s", strings.Join(exhaustedLabels(transient), ", "))
 		identityMu.Unlock()
-		return TokenData{}, identityRef{Name: failed.Name, Gen: identityGen}, err
+		return TokenData{}, back, err
 	}
 	identityMu.Unlock()
 	return tokenForRequest()

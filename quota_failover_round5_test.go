@@ -159,10 +159,10 @@ func TestEmptyReserveDoesNotHideTheHealthyOne(t *testing.T) {
 		t.Fatalf("the empty reserve must be skipped: %v", bearers)
 	}
 	identityMu.Lock()
-	reason := identityFailures["empty"]
+	remembered := identityFailures["empty"]
 	identityMu.Unlock()
-	if !strings.Contains(reason, "no access token") {
-		t.Fatalf("the empty reserve must be remembered with its reason, got %q", reason)
+	if remembered != "" {
+		t.Fatalf("an empty token file is not a permanent rejection; a login may fill it later, got %q", remembered)
 	}
 }
 

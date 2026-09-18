@@ -24,11 +24,15 @@ type Snapshot struct {
 }
 
 // Reading is the live credit figure supplied by the caller's snapshot function.
+// Path, when set, is the history file the reading belongs to: the caller
+// resolved the identity it read for, and the recorder files the sample there
+// rather than under whatever identity is current by the time it writes.
 type Reading struct {
 	Used      float64
 	Limit     float64
 	Remaining float64
 	Plan      string
+	Path      string
 	Err       error
 }
 
@@ -127,7 +131,12 @@ func (r *Recorder) sampleOnce() {
 	if rd.Err != nil || rd.Limit <= 0 {
 		return
 	}
-	if r.pathFn() != before {
+	// The reading's own file wins: it was resolved with the reading. Without
+	// one, the file is the one resolved before the read, provided nothing
+	// moved meanwhile.
+	if rd.Path != "" {
+		before = rd.Path
+	} else if r.pathFn() != before {
 		return
 	}
 	s := Snapshot{
