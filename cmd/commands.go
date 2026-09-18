@@ -273,44 +273,6 @@ func RefreshTokenSocial(currentToken TokenData) (TokenData, error) {
 	}, nil
 }
 
-// TryRefreshToken attempts to refresh the token without exiting on failure
-func TryRefreshToken() error {
-	tokenPath := GetTokenFilePath()
-
-	data, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return fmt.Errorf("failed to read token file: %v", err)
-	}
-
-	var currentToken TokenData
-	if err := json.Unmarshal(data, &currentToken); err != nil {
-		return fmt.Errorf("failed to parse token file: %v", err)
-	}
-
-	var newToken TokenData
-
-	if currentToken.AuthMethod == "IdC" {
-		newToken, err = RefreshTokenIdC(currentToken)
-	} else {
-		newToken, err = RefreshTokenSocial(currentToken)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	newData, err := json.MarshalIndent(newToken, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to serialize new token: %v", err)
-	}
-
-	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
-		return fmt.Errorf("failed to write token file: %v", err)
-	}
-
-	return nil
-}
-
 // Message types for TUI commands
 
 // LoginResultMsg carries the result of a login attempt
@@ -347,22 +309,6 @@ func LoginCmd() tea.Msg {
 	return StatusMsg{
 		Message: "Login requires running 'claude2kiro login' separately for now",
 		IsError: false,
-	}
-}
-
-// RefreshTokenCmd returns a function that refreshes the token
-func RefreshTokenCmd() tea.Msg {
-	err := TryRefreshToken()
-	if err != nil {
-		return RefreshResultMsg{
-			Success: false,
-			Err:     err,
-		}
-	}
-
-	return RefreshResultMsg{
-		Success:   true,
-		ExpiresAt: GetTokenExpiry(),
 	}
 }
 

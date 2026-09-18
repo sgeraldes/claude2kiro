@@ -226,8 +226,19 @@ func Load() (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return Default(), err // Return defaults on parse error
 	}
+	cfg.normalize()
 
 	return cfg, nil
+}
+
+// normalize replaces values that would break the proxy with their defaults.
+// An HTTP timeout of zero means no timeout at all for net/http, and the
+// failover holds the identity lock during a refresh: with no timeout a stuck
+// identity provider would hold every request.
+func (c *Config) normalize() {
+	if c.Network.HTTPTimeout <= 0 {
+		c.Network.HTTPTimeout = Default().Network.HTTPTimeout
+	}
 }
 
 // Save saves the configuration to file
@@ -290,6 +301,9 @@ func Get() *Config {
 
 // Set installs a new current configuration (atomic pointer swap).
 func Set(cfg *Config) {
+	if cfg != nil {
+		cfg.normalize()
+	}
 	currentMu.Lock()
 	current = cfg
 	currentMu.Unlock()

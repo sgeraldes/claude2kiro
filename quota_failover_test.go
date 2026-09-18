@@ -133,20 +133,38 @@ func withIdentities(t *testing.T, tokens map[string]TokenData) string {
 	return home
 }
 
+// identityFile is the token file of a test identity. "" is the primary: the
+// profile the test process was launched as, so the fixtures hold under
+// CLAUDE2KIRO_PROFILE=<name> as well as without it.
+func identityFile(name string) string {
+	if name == "" {
+		name = profile.Name()
+	}
+	return tokenFilePathFor(name)
+}
+
+// primaryLabel is how the primary identity is named in messages.
+func primaryLabel() string {
+	if profile.Name() == "" {
+		return profile.DefaultLabel
+	}
+	return profile.Name()
+}
+
 func writeIdentityToken(t *testing.T, name string, tok TokenData) {
 	t.Helper()
 	data, err := json.Marshal(tok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(tokenFilePathFor(name), data, 0o600); err != nil {
+	if err := os.WriteFile(identityFile(name), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func readIdentityToken(t *testing.T, name string) TokenData {
 	t.Helper()
-	data, err := os.ReadFile(tokenFilePathFor(name))
+	data, err := os.ReadFile(identityFile(name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +291,7 @@ func TestNoFallbackConfiguredSurfacesTheQuotaError(t *testing.T) {
 	if len(bearers) != 1 {
 		t.Fatalf("no retry without fallbacks: %v", bearers)
 	}
-	if got := profile.Active(); got != "" {
+	if got := profile.Active(); got != profile.Name() {
 		t.Fatalf("identity must not move: %q", got)
 	}
 	body := rec.Body.String()
@@ -658,7 +676,7 @@ func TestCreditsAllListsIdentitiesThatAreNotLoggedIn(t *testing.T) {
 			t.Fatalf("%q missing in:\n%s", want, out)
 		}
 	}
-	if got := profile.Active(); got != "" {
+	if got := profile.Active(); got != profile.Name() {
 		t.Fatalf("credits --all must leave the identity where it was: %q", got)
 	}
 }
@@ -698,7 +716,7 @@ func TestCreditsAllUsesEachIdentityAndRefreshesStaleOnes(t *testing.T) {
 	if !strings.Contains(out, "Used:      10000.0 / 10000") || !strings.Contains(out, "Used:      12.0 / 10000") {
 		t.Fatalf("both balances must be printed:\n%s", out)
 	}
-	if got := profile.Active(); got != "" {
+	if got := profile.Active(); got != profile.Name() {
 		t.Fatalf("identity after credits --all: %q", got)
 	}
 }

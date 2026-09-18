@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 )
 
@@ -200,12 +201,12 @@ func TestExhaustedMessageNamesEveryUnusableIdentity(t *testing.T) {
 		t.Fatal("expected an error with nothing usable left")
 	}
 	msg := err.Error()
-	for _, want := range []string{"default (out of credits)", "bad (refresh failed"} {
+	for _, want := range []string{primaryLabel() + " (out of credits)", "bad (refresh failed"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error must name %q, got: %s", want, msg)
 		}
 	}
-	if got := currentIdentity().Name; got != "" {
+	if got := currentIdentity().Name; got != profile.Name() {
 		t.Fatalf("the proxy must stay on the identity that failed, got %q", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -139,6 +140,7 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 	cfg := config.Get()
 	candidates := append([]string{profile.Name()}, cfg.Auth.FallbackProfiles...)
 	var chosen *identityRef
+	transient := map[string]string{}
 	for _, raw := range candidates {
 		name, err := profile.Validate(raw)
 		if err != nil || exhaustedIdentities[name] || identityFailures[name] != "" || !identityHasToken(name) {
@@ -156,13 +158,23 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 			identityFailures[name] = fmt.Sprintf("token file unreadable: %v", err)
 			continue
 		}
+		if tok.AccessToken == "" {
+			// Parseable JSON is not a credential.
+			identityFailures[name] = "token file has no access token"
+			continue
+		}
 		// A reserve that was logged in days ago may hold an expired access
 		// token; renew it before choosing it. A reserve whose refresh is
-		// rejected (revoked login) is skipped so the next one gets its turn,
-		// instead of being handed to the caller only to answer 403.
+		// rejected for good (revoked login) is remembered and skipped; one
+		// whose refresh failed for a passing reason (network, 5xx) is skipped
+		// this time and tried again on the next failover.
 		if tokenIsStale(tok) {
 			if err := tryRefreshToken(); err != nil {
-				identityFailures[name] = fmt.Sprintf("refresh failed: %v", err)
+				if isPermanentRefreshError(err) {
+					identityFailures[name] = fmt.Sprintf("refresh failed: %v", err)
+				} else {
+					transient[name] = fmt.Sprintf("refresh failed for now: %v", err)
+				}
 				continue
 			}
 		}
@@ -170,16 +182,40 @@ func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error
 		break
 	}
 	if chosen == nil {
-		// Nothing left: stay on the identity that failed so the caller reports it.
+		// Nothing left: back to the identity that failed so the caller reports
+		// it. This is a switch like any other: every cache filled for a
+		// candidate that was tried and rejected is dropped.
 		_ = profile.SwitchTo(failed.Name)
+		identityGen++
 		invalidateTokenCache()
-		err := fmt.Errorf("every configured identity is unavailable: %s", strings.Join(exhaustedLabels(), ", "))
+		modelCatalog.Invalidate()
+		err := fmt.Errorf("every configured identity is unavailable: %s", strings.Join(exhaustedLabels(transient), ", "))
 		identityMu.Unlock()
-		return TokenData{}, failed, err
+		return TokenData{}, identityRef{Name: failed.Name, Gen: identityGen}, err
 	}
 	identityMu.Unlock()
 	return tokenForRequest()
 }
+
+// isPermanentRefreshError tells a refresh the identity provider rejected
+// (invalid or revoked grant, bad client: HTTP 400, 401, 403) from one that
+// failed for a passing reason (network error, timeout, 5xx, 429).
+func isPermanentRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := refreshStatusPattern.FindStringSubmatch(err.Error())
+	if m == nil {
+		return false
+	}
+	switch m[1] {
+	case "400", "401", "403":
+		return true
+	}
+	return false
+}
+
+var refreshStatusPattern = regexp.MustCompile(`status(?: code)?:? (\d{3})`)
 
 // tokenIsStale reports whether the access token is expired or about to be.
 func tokenIsStale(tok TokenData) bool {
@@ -194,20 +230,24 @@ func tokenIsStale(tok TokenData) bool {
 }
 
 // exhaustedLabels lists the identities that answered 402 in this process and
-// the reserves that failed for another reason, with that reason. Caller holds
+// the reserves that failed for another reason, with that reason; extra holds
+// the failures of this one selection that are not remembered. Caller holds
 // identityMu.
-func exhaustedLabels() []string {
+func exhaustedLabels(extra map[string]string) []string {
 	label := func(name string) string {
 		if name == "" {
 			return profile.DefaultLabel
 		}
 		return name
 	}
-	names := make([]string, 0, len(exhaustedIdentities)+len(identityFailures))
+	names := make([]string, 0, len(exhaustedIdentities)+len(identityFailures)+len(extra))
 	for name := range exhaustedIdentities {
 		names = append(names, label(name)+" (out of credits)")
 	}
 	for name, reason := range identityFailures {
+		names = append(names, label(name)+" ("+reason+")")
+	}
+	for name, reason := range extra {
 		names = append(names, label(name)+" ("+reason+")")
 	}
 	sort.Strings(names)

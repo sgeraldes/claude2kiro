@@ -83,7 +83,7 @@ func TestUnreadableActiveTokenSendsNothing(t *testing.T) {
 	if _, err := getToken(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(tokenFilePathFor(""), []byte("{not json"), 0o600); err != nil {
+	if err := os.WriteFile(identityFile(""), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	invalidateTokenCache()

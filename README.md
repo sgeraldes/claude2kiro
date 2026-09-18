@@ -160,10 +160,14 @@ reset, so restart the proxy (or the run) to go back to the primary. Only the tok
 config and credit history move: the port marker and the config stay with the profile the
 proxy was started as, so `run` keeps attaching to the right proxy. `/health` reports the
 identity in use in `X-Claude2Kiro-Identity`. A reserve whose stale token cannot be
-refreshed (its login was revoked) is skipped for the next one. When every listed identity
-is exhausted or unusable the client gets a non-retryable error naming each one with its
-reason (`out of credits`, `refresh failed: …`), so you know which login to redo with
-`CLAUDE2KIRO_PROFILE=<name> claude2kiro login`. Failover is deliberately not load
+refreshed is skipped for the next one: for good when the identity provider rejected it
+(revoked login, `invalid_grant`), only for this failover when the refresh failed for a
+passing reason (network, 5xx). A token file with no access token is skipped too. When
+every listed identity is exhausted or unusable the client gets a non-retryable error
+naming each one with its reason (`out of credits`, `refresh failed: …`, `no access token`),
+so you know which login to redo with `CLAUDE2KIRO_PROFILE=<name> claude2kiro login`.
+`network.http_timeout` must be positive; a zero value falls back to the default, since the
+failover holds the identity lock while a reserve is refreshed. Failover is deliberately not load
 balancing: spreading requests over two monthly pools empties both on the same day, while
 a spare pool that only starts when the first one is gone is a real reserve.
 

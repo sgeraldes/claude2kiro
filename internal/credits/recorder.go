@@ -69,7 +69,13 @@ func (r *Recorder) track() string {
 	p := r.pathFn()
 	r.mu.Lock()
 	changed := p != r.path
-	r.path = p
+	if changed {
+		// Path and series move together: until the new file is loaded the
+		// series is empty, never the previous identity's points under the
+		// new path.
+		r.path = p
+		r.snap = nil
+	}
 	r.mu.Unlock()
 	if changed {
 		r.load(p)

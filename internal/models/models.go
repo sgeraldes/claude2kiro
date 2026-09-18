@@ -138,7 +138,9 @@ func NewCatalog(ttl time.Duration, fetch func() ([]KiroModel, error)) *Catalog {
 
 // Invalidate forgets the cached list so the next use refetches. The proxy
 // calls it when it moves to another Kiro identity: the models one account can
-// use are not necessarily the ones another can. A fetch that was already in
+// use are not necessarily the ones another can, so the previous list is
+// dropped outright (a failed fetch for the new identity leaves the catalog
+// empty, never serving the old identity's models). A fetch that was already in
 // flight for the previous identity is discarded when it lands, so it cannot
 // publish that identity's list as the new one's.
 func (c *Catalog) Invalidate() {
@@ -147,6 +149,8 @@ func (c *Catalog) Invalidate() {
 	}
 	c.mu.Lock()
 	c.fetchedAt = time.Time{}
+	c.models = nil
+	c.ids = map[string]bool{}
 	c.gen++
 	c.mu.Unlock()
 }

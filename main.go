@@ -879,7 +879,14 @@ var creditRecorder = creditshist.NewRecorderFor(
 	15*time.Minute,
 	30*24*time.Hour,
 	func() creditshist.Reading {
+		// The reading belongs to the identity in force while it was taken.
+		// If the proxy moved (even away and back) meanwhile, the figures may
+		// be another pool's: drop them rather than file them under this one.
+		before := currentIdentity()
 		info := cmd.GetCreditsInfo()
+		if currentIdentity() != before {
+			return creditshist.Reading{Err: fmt.Errorf("identity changed while reading credits")}
+		}
 		return creditshist.Reading{
 			Used:      info.CreditsUsed,
 			Limit:     info.CreditsLimit,
@@ -3656,7 +3663,7 @@ func runTUI() {
 			}
 			return nil
 		},
-		RefreshToken:    cmd.RefreshTokenCmd,
+		RefreshToken:    refreshTokenCmd,
 		ViewToken:       cmd.ViewTokenCmd,
 		ExportEnv:       cmd.ExportEnvCmd,
 		ConfigureClaude: cmd.ConfigureClaudeCmd,
@@ -3666,7 +3673,7 @@ func runTUI() {
 		GetTokenExpiry:  cmd.GetTokenExpiry,
 		HasToken:        cmd.HasToken,
 		IsTokenExpired:  cmd.IsTokenExpired,
-		TryRefreshToken: cmd.TryRefreshToken,
+		TryRefreshToken: tryRefreshToken,
 	}
 
 	// Create root model
@@ -3895,8 +3902,10 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			return
 		}
 
-		// Get current token, refreshing proactively if expired/expiring soon
-		token, err := getToken()
+		// Get current token, refreshing proactively if expired/expiring soon.
+		// tokenForRequest waits for a failover in progress to settle, so a
+		// candidate reserve that is being checked is never read here.
+		token, _, err := tokenForRequest()
 		if err != nil {
 			lg.LogError(fmt.Sprintf("Failed to get token: %v", err))
 			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
@@ -3914,7 +3923,7 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 					} else {
 						lg.LogInfo("Token refreshed successfully")
 						// Re-read the refreshed token
-						token, err = getToken()
+						token, _, err = tokenForRequest()
 						if err != nil {
 							lg.LogError(fmt.Sprintf("Failed to get refreshed token: %v", err))
 							http.Error(w, fmt.Sprintf("Failed to get refreshed token: %v", err), http.StatusInternalServerError)
@@ -6271,10 +6280,10 @@ func saveTokenTo(tokenPath string, token *TokenData) error {
 		return fmt.Errorf("failed to marshal token: %v", err)
 	}
 
-	if err := os.WriteFile(tokenPath, data, 0600); err != nil {
+	if err := writeFileAtomic(tokenPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
-	tokenWriteGen.Add(1)
+	bumpTokenGen()
 
 	return nil
 }
@@ -6538,23 +6547,21 @@ func tryRefreshToken() error {
 		return fmt.Errorf("failed to serialize new token: %v", err)
 	}
 
-	if err := os.WriteFile(tokenPath, newData, 0600); err != nil {
+	if err := writeFileAtomic(tokenPath, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write token file: %v", err)
 	}
-	tokenWriteGen.Add(1)
+	bumpTokenGen()
 	// An IdC token that never had its profileArn resolved (a reserve refreshed
 	// straight from a stale login) gets it now, with the bearer that works.
 	if newToken.AuthMethod == "IdC" && newToken.ProfileArn == "" {
 		if arn := discoverProfileArn(newToken.AccessToken); arn != "" {
 			newToken.ProfileArn = arn
 			if data, merr := jsonStr.MarshalIndent(newToken, "", "  "); merr == nil {
-				if os.WriteFile(tokenPath, data, 0600) == nil {
-					tokenWriteGen.Add(1)
-				}
+				_ = writeFileAtomic(tokenPath, data, 0600) // best-effort; published below either way
 			}
 		}
 	}
-	publishToken(identityName, newToken)
+	publishWrittenToken(identityName, newToken)
 
 	fmt.Println("Token refreshed successfully")
 	return nil
@@ -6605,6 +6612,15 @@ func setClaude() {
 	fmt.Println("Claude config file updated successfully")
 }
 
+// refreshTokenCmd is the TUI's token refresh: the same writer as the proxy's
+// own refresh, so the cache generation and the identity locks see it.
+func refreshTokenCmd() tea.Msg {
+	if err := tryRefreshToken(); err != nil {
+		return cmd.RefreshResultMsg{Success: false, Err: err}
+	}
+	return cmd.RefreshResultMsg{Success: true, ExpiresAt: cmd.GetTokenExpiry()}
+}
+
 // getToken retrieves the current token.
 //
 // The cache is keyed by the identity it was read for: after a failover the
@@ -6617,19 +6633,30 @@ var (
 	cachedIdentity  string
 	cachedTokenTime time.Time
 	tokenMutex      sync.Mutex
+	cachedTTL       time.Duration
 	// tokenWriteGen counts token file writes (refresh, login, ARN merge). A
 	// reader that started before a write must not publish what it read: by
 	// the time its discovery call returns, the bearer it holds may have been
-	// replaced on disk and in the cache by a completed refresh.
+	// replaced on disk and in the cache by a completed refresh. Writers bump
+	// it under tokenMutex, readers check it under tokenMutex, so the check
+	// and the publication are one step.
 	tokenWriteGen atomic.Uint64
+)
+
+const (
+	tokenCacheTTL = time.Minute
+	// An IdC token whose profile ARN could not be resolved (profiles API
+	// down) is cached only this long, so discovery is retried soon without
+	// hitting the API on every request.
+	unresolvedArnCacheTTL = 10 * time.Second
 )
 
 func getToken() (TokenData, error) {
 	name := profile.Active()
 
 	tokenMutex.Lock()
-	// Use cache if it's fresh (less than 1 minute old, to pick up manual file edits)
-	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < time.Minute {
+	// Use cache if it's fresh (a minute, to pick up manual file edits)
+	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < cachedTTL {
 		tok := *cachedToken
 		tokenMutex.Unlock()
 		return tok, nil
@@ -6644,6 +6671,9 @@ func getToken() (TokenData, error) {
 		gen := tokenWriteGen.Load()
 		token, err := readTokenFile(tokenPath)
 		if err != nil {
+			if tokenWriteGen.Load() != gen {
+				continue // a write landed while reading: the file was mid-replacement
+			}
 			return TokenData{}, err
 		}
 
@@ -6658,8 +6688,7 @@ func getToken() (TokenData, error) {
 				token, gen = mergeProfileArn(tokenPath, token, arn)
 			}
 		}
-		if tokenWriteGen.Load() == gen {
-			publishToken(name, token)
+		if publishTokenAt(name, token, gen) {
 			return token, nil
 		}
 		// The file was written while this read was out: what was read is
@@ -6667,6 +6696,56 @@ func getToken() (TokenData, error) {
 	}
 	// Writes kept landing: hand out what is on disk now, without caching it.
 	return readTokenFile(tokenPath)
+}
+
+// publishTokenAt installs token in the cache unless a token file write
+// happened since generation gen. Check and install are one step under
+// tokenMutex, so a writer cannot publish a newer token in between and be
+// overwritten by this older read.
+func publishTokenAt(name string, token TokenData, gen uint64) bool {
+	tokenMutex.Lock()
+	defer tokenMutex.Unlock()
+	if tokenWriteGen.Load() != gen {
+		return false
+	}
+	installToken(name, token)
+	return true
+}
+
+// installToken sets the cache. Caller holds tokenMutex.
+func installToken(name string, token TokenData) {
+	cachedToken = &token
+	cachedIdentity = name
+	cachedTokenTime = time.Now()
+	cachedTTL = tokenCacheTTL
+	if token.AuthMethod == "IdC" && token.ProfileArn == "" {
+		cachedTTL = unresolvedArnCacheTTL
+	}
+}
+
+// bumpTokenGen records a token file write and drops the cache, as one step
+// under tokenMutex: a reader that published just before now re-reads.
+func bumpTokenGen() {
+	tokenMutex.Lock()
+	tokenWriteGen.Add(1)
+	cachedToken = nil
+	cachedIdentity = ""
+	tokenMutex.Unlock()
+}
+
+// writeFileAtomic replaces path with data through a temporary file and a
+// rename, so a concurrent reader sees either the old file or the new one,
+// never a truncated one.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := fmt.Sprintf("%s.%d.tmp", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // readTokenFile parses one identity's token file.
@@ -6702,14 +6781,13 @@ func mergeProfileArn(tokenPath string, token TokenData, arn string) (TokenData, 
 	return current, tokenWriteGen.Load()
 }
 
-// publishToken installs a freshly written token in the cache for the identity
-// it belongs to, so readers between the write and the next cache expiry do not
-// keep handing out the previous bearer.
-func publishToken(name string, token TokenData) {
+// publishWrittenToken installs a token this process just wrote to its file:
+// the write generation moves and the cache is set in one step under
+// tokenMutex, so no reader can install an older read after it.
+func publishWrittenToken(name string, token TokenData) {
 	tokenMutex.Lock()
-	cachedToken = &token
-	cachedIdentity = name
-	cachedTokenTime = time.Now()
+	tokenWriteGen.Add(1)
+	installToken(name, token)
 	tokenMutex.Unlock()
 }
 
