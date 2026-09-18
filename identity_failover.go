@@ -55,6 +55,11 @@ var (
 	// that made a reserve unusable (unreadable file, empty token, a refresh
 	// that failed for a passing reason) is tried again on the next failover.
 	identityFailures = map[string]string{}
+	// retiredBearer is the access token an identity in identityFailures was
+	// retired with. A later login of that identity (another process) puts
+	// other credentials in its file: the next failover notices and tries it
+	// again instead of skipping a healthy login for the rest of the process.
+	retiredBearer = map[string]string{}
 )
 
 // currentIdentity is the identity the proxy is on right now.
@@ -114,6 +119,17 @@ func identityHasToken(name string) bool {
 	return err == nil
 }
 
+// identityLoggedInAgain tells whether a retired identity's file holds other
+// credentials than the ones it was retired with: a login happened since.
+// Caller holds identityMu.
+func identityLoggedInAgain(name string) bool {
+	tok, err := readTokenFile(tokenFilePathFor(name))
+	if err != nil || tok.AccessToken == "" {
+		return false
+	}
+	return tok.AccessToken != retiredBearer[name]
+}
+
 // tokenFilePathFor is the token file of a given profile name ("" = default).
 func tokenFilePathFor(name string) string {
 	homeDir, err := os.UserHomeDir()
@@ -131,15 +147,16 @@ func tokenFilePathFor(name string) string {
 // token when it is stale. With nothing left it returns an error naming every
 // exhausted identity; the proxy stays where it was.
 func switchToFallbackIdentity(failed identityRef) (TokenData, identityRef, error) {
-	return switchAway(failed, "")
+	return switchAway(failed, "", "")
 }
 
 // retireIdentity is switchToFallbackIdentity for an identity whose bearer the
 // backend rejects and whose refresh cannot fix (revoked login): it is not out
 // of credits, it is unusable until someone logs it in again. The reason is
-// remembered so the final error names it.
-func retireIdentity(failed identityRef, reason string) (TokenData, identityRef, error) {
-	return switchAway(failed, reason)
+// remembered so the final error names it, with the bearer that was rejected,
+// so a later login of the identity is recognized.
+func retireIdentity(failed identityRef, bearer, reason string) (TokenData, identityRef, error) {
+	return switchAway(failed, reason, bearer)
 }
 
 // recoverFromInvalidBearer is what a handler does with a 403 "invalid bearer"
@@ -170,19 +187,31 @@ func recoverFromInvalidBearer(ident identityRef, rejected TokenData, refreshedFo
 		if !isPermanentRefreshError(err) || !canSwitch {
 			return TokenData{}, identityRef{}, false, err
 		}
-		tok, id, serr := retireIdentity(ident, "refresh rejected: "+err.Error())
+		tok, id, serr := retireIdentity(ident, rejected.AccessToken, "refresh rejected: "+err.Error())
 		return tok, id, true, serr
+	}
+	// The identity had its refresh. Before retiring it, the file is looked
+	// at once more: a login that landed since (another process) is not the
+	// rejected bearer, and gets its own chance, refresh included.
+	adopted, err := adoptReplacedCredentials(rejected)
+	if err != nil {
+		return TokenData{}, identityRef{}, false, err
+	}
+	if adopted {
+		refreshedFor[ident.Name] = false
+		tok, id, terr := tokenForRequest()
+		return tok, id, false, terr
 	}
 	if !canSwitch {
 		return TokenData{}, identityRef{}, false, fmt.Errorf("bearer of identity %s still rejected after a refresh", ident.Name)
 	}
-	tok, id, serr := retireIdentity(ident, "bearer rejected after a refresh")
+	tok, id, serr := retireIdentity(ident, rejected.AccessToken, "bearer rejected after a refresh")
 	return tok, id, true, serr
 }
 
 // switchAway moves the proxy off the identity that failed: out of credits
 // when reason is empty, unusable for the given reason otherwise.
-func switchAway(failed identityRef, reason string) (TokenData, identityRef, error) {
+func switchAway(failed identityRef, reason, bearer string) (TokenData, identityRef, error) {
 	identityMu.Lock()
 	if failed.Gen != identityGen || failed.Name != profile.Active() {
 		// Someone else already switched: adopt the current identity.
@@ -193,6 +222,7 @@ func switchAway(failed identityRef, reason string) (TokenData, identityRef, erro
 		exhaustedIdentities[failed.Name] = true
 	} else {
 		identityFailures[failed.Name] = reason
+		retiredBearer[failed.Name] = bearer
 	}
 
 	cfg := config.Get()
@@ -201,8 +231,16 @@ func switchAway(failed identityRef, reason string) (TokenData, identityRef, erro
 	transient := map[string]string{}
 	for _, raw := range candidates {
 		name, err := profile.Validate(raw)
-		if err != nil || exhaustedIdentities[name] || identityFailures[name] != "" || !identityHasToken(name) {
+		if err != nil || exhaustedIdentities[name] || !identityHasToken(name) {
 			continue
+		}
+		if identityFailures[name] != "" {
+			// retired for good, unless someone logged it in again since
+			if !identityLoggedInAgain(name) {
+				continue
+			}
+			delete(identityFailures, name)
+			delete(retiredBearer, name)
 		}
 		if err := profile.SwitchTo(name); err != nil {
 			continue
@@ -232,6 +270,7 @@ func switchAway(failed identityRef, reason string) (TokenData, identityRef, erro
 			if err := tryRefreshToken(); err != nil {
 				if isPermanentRefreshError(err) {
 					identityFailures[name] = fmt.Sprintf("refresh failed: %v", err)
+					retiredBearer[name] = tok.AccessToken
 				} else {
 					transient[name] = fmt.Sprintf("refresh failed for now: %v", err)
 				}
@@ -337,6 +376,7 @@ func resetIdentityState() {
 	identityMu.Lock()
 	exhaustedIdentities = map[string]bool{}
 	identityFailures = map[string]string{}
+	retiredBearer = map[string]string{}
 	identityGen++
 	identityMu.Unlock()
 	profile.ResetIdentity()

@@ -44,7 +44,7 @@ func TestPublishAtRefusesAnOlderReadAfterAWrite(t *testing.T) {
 	if err := tryRefreshToken(); err != nil {
 		t.Fatal(err)
 	}
-	if publishTokenAt(profile.Active(), old, gen, stampOf(identityFile(""))) {
+	if publishTokenAt(profile.Active(), old, gen) {
 		t.Fatal("an older read was installed over a refreshed token")
 	}
 	if tok, _ := getToken(); tok.AccessToken != "fresh-token" {

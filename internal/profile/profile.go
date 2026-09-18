@@ -166,6 +166,9 @@ func TokenFileNameFor(n string) string { return withSuffix("kiro-auth-token.json
 // LoginConfigFileName is the file name of the saved login choice for the active identity.
 func LoginConfigFileName() string { return identitySuffixed("claude2kiro-login-config.json") }
 
+// LoginConfigFileNameFor is LoginConfigFileName for a given profile name.
+func LoginConfigFileNameFor(n string) string { return withSuffix("claude2kiro-login-config.json", n) }
+
 // ProxyPortFileName is the file name of the live-proxy port marker for the launched profile.
 func ProxyPortFileName() string { return suffixed("proxy.port") }
 

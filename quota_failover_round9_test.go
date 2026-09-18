@@ -398,12 +398,12 @@ func publishFromFileFor(t *testing.T, tokenPath string, expect TokenData, arn st
 			return TokenData{}, false
 		}
 	}
-	publishWrittenToken("", current, stampOf(tokenPath))
+	publishWrittenToken("", current)
 	return current, true
 }
 
 // A token file replaced by another process is noticed on the next request,
-// not at the cache TTL: the cache is keyed on the file's version.
+// not at the cache TTL: a hit is checked against the file's content.
 func TestCacheNoticesAFileWrittenByAnotherProcess(t *testing.T) {
 	x := TokenData{AccessToken: "user-X", RefreshToken: "rx", AuthMethod: "Social", ExpiresAt: farFuture()}
 	withIdentities(t, map[string]TokenData{"": x})

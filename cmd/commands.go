@@ -350,17 +350,21 @@ func ExportEnvCmd() tea.Msg {
 	}
 }
 
-// LoginFiles returns the login config and token file paths of the active
-// identity, resolved together.
-func LoginFiles() (configPath, tokenPath string) {
-	tokenPath = GetTokenFilePath()
-	configPath = filepath.Join(filepath.Dir(tokenPath), profile.LoginConfigFileName())
-	return configPath, tokenPath
+// LoginFilesFor returns the login config and token file paths of the
+// identity name ("" = default), so a caller that read the active name once
+// gets both files of that same identity.
+func LoginFilesFor(name string) (configPath, tokenPath string) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", ""
+	}
+	dir := filepath.Join(homeDir, ".aws", "sso", "cache")
+	return filepath.Join(dir, profile.LoginConfigFileNameFor(name)), filepath.Join(dir, profile.TokenFileNameFor(name))
 }
 
 // LogoutCmd logs the active identity out.
 func LogoutCmd() tea.Msg {
-	return LogoutAt(LoginFiles())
+	return LogoutAt(LoginFilesFor(profile.Active()))
 }
 
 // LogoutAt removes the given login config and token files. The caller

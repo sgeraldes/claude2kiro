@@ -17,6 +17,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/cmd"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 )
 
@@ -349,7 +350,7 @@ func TestChildLogoutHelper(t *testing.T) {
 	if os.Getenv("CLAUDE2KIRO_TEST_CHILD_LOGOUT") == "" {
 		t.Skip("not a child")
 	}
-	if _, _, err := cmd.RemoveLogin(cmd.LoginFiles()); err != nil {
+	if _, _, err := cmd.RemoveLogin(cmd.LoginFilesFor(profile.Active())); err != nil {
 		t.Fatal(err)
 	}
 	fmt.Println("child-logout-done")

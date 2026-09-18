@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	jsonStr "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -6685,7 +6686,7 @@ func logoutCmd() tea.Msg {
 	// The target is the identity that was active when the user asked,
 	// resolved before any wait: a failover that lands while a writer is
 	// busy must not redirect the logout to the reserve it moved to.
-	configPath, tokenPath := cmd.LoginFiles()
+	configPath, tokenPath := cmd.LoginFilesFor(profile.Active())
 	// serialized with this process's writers (mutex) and with any other
 	// process's (file lock) so nothing in flight can put the file back
 	tokenRefreshMutex.Lock()
@@ -6716,13 +6717,8 @@ var (
 	cachedToken     *TokenData
 	cachedIdentity  string
 	cachedTokenTime time.Time
-	// cachedStamp is the token file's modification time and size at the
-	// read the cache came from. A cache hit compares it with the file's:
-	// a login, refresh or logout in another process changes the file, and
-	// the cache is dropped on the next request rather than at the TTL.
-	cachedStamp tokenStamp
-	tokenMutex  sync.Mutex
-	cachedTTL   time.Duration
+	tokenMutex      sync.Mutex
+	cachedTTL       time.Duration
 	// tokenWriteGen counts token file writes (refresh, login, ARN merge). A
 	// reader that started before a write must not publish what it read: by
 	// the time its discovery call returns, the bearer it holds may have been
@@ -6748,21 +6744,23 @@ func getToken() (TokenData, error) {
 	}
 
 	tokenMutex.Lock()
-	// Use cache if it's fresh (a minute, to pick up manual file edits) and
-	// the file is the one it was read from.
-	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < cachedTTL && stampOf(tokenPath) == cachedStamp {
+	var hit *TokenData
+	// Use cache if it's fresh (a minute, to pick up manual file edits)
+	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < cachedTTL {
 		tok := *cachedToken
-		tokenMutex.Unlock()
-		return tok, nil
+		hit = &tok
 	}
 	tokenMutex.Unlock()
+	// A hit is served only while the file still holds the cached
+	// credentials and profile: a login, refresh or logout in another process
+	// changes or removes the file (its time and size say nothing reliable),
+	// and the cache is dropped on the next request rather than at the TTL.
+	if hit != nil && cacheMatchesFile(tokenPath, *hit) {
+		return *hit, nil
+	}
 
 	for attempt := 0; attempt < 3; attempt++ {
 		gen := tokenWriteGen.Load()
-		// The stamp is taken before the read: a write that lands between
-		// the two leaves a stamp the file no longer matches, and the next
-		// request reads again.
-		stamp := stampOf(tokenPath)
 		token, err := readTokenFile(tokenPath)
 		if err != nil {
 			if tokenWriteGen.Load() != gen {
@@ -6786,7 +6784,7 @@ func getToken() (TokenData, error) {
 				return merged, nil
 			}
 		}
-		if publishTokenAt(name, token, gen, stamp) {
+		if publishTokenAt(name, token, gen) {
 			return token, nil
 		}
 		// The file was written while this read was out: what was read is
@@ -6800,39 +6798,32 @@ func getToken() (TokenData, error) {
 // happened since generation gen. Check and install are one step under
 // tokenMutex, so a writer cannot publish a newer token in between and be
 // overwritten by this older read.
-func publishTokenAt(name string, token TokenData, gen uint64, stamp tokenStamp) bool {
+func publishTokenAt(name string, token TokenData, gen uint64) bool {
 	tokenMutex.Lock()
 	defer tokenMutex.Unlock()
 	if tokenWriteGen.Load() != gen {
 		return false
 	}
-	installToken(name, token, stamp)
+	installToken(name, token)
 	return true
 }
 
-// tokenStamp identifies a version of a token file: its modification time
-// and size. Every writer replaces the file through a rename, so a new
-// version is a new file with a new time.
-type tokenStamp struct {
-	mod  time.Time
-	size int64
-}
-
-// stampOf reads the stamp of the token file at path; a file that is not
-// there has the zero stamp.
-func stampOf(path string) tokenStamp {
-	info, err := os.Stat(path)
+// cacheMatchesFile tells whether the token file still holds the cached
+// token's credentials and profile. A file that is gone does not; a file
+// that cannot be read right now (a writer mid-replacement) is given the
+// benefit of the doubt, the cache being what was read from it last.
+func cacheMatchesFile(tokenPath string, cached TokenData) bool {
+	onDisk, err := readTokenFile(tokenPath)
 	if err != nil {
-		return tokenStamp{}
+		return !errors.Is(err, os.ErrNotExist)
 	}
-	return tokenStamp{mod: info.ModTime(), size: info.Size()}
+	return sameCredentials(onDisk, cached) && onDisk.ProfileArn == cached.ProfileArn
 }
 
 // installToken sets the cache. Caller holds tokenMutex.
-func installToken(name string, token TokenData, stamp tokenStamp) {
+func installToken(name string, token TokenData) {
 	cachedToken = &token
 	cachedIdentity = name
-	cachedStamp = stamp
 	cachedTokenTime = time.Now()
 	cachedTTL = tokenCacheTTL
 	if token.AuthMethod == "IdC" && token.ProfileArn == "" {
@@ -6869,7 +6860,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 func readTokenFile(tokenPath string) (TokenData, error) {
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
-		return TokenData{}, fmt.Errorf("failed to read token file: %v", err)
+		return TokenData{}, fmt.Errorf("failed to read token file: %w", err)
 	}
 	var token TokenData
 	if err := jsonStr.Unmarshal(data, &token); err != nil {
@@ -6914,7 +6905,7 @@ func publishFromFile(name, tokenPath string, expect TokenData, arn string) (Toke
 			return TokenData{}, false
 		}
 	}
-	publishWrittenToken(name, current, stampOf(tokenPath))
+	publishWrittenToken(name, current)
 	return current, true
 }
 
@@ -6942,11 +6933,39 @@ func writeTokenLocked(tokenPath string, token *TokenData) error {
 // publishWrittenToken installs a token this process just wrote to its file:
 // the write generation moves and the cache is set in one step under
 // tokenMutex, so no reader can install an older read after it.
-func publishWrittenToken(name string, token TokenData, stamp tokenStamp) {
+func publishWrittenToken(name string, token TokenData) {
 	tokenMutex.Lock()
 	tokenWriteGen.Add(1)
-	installToken(name, token, stamp)
+	installToken(name, token)
 	tokenMutex.Unlock()
+}
+
+// adoptReplacedCredentials tells whether the active identity's file no
+// longer holds the credentials rejected (a login or a refresh in another
+// process replaced them). When so the cache is dropped, so the next read
+// hands out what the file holds; the provider is not asked and nothing is
+// retired.
+func adoptReplacedCredentials(rejected TokenData) (bool, error) {
+	tokenRefreshMutex.Lock()
+	defer tokenRefreshMutex.Unlock()
+	tokenPath := tokenFilePathFor(profile.Active())
+	if tokenPath == "" {
+		return false, fmt.Errorf("failed to get user home directory")
+	}
+	unlock, err := tokenfile.Lock(tokenPath)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	current, err := readTokenFile(tokenPath)
+	if err != nil {
+		return false, err
+	}
+	if sameCredentials(current, rejected) {
+		return false, nil
+	}
+	bumpTokenGen()
+	return true, nil
 }
 
 // handleNonStreamRequest handles non-streaming requests. It returns the HTTP
@@ -7041,6 +7060,11 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	maxSwitches := len(cfg.Auth.FallbackProfiles) + 1
 	switches := 0
 	refreshedFor := map[string]bool{}
+	// every retry after a rejected bearer counts (a switch, a refresh, an
+	// adoption of credentials another process wrote), so a file that keeps
+	// changing under the request cannot keep it going
+	const bearerRetriesPerIdentity = 3
+	bearerRetries := 0
 	for {
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
@@ -7081,7 +7105,8 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			continue
 		}
 
-		if resp.StatusCode == 403 && isInvalidBearerToken(cwRespBody) {
+		if resp.StatusCode == 403 && isInvalidBearerToken(cwRespBody) && bearerRetries < maxSwitches*bearerRetriesPerIdentity {
+			bearerRetries++
 			if cur := currentIdentity(); cur != ident && switches < maxSwitches {
 				if tok, id, terr := tokenForRequest(); terr == nil {
 					switches++
