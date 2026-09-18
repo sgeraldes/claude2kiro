@@ -38,12 +38,16 @@ func holdFileUndeletable(t *testing.T, path string) func() {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = f.Close() })
+	// the hold is real only if the held file cannot be replaced right now
 	probe := path + ".probe"
-	if err := os.WriteFile(probe, []byte("x"), 0o600); err != nil {
+	if err := os.WriteFile(probe, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(probe); err != nil {
-		t.Fatal(err)
+	if err := os.Rename(probe, path); err == nil {
+		_ = f.Close()
+		return nil
 	}
+	_ = os.Remove(probe)
 	return func() { _ = f.Close() }
 }

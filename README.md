@@ -347,7 +347,7 @@ Claude2Kiro is useful if you:
 
 **Dashboard and server** both start a persistent proxy on a fixed port (default 8080). Additional Claude Code sessions attach automatically via `claude2kiro run`, or explicitly with `claude2kiro remote`. All requests are logged to the same files on disk.
 
-The proxy is stateless — it reads the auth token from disk on every request and holds no session data in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
+The proxy keeps no session data: it reads the auth token from disk on every request (a short-lived cache is checked against the file each time) and holds only the identity failover state in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
 
 ## License
 

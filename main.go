@@ -6814,7 +6814,8 @@ func getToken() (TokenData, error) {
 
 	tokenMutex.Lock()
 	var hit *TokenData
-	// Use cache if it's fresh (a minute, to pick up manual file edits)
+	// A hit is a token cached for this identity within the TTL; it is
+	// checked against the file's content below
 	if cachedToken != nil && cachedIdentity == name && time.Since(cachedTokenTime) < cachedTTL {
 		tok := *cachedToken
 		hit = &tok
