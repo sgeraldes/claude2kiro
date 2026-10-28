@@ -2236,6 +2236,13 @@ func main() {
 	// set changes (fires on the first fetch and on every subsequent change).
 	modelCatalog.SetOnChange(updateModelsDoc)
 
+	var err error
+	os.Args, err = normalizeRunInvocation(os.Args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	if len(os.Args) < 2 {
 		// No arguments - launch TUI
 		runTUI()
@@ -2441,6 +2448,27 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+// normalizeRunInvocation accepts resume-first syntax while keeping the
+// established command-first form intact:
+//
+//	claude2kiro --resume <session-id> run [claude args...]
+//
+// Internally it becomes `claude2kiro run --resume <session-id> ...`, so the
+// existing run path forwards the Claude flags unchanged.
+func normalizeRunInvocation(args []string) ([]string, error) {
+	if len(args) < 2 || args[1] != "--resume" {
+		return args, nil
+	}
+	if len(args) < 4 || args[2] == "" || args[3] != "run" {
+		return nil, fmt.Errorf("usage: claude2kiro --resume <session-id> run [claude args...]")
+	}
+
+	normalized := make([]string, 0, len(args))
+	normalized = append(normalized, args[0], "run", "--resume", args[2])
+	normalized = append(normalized, args[4:]...)
+	return normalized, nil
 }
 
 // ensureClaudeConfig seeds ~/.claude.json so Claude Code works through the
@@ -5213,9 +5241,25 @@ func interactiveIdCLogin() *LoginConfig {
 }
 
 const (
-	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "0.11.107" // Kiro IDE version to impersonate
+	kiroAuthEndpoint        = "https://prod.us-east-1.auth.desktop.kiro.dev"
+	kiroSocialLoginEndpoint = "https://app.kiro.dev/signin"
+	kiroVersion             = "0.11.107" // Kiro IDE version to impersonate
 )
+
+// buildSocialLoginURL builds the browser URL used by the current Kiro CLI.
+// Token exchange still belongs to kiroAuthEndpoint, but the old /login page on
+// that host is no longer the public entry point for Google/GitHub sign-in.
+func buildSocialLoginURL(provider, redirectURI, codeChallenge, state string) string {
+	params := url.Values{
+		"idp":                   {provider},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {state},
+		"redirect_from":         {"kirocli"},
+	}
+	return kiroSocialLoginEndpoint + "?" + params.Encode()
+}
 
 // generatePKCE generates PKCE code verifier and challenge
 func generatePKCE() (verifier string, challenge string, err error) {
@@ -5715,8 +5759,159 @@ func joinInts(ns []int) string {
 	return strings.Join(parts, ", ")
 }
 
-// loginSocial performs browser-based OAuth login with GitHub or Google
+type socialDeviceAuthorization struct {
+	DeviceCode              string `json:"deviceCode"`
+	ExpiresInMilliseconds   int    `json:"expiresInMilliseconds"`
+	IntervalInMilliseconds  int    `json:"intervalInMilliseconds"`
+	UserCode                string `json:"userCode"`
+	VerificationURI         string `json:"verificationUri"`
+	VerificationURIComplete string `json:"verificationUriComplete"`
+}
+
+type socialDevicePollResponse struct {
+	AccessToken      string `json:"accessToken"`
+	RefreshToken     string `json:"refreshToken"`
+	ProfileArn       string `json:"profileArn"`
+	IdentityProvider string `json:"identityProvider"`
+	Status           string `json:"status"`
+	ExpiresIn        int    `json:"expiresIn"`
+}
+
+func postSocialDeviceJSON(client *http.Client, endpoint string, payload any, result any) error {
+	body, err := jsonStr.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("request failed (status %d): %s", resp.StatusCode, string(responseBody))
+	}
+	if err := jsonStr.Unmarshal(responseBody, result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+func startSocialDeviceAuthorization(client *http.Client, endpoint, provider string) (socialDeviceAuthorization, error) {
+	var auth socialDeviceAuthorization
+	err := postSocialDeviceJSON(client, endpoint+"/oauth/device/authorization", map[string]string{
+		"clientId":      "kiro-cli",
+		"loginProvider": provider,
+	}, &auth)
+	if err != nil {
+		return auth, err
+	}
+	if auth.DeviceCode == "" || auth.UserCode == "" || auth.VerificationURIComplete == "" {
+		return auth, fmt.Errorf("device authorization response is incomplete")
+	}
+	return auth, nil
+}
+
+func pollSocialDeviceAuthorization(client *http.Client, endpoint, deviceCode string) (socialDevicePollResponse, error) {
+	var poll socialDevicePollResponse
+	err := postSocialDeviceJSON(client, endpoint+"/oauth/device/poll", map[string]string{
+		"clientId":   "kiro-cli",
+		"deviceCode": deviceCode,
+	}, &poll)
+	return poll, err
+}
+
+// loginSocial uses Kiro's device authorization flow. Unlike the legacy PKCE
+// portal, it does not depend on a localhost redirect URI accepted by the web
+// application and is the supported fallback exposed by kiro-cli.
 func loginSocial(provider string) {
+	fmt.Printf("Starting login with %s...\n", provider)
+	client := &http.Client{Timeout: 30 * time.Second}
+	auth, err := startSocialDeviceAuthorization(client, kiroAuthEndpoint, provider)
+	if err != nil {
+		fmt.Printf("Failed to start device authorization: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Authorization code: %s\n", auth.UserCode)
+	fmt.Printf("Open this URL to authenticate:\n%s\n\n", auth.VerificationURIComplete)
+	if err := openBrowser(auth.VerificationURIComplete); err != nil {
+		fmt.Printf("Failed to open browser: %v\n", err)
+		fmt.Println("Please open the URL above manually.")
+	}
+	fmt.Println("Waiting for authentication...")
+
+	interval := time.Duration(auth.IntervalInMilliseconds) * time.Millisecond
+	if interval < time.Second {
+		interval = 5 * time.Second
+	}
+	timeout := time.Duration(auth.ExpiresInMilliseconds) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Authentication timed out. Please try again.")
+			os.Exit(1)
+		case <-ticker.C:
+			poll, err := pollSocialDeviceAuthorization(client, kiroAuthEndpoint, auth.DeviceCode)
+			if err != nil {
+				fmt.Printf("Authentication failed: %v\n", err)
+				os.Exit(1)
+			}
+			switch poll.Status {
+			case "authorization_pending":
+				continue
+			case "slow_down":
+				ticker.Reset(interval + 5*time.Second)
+				continue
+			}
+			if poll.AccessToken == "" || poll.RefreshToken == "" {
+				fmt.Printf("Authentication failed: %s\n", poll.Status)
+				os.Exit(1)
+			}
+			expiresIn := poll.ExpiresIn
+			if expiresIn <= 0 {
+				expiresIn = 3600
+			}
+			token := &TokenData{
+				AccessToken:  poll.AccessToken,
+				RefreshToken: poll.RefreshToken,
+				ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339),
+				AuthMethod:   "social",
+				Provider:     provider,
+				ProfileArn:   poll.ProfileArn,
+			}
+			if err := saveToken(token); err != nil {
+				fmt.Printf("Failed to save token: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("\n✓ Login successful!")
+			fmt.Printf("Provider: %s\n", provider)
+			fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
+			return
+		}
+	}
+}
+
+// loginSocialPKCE retains the previous local callback implementation for
+// reference while social login uses the more reliable device flow above.
+func loginSocialPKCE(provider string) {
 	fmt.Printf("Starting login with %s...\n", provider)
 
 	// Generate PKCE values
@@ -5740,7 +5935,7 @@ func loginSocial(provider string) {
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	redirectUri := fmt.Sprintf("http://127.0.0.1:%d/oauth/callback", port)
+	redirectUri := fmt.Sprintf("http://localhost:%d/oauth/callback", port)
 
 	fmt.Printf("Callback server started on port %d\n", port)
 
@@ -5819,14 +6014,9 @@ func loginSocial(provider string) {
 		}
 	}()
 
-	// Build login URL
-	loginUrl := fmt.Sprintf("%s/login?idp=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=%s",
-		kiroAuthEndpoint,
-		provider,
-		url.QueryEscape(redirectUri),
-		codeChallenge,
-		state,
-	)
+	// Kiro moved the browser-facing social login page to app.kiro.dev. The
+	// auth service remains responsible for the subsequent token exchange.
+	loginUrl := buildSocialLoginURL(provider, redirectUri, codeChallenge, state)
 
 	fmt.Println("Opening browser for authentication...")
 	fmt.Printf("If the browser doesn't open, please visit:\n%s\n\n", loginUrl)
