@@ -5214,7 +5214,10 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "0.11.107" // Kiro IDE version to impersonate
+	// Kiro stopped accepting IDE versions older than 0.11.133 on 2026-11-09.
+	// Keep this aligned with a currently supported IDE release because every
+	// CodeWhisperer request identifies this proxy as a Kiro IDE client.
+	kiroVersion = "0.12.200"
 )
 
 // generatePKCE generates PKCE code verifier and challenge
