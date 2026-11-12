@@ -71,7 +71,9 @@ type SSOCreateTokenResponse struct {
 	TokenType    string `json:"tokenType"`
 }
 
-const kiroVersion = "0.11.107"
+// Kiro stopped accepting IDE versions older than 0.11.133 on 2026-11-09.
+// This package also calls Kiro services directly, so it must match main.go.
+const kiroVersion = "0.12.200"
 
 // GetTokenFilePath returns the cross-platform token file path
 func GetTokenFilePath() string {
