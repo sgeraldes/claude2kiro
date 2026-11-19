@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 )
 
@@ -176,6 +177,57 @@ func TestStreamCancelsTheBackendWhenTheClientDisconnects(t *testing.T) {
 	if strings.Contains(rec.String(), `"type":"error"`) {
 		t.Fatalf("a disconnected client must not be answered an error:\n%s", rec.String())
 	}
+}
+
+// A client that leaves while its request waits for a concurrency slot ends the
+// wait: the handler returns without the slot and the backend never hears of it.
+func TestStreamQueuedRequestStopsWaitingWhenTheClientLeaves(t *testing.T) {
+	var contacted sync.Once
+	backendHit := make(chan struct{})
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		contacted.Do(func() { close(backendHit) })
+		w.WriteHeader(http.StatusOK)
+	})
+	cfg := *config.Get()
+	cfg.Network.MaxConcurrentReqs = 1
+	withConfig(t, &cfg)
+
+	// Another request holds the only slot.
+	kiroSema.acquire()
+	held := true
+	t.Cleanup(func() {
+		if held {
+			kiroSema.release()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		handleStreamRequestCtx(ctx, newLiveRecorder(), testRequest(), logger.NewLogger(50), "sess", "req", nil)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond) // let it queue
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler kept waiting for a slot after the client left")
+	}
+	select {
+	case <-backendHit:
+		t.Fatal("a request abandoned in the queue reached the backend")
+	default:
+	}
+	kiroSema.mu.Lock()
+	active := kiroSema.active
+	kiroSema.mu.Unlock()
+	if active != 1 {
+		t.Fatalf("active = %d, want 1 (only the holder)", active)
+	}
+	kiroSema.release()
+	held = false
 }
 
 // assertStreamFailed checks that a response the backend did not finish reaches

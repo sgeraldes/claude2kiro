@@ -640,12 +640,36 @@ func kiroConcurrencyLimit() int {
 
 // acquire blocks until fewer than the current limit are in flight.
 func (l *kiroLimiter) acquire() {
+	l.acquireCtx(context.Background())
+}
+
+// acquireCtx blocks until fewer than the current limit are in flight and
+// takes a slot, or until ctx is done, in which case it takes no slot and
+// returns false. A waiter whose client left stops waiting at once instead of
+// holding its place in the queue.
+func (l *kiroLimiter) acquireCtx(ctx context.Context) bool {
+	// sync.Cond cannot be cancelled, so wake every waiter when ctx ends. The
+	// broadcast takes the lock: a waiter is either still before its ctx check
+	// (and sees the error) or already parked in Wait (and is woken).
+	stop := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer stop()
+
 	l.mu.Lock()
-	for l.active >= kiroConcurrencyLimit() {
+	defer l.mu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		if l.active < kiroConcurrencyLimit() {
+			l.active++
+			return true
+		}
 		l.cond.Wait()
 	}
-	l.active++
-	l.mu.Unlock()
 }
 
 // release frees a slot and wakes any waiters (the limit may have risen).
@@ -4557,10 +4581,6 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
 	queuedAt := time.Now()
-	kiroSema.acquire()
-	defer kiroSema.release()
-	queueWait := time.Since(queuedAt)
-	sentAt := time.Now()
 
 	// clientGone reports a client that disconnected; nothing is sent to it and
 	// the backend request, bound to ctx, is already cancelled.
@@ -4572,9 +4592,15 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			stage, cwReq.ConversationState.ConversationId[:8], time.Since(queuedAt).Round(time.Millisecond)))
 		return true
 	}
-	if clientGone("while queued") {
+	if !kiroSema.acquireCtx(ctx) {
+		// The client left while the request waited for a slot; it never took
+		// one and the backend never saw it.
+		clientGone("while queued")
 		return ""
 	}
+	defer kiroSema.release()
+	queueWait := time.Since(queuedAt)
+	sentAt := time.Now()
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response
