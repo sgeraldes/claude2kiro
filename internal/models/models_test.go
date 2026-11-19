@@ -519,3 +519,64 @@ func TestThinkingTypesAndMaxTokensComeFromTheRequestFieldsSchema(t *testing.T) {
 		t.Error("max_tokens of a model the catalog does not list must be reported unknown and not accepted")
 	}
 }
+
+// countingFailingCatalog returns a catalog whose every fetch fails, and the
+// number of fetches it has made so far.
+func countingFailingCatalog(backoff time.Duration) (*Catalog, func() int) {
+	var mu sync.Mutex
+	calls := 0
+	cat := NewCatalog(time.Minute, func() ([]KiroModel, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		return nil, fmt.Errorf("ListAvailableModels unreachable")
+	})
+	cat.failureBackoff = backoff
+	return cat, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+}
+
+// After a failed fetch the catalog does not fetch again within the backoff,
+// however often the request path asks.
+func TestCatalogFailedFetchIsNotRepeatedWithinTheBackoff(t *testing.T) {
+	cat, calls := countingFailingCatalog(time.Hour)
+	for i := 0; i < 20; i++ {
+		cat.Models()
+		cat.Has("claude-opus-4.8")
+	}
+	if n := calls(); n != 1 {
+		t.Fatalf("fetches = %d, want 1 within the backoff", n)
+	}
+}
+
+// Once the backoff has passed, the next use tries again.
+func TestCatalogFailedFetchIsRetriedAfterTheBackoff(t *testing.T) {
+	cat, calls := countingFailingCatalog(20 * time.Millisecond)
+	cat.Has("claude-opus-4.8")
+	time.Sleep(40 * time.Millisecond)
+	cat.Has("claude-opus-4.8")
+	if n := calls(); n != 2 {
+		t.Fatalf("fetches = %d, want 2 (one more after the backoff)", n)
+	}
+}
+
+// Invalidate clears the backoff: the next use fetches at once.
+func TestCatalogInvalidateClearsTheFailureBackoff(t *testing.T) {
+	cat, calls := countingFailingCatalog(time.Hour)
+	cat.Has("claude-opus-4.8")
+	cat.Invalidate()
+	cat.Has("claude-opus-4.8")
+	if n := calls(); n != 2 {
+		t.Fatalf("fetches = %d, want 2 (Invalidate forces a retry)", n)
+	}
+}
+
+// The default backoff is 30 seconds.
+func TestCatalogFailureBackoffDefaultsTo30s(t *testing.T) {
+	if got := NewCatalog(time.Minute, nil).failureBackoff; got != 30*time.Second {
+		t.Fatalf("failureBackoff = %v, want 30s", got)
+	}
+}

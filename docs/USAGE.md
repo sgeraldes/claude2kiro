@@ -130,6 +130,12 @@ When the proxy has to resolve a generic model id (like a bare `opus` alias),
 it picks the highest version *your* account offers — which is why an account
 without preview models lands on Opus 4.6.
 
+The proxy keeps that list for 10 minutes. When fetching it fails
+(`ListAvailableModels` unreachable), the proxy keeps using the last list it
+got, or the build-time model table when it never got one, and does not try
+again for 30 seconds, so requests do not each wait for a failing fetch. Moving
+to another identity fetches the list again at once.
+
 Quick checks:
 
 - **Which model is the session on?** The statusline shows the id Claude Code

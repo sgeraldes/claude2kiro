@@ -188,11 +188,13 @@ type Catalog struct {
 	models    []KiroModel
 	ids       map[string]bool
 	fetchedAt time.Time
-	gen       uint64 // bumped by Invalidate; a fetch started before it is discarded
+	gen       uint64    // bumped by Invalidate; a fetch started before it is discarded
+	failedAt  time.Time // last failed fetch; zero after a success or Invalidate
 
-	fetchMu sync.Mutex // serializes refresh to avoid a fetch stampede
-	ttl     time.Duration
-	fetch   func() ([]KiroModel, error)
+	fetchMu        sync.Mutex // serializes refresh to avoid a fetch stampede
+	ttl            time.Duration
+	failureBackoff time.Duration // no new fetch this long after a failed one
+	fetch          func() ([]KiroModel, error)
 
 	onChange    func([]KiroModel) // fired when the model set changes
 	fingerprint string            // fingerprint of the last seen model set
@@ -202,8 +204,13 @@ type Catalog struct {
 // than ttl. fetch supplies the live model list (typically a closure that reads
 // the auth token + config and calls Fetch).
 func NewCatalog(ttl time.Duration, fetch func() ([]KiroModel, error)) *Catalog {
-	return &Catalog{ttl: ttl, fetch: fetch, ids: map[string]bool{}}
+	return &Catalog{ttl: ttl, failureBackoff: fetchFailureBackoff, fetch: fetch, ids: map[string]bool{}}
 }
+
+// fetchFailureBackoff is how long the catalog waits after a failed fetch before
+// it fetches again. Without it, while ListAvailableModels is unreachable every
+// lookup on the request path would refetch and wait out the HTTP timeout.
+const fetchFailureBackoff = 30 * time.Second
 
 // Invalidate forgets the cached list so the next use refetches. The proxy
 // calls it when it moves to another Kiro identity: the models one account can
@@ -218,6 +225,7 @@ func (c *Catalog) Invalidate() {
 	}
 	c.mu.Lock()
 	c.fetchedAt = time.Time{}
+	c.failedAt = time.Time{}
 	c.models = nil
 	c.ids = map[string]bool{}
 	c.gen++
@@ -237,31 +245,28 @@ func (c *Catalog) SetOnChange(fn func([]KiroModel)) {
 }
 
 // refreshIfStale refetches when the cache is empty or older than the TTL.
-// A fetch failure is swallowed when usable cached data already exists.
+// A fetch failure is swallowed: the last good data (if any) stays in use, and
+// no fetch is tried again for failureBackoff.
 func (c *Catalog) refreshIfStale() {
 	if c == nil || c.fetch == nil {
 		return
 	}
 
-	c.mu.RLock()
-	fresh := len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
-	hadData := len(c.models) > 0
-	c.mu.RUnlock()
-	if fresh {
+	if c.skipRefresh() {
 		return
 	}
 
 	c.fetchMu.Lock()
 	defer c.fetchMu.Unlock()
 
-	// Another goroutine may have refreshed while we waited for the fetch lock.
-	c.mu.RLock()
-	fresh = len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
-	gen := c.gen
-	c.mu.RUnlock()
-	if fresh {
+	// Another goroutine may have refreshed (or failed) while we waited for the
+	// fetch lock.
+	if c.skipRefresh() {
 		return
 	}
+	c.mu.RLock()
+	gen := c.gen
+	c.mu.RUnlock()
 
 	var models []KiroModel
 	confirmed := false
@@ -270,8 +275,13 @@ func (c *Catalog) refreshIfStale() {
 		models, err = c.fetch()
 		if err != nil {
 			// Keep serving stale-but-usable data; only the first fetch failure
-			// (with nothing cached) leaves the catalog empty.
-			_ = hadData
+			// (with nothing cached) leaves the catalog empty. A failure for an
+			// identity that was invalidated meanwhile is not recorded.
+			c.mu.Lock()
+			if c.gen == gen {
+				c.failedAt = time.Now()
+			}
+			c.mu.Unlock()
 			return
 		}
 		c.mu.RLock()
@@ -304,6 +314,7 @@ func (c *Catalog) refreshIfStale() {
 	c.models = models
 	c.ids = ids
 	c.fetchedAt = time.Now()
+	c.failedAt = time.Time{}
 	changed := fp != c.fingerprint
 	c.fingerprint = fp
 	c.mu.Unlock()
@@ -314,6 +325,17 @@ func (c *Catalog) refreshIfStale() {
 		copy(snapshot, models)
 		c.onChange(snapshot)
 	}
+}
+
+// skipRefresh reports whether no fetch is due: the cache is fresh, or a fetch
+// failed less than failureBackoff ago.
+func (c *Catalog) skipRefresh() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl {
+		return true
+	}
+	return !c.failedAt.IsZero() && time.Since(c.failedAt) < c.failureBackoff
 }
 
 // Warm forces an initial fetch (best-effort). Safe to call from a goroutine at
