@@ -7650,81 +7650,13 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
 	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
 
-	textContent := ""
-	toolName := ""
-	toolUseId := ""
-	partialJsonStr := ""
-
-	contexts := []map[string]any{}
-
-	// Extract content from parsed events.
-	// Parser generates: content_block_delta (text_delta/input_json_delta) and message_delta.
-	// Note: parser does NOT generate content_block_start or content_block_stop events.
-	for _, event := range events {
-		if event.Data == nil {
-			continue
-		}
-		dataMap, ok := event.Data.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		switch event.Event {
-		case "content_block_delta":
-			if delta, ok := dataMap["delta"].(map[string]any); ok {
-				switch delta["type"] {
-				case "text_delta":
-					if text, ok := delta["text"].(string); ok {
-						textContent += text
-					}
-				case "input_json_delta":
-					if pj, ok := delta["partial_json"].(string); ok {
-						partialJsonStr += pj
-					}
-				}
-			}
-			// Also check direct content field (Kiro raw format)
-			if content, ok := dataMap["content"].(string); ok && content != "" {
-				textContent += content
-			}
-
-		case "content_block_start":
-			if cb, ok := dataMap["content_block"].(map[string]any); ok {
-				if cb["type"] == "tool_use" {
-					if name, ok := cb["name"].(string); ok {
-						toolName = name
-					}
-					if id, ok := cb["id"].(string); ok {
-						toolUseId = id
-					}
-				}
-			}
-		}
-	}
+	contexts, toolCount, outputChars := nonStreamContentBlocks(events)
 
 	if lg != nil {
 		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d%s [%s:%s]",
-			len(events), textContent != "", toolName != "",
+			len(events), len(contexts) > toolCount, toolCount > 0,
 			backendStopReasonLabel(summary.BackendStopReason), summary.ReasoningChars,
 			servedModelField(summary.ServedModel), sessionID, requestID))
-	}
-
-	// Build content blocks
-	if strings.TrimSpace(textContent) != "" {
-		contexts = append(contexts, map[string]any{
-			"type": "text",
-			"text": textContent,
-		})
-	}
-	if toolName != "" && partialJsonStr != "" {
-		toolInput := map[string]any{}
-		jsonStr.Unmarshal([]byte(partialJsonStr), &toolInput)
-		contexts = append(contexts, map[string]any{
-			"type":  "tool_use",
-			"id":    toolUseId,
-			"name":  toolName,
-			"input": toolInput,
-		})
 	}
 
 	if len(contexts) == 0 && summary.StopReason == "max_tokens" {
@@ -7744,9 +7676,10 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		"stop_reason":   summary.StopReason,
 		"stop_sequence": nil,
 		"type":          "message",
+		// The same estimates as the streaming path: characters / 4.
 		"usage": map[string]any{
-			"input_tokens":  len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
-			"output_tokens": len(textContent),
+			"input_tokens":  len(cwReqBody) / 4,
+			"output_tokens": outputChars / 4,
 		},
 	}
 
@@ -7754,6 +7687,89 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	w.Header().Set("Content-Type", "application/json")
 	jsonStr.NewEncoder(w).Encode(anthropicResp)
 	return http.StatusOK
+}
+
+// nonStreamContentBlocks builds the content of a non-streaming answer from the
+// parsed events, in arrival order: one text block per run of text, and one
+// tool_use block per tool call with its own id, name and input. A text run of
+// only whitespace is dropped. It also returns the number of tool blocks and
+// the characters of text and tool input, for the usage estimate.
+func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, tools int, outputChars int) {
+	type toolBlock struct {
+		block map[string]any
+		input strings.Builder
+	}
+	type pending struct {
+		text *strings.Builder
+		tool *toolBlock
+	}
+	var order []pending
+	toolsByIndex := map[any]*toolBlock{}
+	appendText := func(text string) {
+		outputChars += len(text)
+		if n := len(order); n > 0 && order[n-1].text != nil {
+			order[n-1].text.WriteString(text)
+			return
+		}
+		b := &strings.Builder{}
+		b.WriteString(text)
+		order = append(order, pending{text: b})
+	}
+
+	for _, event := range events {
+		dataMap, ok := event.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch event.Event {
+		case "content_block_start":
+			cb, ok := dataMap["content_block"].(map[string]any)
+			if !ok || cb["type"] != "tool_use" {
+				continue
+			}
+			tb := &toolBlock{block: map[string]any{"type": "tool_use", "id": cb["id"], "name": cb["name"]}}
+			toolsByIndex[dataMap["index"]] = tb
+			order = append(order, pending{tool: tb})
+		case "content_block_delta":
+			if delta, ok := dataMap["delta"].(map[string]any); ok {
+				switch delta["type"] {
+				case "text_delta":
+					if text, ok := delta["text"].(string); ok {
+						appendText(text)
+					}
+				case "input_json_delta":
+					if pj, ok := delta["partial_json"].(string); ok {
+						outputChars += len(pj)
+						if tb := toolsByIndex[dataMap["index"]]; tb != nil {
+							tb.input.WriteString(pj)
+						}
+					}
+				}
+			}
+			// Also check direct content field (Kiro raw format)
+			if content, ok := dataMap["content"].(string); ok && content != "" {
+				appendText(content)
+			}
+		}
+	}
+
+	blocks = []map[string]any{} // an empty answer is "content": [], never null
+	for _, p := range order {
+		if p.text != nil {
+			if text := p.text.String(); strings.TrimSpace(text) != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": text})
+			}
+			continue
+		}
+		input := map[string]any{}
+		if raw := p.tool.input.String(); raw != "" {
+			jsonStr.Unmarshal([]byte(raw), &input)
+		}
+		p.tool.block["input"] = input
+		blocks = append(blocks, p.tool.block)
+		tools++
+	}
+	return blocks, tools, outputChars
 }
 
 // sendSSEEvent sends an SSE event and optionally captures it
