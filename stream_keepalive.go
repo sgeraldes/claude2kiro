@@ -24,8 +24,9 @@ type keepaliveWriter struct {
 	flusher   http.Flusher
 	lastWrite time.Time
 
-	done chan struct{}
-	wg   sync.WaitGroup
+	done     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 func newKeepaliveWriter(w http.ResponseWriter, flusher http.Flusher, interval time.Duration) *keepaliveWriter {
@@ -59,9 +60,9 @@ func (k *keepaliveWriter) Flush() {
 }
 
 // stop ends the ping goroutine and waits for it, so nothing is written to the
-// response after the handler returns.
+// response after the handler returns. Calling it again does nothing.
 func (k *keepaliveWriter) stop() {
-	close(k.done)
+	k.stopOnce.Do(func() { close(k.done) })
 	k.wg.Wait()
 }
 

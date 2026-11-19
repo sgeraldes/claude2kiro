@@ -254,6 +254,63 @@ func TestStreamQueuedRequestStopsWaitingWhenTheClientLeaves(t *testing.T) {
 	held = false
 }
 
+// A client that leaves while the handler waits out a retry backoff ends the
+// wait at once, and the backend gets no further attempt.
+func TestStreamRetryBackoffEndsWhenTheClientLeaves(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	third := make(chan struct{})
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		if n == 3 {
+			close(third)
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"message":"overloaded"}`))
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		handleStreamRequestCtx(ctx, newLiveRecorder(), testRequest(), logger.NewLogger(50), "sess", "req", nil)
+		close(done)
+	}()
+
+	select {
+	case <-third:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the backend never got its third attempt")
+	}
+	// The backoff before the fourth attempt is at least 800ms.
+	time.Sleep(50 * time.Millisecond)
+	cancelled := time.Now()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler did not return after the client left")
+	}
+	if waited := time.Since(cancelled); waited > 400*time.Millisecond {
+		t.Fatalf("the handler slept %v of the backoff after the client left", waited)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 3 {
+		t.Fatalf("backend attempts = %d, want 3 (none after the client left)", hits)
+	}
+}
+
+func TestKeepaliveWriterStopIsSafeTwice(t *testing.T) {
+	k := newKeepaliveWriter(newLiveRecorder(), newLiveRecorder(), 10*time.Millisecond)
+	k.stop()
+	k.stop()
+}
+
 // assertStreamFailed checks that a response the backend did not finish reaches
 // the client as a retryable error and never as a finished answer.
 func assertStreamFailed(t *testing.T, body string) {

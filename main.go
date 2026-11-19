@@ -4648,7 +4648,16 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			proxyReq.Header.Set("Accept", "text/event-stream")
 			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 			if !skipBackoff {
-				time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
+				// Exponential backoff with jitter, cut short when the client leaves.
+				backoff := time.NewTimer(retryBackoff(attempt))
+				select {
+				case <-backoff.C:
+				case <-ctx.Done():
+					backoff.Stop()
+				}
+				if clientGone("during the retry backoff") {
+					return ""
+				}
 			}
 			skipBackoff = false
 		}
