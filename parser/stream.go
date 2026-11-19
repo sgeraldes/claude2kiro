@@ -46,10 +46,12 @@ func ReadFramePayload(r io.Reader) ([]byte, error) {
 // events one frame at a time, so the proxy can forward a response while the
 // backend is still producing it. Blocks get their index in arrival order and a
 // text block is closed before a tool block starts. A tool block stays open
-// until its stop frame or Finish, even when text arrives in between: that text
-// gets its own block, so two blocks can be open at once. Clients follow blocks
-// by index, and ParseEvents produced the same shape. It is not safe for
-// concurrent use.
+// until its stop frame or Finish. Text that arrives while a tool block is open
+// gets its own block, so two blocks can be open at once. That order is handled
+// defensively and has not been observed: in the live responses captured so far
+// (about a dozen) text frames always came before the tool frames, never inside
+// an open tool call. Clients follow blocks by index, and ParseEvents produced
+// the same shape. It is not safe for concurrent use.
 type StreamTranslator struct {
 	nextIndex int
 	textIndex int            // index of the open text block, -1 when none is open
@@ -86,8 +88,8 @@ func (t *StreamTranslator) Translate(payload []byte) []SSEEvent {
 	switch {
 	case evt.Content != "":
 		if t.textIndex < 0 {
-			// An open tool block stays open: its input may still arrive after
-			// this text, and closing it would lose that input.
+			// An open tool block stays open: if its input arrived after this
+			// text (not observed so far), closing it would lose that input.
 			t.textIndex = t.nextIndex
 			t.nextIndex++
 			out = append(out, SSEEvent{Event: "content_block_start", Data: map[string]any{
