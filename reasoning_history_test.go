@@ -230,6 +230,31 @@ func TestReasoningCapKeepsTheNewestTurns(t *testing.T) {
 	}
 }
 
+// A turn whose reasoning alone exceeds the room left is skipped; older turns
+// that fit still get theirs.
+func TestReasoningCapSkipsAnOversizedTurnAndKeepsOlderOnes(t *testing.T) {
+	withReasoningStore(t)
+	withReasoningConfig(t, 100, "full", "full")
+	kiroModel := getKiroModelID(reasoningTestModel)
+	rememberResponse(t, kiroModel, toolAnswer("small", "SIG-S", "tu_old")...)
+	rememberResponse(t, kiroModel, toolAnswer(strings.Repeat("x", 200), "SIG-BIG", "tu_new")...)
+
+	cw := buildCodeWhispererRequest(manyTurnsRequest("tu_old", "tu_new"), TokenData{})
+	assistants := historyAssistants(cw)
+	if len(assistants) != 2 {
+		t.Fatalf("history has %d assistant turns, want 2", len(assistants))
+	}
+	if assistants[1].AssistantResponseMessage.ReasoningContent != nil {
+		t.Fatal("the newest turn's reasoning is over the cap and must not be attached")
+	}
+	if assistants[0].AssistantResponseMessage.ReasoningContent == nil {
+		t.Fatal("the older turn fits and must carry its reasoning")
+	}
+	if cw.reasoning.turns != 1 || cw.reasoning.bytes != len("small")+len("SIG-S") {
+		t.Fatalf("attachment = %+v, want only the small turn", cw.reasoning)
+	}
+}
+
 func TestReasoningCapZeroTurnsTheFeatureOff(t *testing.T) {
 	withReasoningStore(t)
 	withReasoningConfig(t, config.DefaultReasoningHistoryMaxBytes, "full", "full")

@@ -113,8 +113,10 @@ func rememberReasoning(kiroModel string, scope reasoningScope, block parser.Reas
 }
 
 // attachReasoning sets reasoningContent on the history's assistant turns that
-// have stored reasoning of kiroModel, newest first, and stops before the
-// attached bytes would exceed maxBytes. maxBytes 0 attaches nothing. Each
+// have stored reasoning of kiroModel, newest first, and skips a turn whose
+// reasoning would take the attached bytes past maxBytes, so one oversized
+// block does not cost every older turn its reasoning. maxBytes 0 attaches
+// nothing. Each
 // turn is looked up by the keys buildCodeWhispererRequest gave it
 // (reasoningScope.keys), the same keys rememberReasoning stored under.
 func attachReasoning(history []any, kiroModel string, maxBytes int) reasoningAttachment {
@@ -132,7 +134,7 @@ func attachReasoning(history []any, kiroModel string, maxBytes int) reasoningAtt
 			continue
 		}
 		if att.bytes+entry.Size() > maxBytes {
-			break
+			continue // too big for the room left; an older, smaller turn may fit
 		}
 		if len(entry.Redacted) > 0 && (entry.Text == "" || entry.Signature == "") {
 			msg.AssistantResponseMessage.ReasoningContent = &ReasoningContent{RedactedContent: entry.Redacted}

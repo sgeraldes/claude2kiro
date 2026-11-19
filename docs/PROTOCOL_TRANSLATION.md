@@ -248,10 +248,11 @@ the next turn simply carries no reasoning and the model thinks again.
 
 When the proxy builds a request, it looks up each assistant turn of the history
 by the keys above and attaches `reasoningContent` only when the entry's model
-id equals the current request's Kiro model id. It attaches newest turns first and stops at the first
-turn whose reasoning would take the request past
+id equals the current request's Kiro model id. It attaches newest turns first and skips any turn
+whose reasoning would take the request past
 `advanced.reasoning_history_max_bytes` (default 4194304, 4 MiB; text plus
-signature or redacted bytes). `0` turns the feature off: nothing is kept and
+signature or redacted bytes), then keeps trying older turns, so one oversized
+block does not leave every older turn without its reasoning. `0` turns the feature off: nothing is kept and
 nothing is attached. Turns a history mode drops carry nothing, and the cap only
 counts turns that are sent. In `tool_mode: none_text` nothing is attached,
 because that history holds tool calls as text, which is not what the reasoning
