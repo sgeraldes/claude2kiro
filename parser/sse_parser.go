@@ -208,11 +208,8 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	}
 	frameIndex := 0
 
-	// Track tool indices by tool ID for multi-tool responses
-	toolIndices := make(map[string]int)
-	nextToolIndex := 0 // Will be adjusted to 1 if text content is present
+	indices := newBlockIndexer()
 	hasToolUse := false
-	hasTextContent := false
 	var collector responseCollector
 
 	r := bytes.NewReader(resp)
@@ -279,17 +276,7 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 				}
 			}
 
-			// Track if we have text content - this affects tool indexing
-			if evt.Content != "" {
-				hasTextContent = true
-				// If we haven't assigned any tool indices yet, bump to 1
-				// so tools don't conflict with text at index 0
-				if len(toolIndices) == 0 && nextToolIndex == 0 {
-					nextToolIndex = 1
-				}
-			}
-
-			sseEvent := convertAssistantEventToSSEWithIndex(evt, toolIndices, &nextToolIndex)
+			sseEvent := convertAssistantEventToSSEWithIndex(evt, indices)
 			if sseEvent.Event != "" {
 				events = append(events, sseEvent)
 			}
@@ -318,15 +305,12 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	// Add a single message_delta at the end for every response with content.
 	// It carries the backend's stop reason; without one, tool responses get
 	// "tool_use" and text-only responses "end_turn".
-	// Note: hasTextContent is used above to adjust tool indices, ensuring tools start at index 1
-	// when there's text content at index 0
 	summary.StopReason = AnthropicStopReason(summary.BackendStopReason, hasToolUse)
 	summary.Reasoning = collector.reasoning
 	summary.ToolUseIDs = collector.toolUseIDs
 	summary.Text = collector.text.String()
 	summary.ServedModel = collector.servedModel
 	if len(events) > 0 {
-		_ = hasTextContent // Used for index adjustment above
 		events = append(events, SSEEvent{
 			Event: "message_delta",
 			Data: map[string]any{
@@ -351,13 +335,46 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	return events, summary
 }
 
-func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices map[string]int, nextToolIndex *int) SSEEvent {
+// blockIndexer gives content blocks their index in arrival order, as
+// StreamTranslator does: a run of text gets the next index when it starts,
+// and each tool call gets the next index when it is first seen and ends the
+// text run, so text after a tool starts a new block.
+type blockIndexer struct {
+	next  int
+	text  int // index of the current text run, -1 when none
+	tools map[string]int
+}
+
+func newBlockIndexer() *blockIndexer {
+	return &blockIndexer{text: -1, tools: map[string]int{}}
+}
+
+func (b *blockIndexer) textIndex() int {
+	if b.text < 0 {
+		b.text = b.next
+		b.next++
+	}
+	return b.text
+}
+
+func (b *blockIndexer) toolIndex(id string) int {
+	if index, known := b.tools[id]; known {
+		return index
+	}
+	b.text = -1
+	index := b.next
+	b.next++
+	b.tools[id] = index
+	return index
+}
+
+func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, indices *blockIndexer) SSEEvent {
 	if evt.Content != "" {
 		return SSEEvent{
 			Event: "content_block_delta",
 			Data: map[string]any{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": indices.textIndex(),
 				"delta": map[string]any{
 					"type": "text_delta",
 					"text": evt.Content,
@@ -365,13 +382,7 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 			},
 		}
 	} else if evt.ToolUseId != "" && evt.Name != "" && !evt.Stop {
-		// Get or assign index for this tool
-		toolIndex, exists := toolIndices[evt.ToolUseId]
-		if !exists {
-			toolIndex = *nextToolIndex
-			toolIndices[evt.ToolUseId] = toolIndex
-			*nextToolIndex++
-		}
+		toolIndex := indices.toolIndex(evt.ToolUseId)
 
 		if evt.Input == nil {
 			// First event for this tool - content_block_start
@@ -404,7 +415,7 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 		}
 	} else if evt.Stop && evt.ToolUseId != "" {
 		// Tool stop event
-		toolIndex, exists := toolIndices[evt.ToolUseId]
+		toolIndex, exists := indices.tools[evt.ToolUseId]
 		if !exists {
 			toolIndex = 0 // Fallback, shouldn't happen
 		}

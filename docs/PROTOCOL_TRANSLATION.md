@@ -174,7 +174,9 @@ a positive `max_tokens`, the proxy sends it clamped to the schema's `minimum` an
    - `toolUseEvent` start → `content_block_start` with `tool_use`
    - `toolUseEvent` with `input` → `content_block_delta` with `input_json_delta`
    - `toolUseEvent` with `stop: true` → `content_block_stop`
-4. Generate proper indices for each content block
+4. Give each content block its index in arrival order, as the stream translator
+   does: a run of text takes the next index when it starts, each tool call the
+   next index when first seen, and text after a tool starts a new block
 5. Add single `message_delta` at the end
 
 Reasoning frames (`text`, `signature`, `redactedContent`), `contextUsagePercentage`

@@ -94,6 +94,29 @@ func TestNonStreamTextAfterAToolKeepsItsPlace(t *testing.T) {
 	}
 }
 
+// Interleaved text and tools keep their order and each tool its own input.
+func TestNonStreamInterleavedTextAndToolsKeepTheirOrder(t *testing.T) {
+	got, _ := nonStreamAnswerFor(t,
+		`{"name":"Read","toolUseId":"tu_1"}`,
+		`{"name":"Read","toolUseId":"tu_1","input":"{\"file_path\":\"a\"}"}`,
+		`{"name":"Read","toolUseId":"tu_1","stop":true}`,
+		`{"content":"between"}`,
+		`{"name":"Grep","toolUseId":"tu_2"}`,
+		`{"name":"Grep","toolUseId":"tu_2","input":"{\"pattern\":\"b\"}"}`,
+		`{"name":"Grep","toolUseId":"tu_2","stop":true}`,
+		`{"content":"last"}`,
+	)
+	want := []map[string]any{
+		{"type": "tool_use", "id": "tu_1", "name": "Read", "input": map[string]any{"file_path": "a"}},
+		{"type": "text", "text": "between"},
+		{"type": "tool_use", "id": "tu_2", "name": "Grep", "input": map[string]any{"pattern": "b"}},
+		{"type": "text", "text": "last"},
+	}
+	if !reflect.DeepEqual(got.Content, want) {
+		t.Fatalf("content =\n%v\nwant\n%v", got.Content, want)
+	}
+}
+
 // Non-streaming usage uses the streaming path's estimates: input is the
 // request body's bytes / 4, output the characters of text and tool input / 4.
 func TestNonStreamUsageEstimatesTokensLikeStreaming(t *testing.T) {
