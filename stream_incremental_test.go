@@ -306,7 +306,7 @@ func TestStreamRetryBackoffEndsWhenTheClientLeaves(t *testing.T) {
 }
 
 func TestKeepaliveWriterStopIsSafeTwice(t *testing.T) {
-	k := newKeepaliveWriter(newLiveRecorder(), newLiveRecorder(), 10*time.Millisecond)
+	k := newKeepaliveWriter(newLiveRecorder(), 10*time.Millisecond, nil)
 	k.stop()
 	k.stop()
 }

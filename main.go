@@ -4640,15 +4640,18 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	rawFlusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return ""
 	}
 
 	// From here on every write goes through the keepalive writer, which also
-	// pings the client while the backend is silent.
-	keepalive := newKeepaliveWriter(w, rawFlusher, config.Get().Network.StreamKeepaliveInterval)
+	// pings the client while the backend is silent. A write that fails (its
+	// deadline passed: the client stopped reading) cancels ctx, so the handler
+	// ends through its client-gone path like after a disconnect.
+	ctx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	keepalive := newKeepaliveWriter(w, config.Get().Network.StreamKeepaliveInterval, cancelStream)
 	defer keepalive.stop()
 	w = keepalive
 	var flusher http.Flusher = keepalive
