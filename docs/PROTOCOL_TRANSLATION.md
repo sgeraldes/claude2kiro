@@ -130,6 +130,18 @@ data: {"type": "message_stop"}
 4. Generate proper indices for each content block
 5. Add single `message_delta` at the end
 
+### Streaming (parser/stream.go, stream_keepalive.go)
+
+A streaming request (`"stream": true`) is forwarded frame by frame. `parser.ReadFramePayload` reads one binary frame from the backend response and `parser.StreamTranslator` turns it into Anthropic events, which the proxy sends before it reads the next frame. The client sees text and tool input while the backend is still generating.
+
+- Blocks get their index in arrival order. A text block is closed before a tool block starts, and text that arrives after a tool opens a new block.
+- `message_start` goes out with the first content frame. `message_delta` and `message_stop` close the response when the backend stream ends.
+- While the stream is silent the proxy sends a `ping` event every 15 seconds, including the time before the backend's first byte. Without it, a client that hears nothing for minutes gives up and resends the whole request while the first one is still running.
+- When the client disconnects, the backend request is cancelled (streaming and non-streaming). It stops consuming credits and frees its slot in `max_concurrent_requests`.
+- The log line `Parser: N events, ... queueWait=… firstEvent=…` shows how long the request waited for a concurrency slot and how long the backend took to produce its first content.
+
+Non-streaming requests (`"stream": false`) still read the whole backend response and translate it with `parser.ParseEvents`.
+
 ## Credit-Efficiency Optimizations
 
 Credits scale with how many tokens the backend ingests, so the proxy mirrors the
@@ -159,7 +171,11 @@ benchmarks prove the trade-off is safe.
 - **Native effort passthrough.** Claude Code `output_config.effort` or enabled
   `thinking` is translated to Kiro's
   `additionalModelRequestFields.output_config.effort` for models that advertise an
-  effort enum. Unsupported or absent effort is omitted.
+  effort enum. Unsupported or absent effort is omitted. The enum is read from the
+  live catalog (`additionalModelRequestFieldsSchema` in `ListAvailableModels`), so a
+  model released after this build gets the requested effort too. A static table of
+  the levels known at build time covers the case where the catalog is unreachable.
+  `auto` accepts no request fields, so no effort is sent for it and Kiro decides.
 - **Environment state passthrough.** Claude Code's `<env>` system block is parsed for
   working directory and platform, then attached to the current message as
   `envState`. This is protocol parity with current Kiro clients, not a direct token

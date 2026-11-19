@@ -349,6 +349,10 @@ Claude2Kiro is useful if you:
 
 The proxy keeps no session data: it reads the auth token from disk on every request (a short-lived cache is checked against the file each time) and holds only the identity failover state in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
 
+### Streaming
+
+Streaming responses are forwarded as Kiro produces them. While Kiro is silent (it can take minutes before the first byte on a long step) the proxy sends a `ping` every 15 seconds, so the client does not give up and resend the request. If the client disconnects, the proxy cancels the request to Kiro, which stops it from consuming credits and frees its concurrency slot. Details in [docs/PROTOCOL_TRANSLATION.md](docs/PROTOCOL_TRANSLATION.md).
+
 ## License
 
 MIT
