@@ -433,3 +433,33 @@ func TestCatalogDiscardsAFetchThatPredatesInvalidate(t *testing.T) {
 		t.Fatalf("fetches=%d, want 2 (the pre-switch result was discarded and refetched)", n)
 	}
 }
+
+// The backend publishes, per model, the schema of the request options it
+// accepts. The effort levels come from there.
+func TestEffortLevelsComeFromTheRequestFieldsSchema(t *testing.T) {
+	const body = `{"models":[
+		{"modelId":"auto","additionalModelRequestFieldsSchema":null},
+		{"modelId":"claude-sonnet-5.5","additionalModelRequestFieldsSchema":{"type":"object","properties":{
+			"thinking":{"type":"object"},
+			"output_config":{"type":"object","properties":{"effort":{"type":"string","enum":["low","medium","high","xhigh","max"],"default":"high"}}}}}},
+		{"modelId":"gpt-5.6-sol","additionalModelRequestFieldsSchema":{"type":"object","properties":{"reasoning":{"type":"object"}}}}
+	]}`
+	var lr listResponse
+	if err := json.Unmarshal([]byte(body), &lr); err != nil {
+		t.Fatal(err)
+	}
+	cat := NewCatalog(time.Minute, func() ([]KiroModel, error) { return lr.Models, nil })
+
+	levels, known := cat.EffortLevels("claude-sonnet-5.5")
+	if !known || strings.Join(levels, ",") != "low,medium,high,xhigh,max" {
+		t.Fatalf("sonnet 5.5 levels = %v known=%v", levels, known)
+	}
+	for _, id := range []string{"auto", "gpt-5.6-sol"} {
+		if levels, known := cat.EffortLevels(id); !known || len(levels) != 0 {
+			t.Fatalf("%s levels = %v known=%v, want known with no levels", id, levels, known)
+		}
+	}
+	if _, known := cat.EffortLevels("not-offered"); known {
+		t.Fatal("a model the catalog does not list must be reported unknown")
+	}
+}

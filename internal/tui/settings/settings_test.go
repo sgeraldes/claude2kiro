@@ -3,6 +3,7 @@ package settings
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sgeraldes/claude2kiro/internal/config"
 )
@@ -42,6 +43,36 @@ func TestStableConversationIDSettingDefaultsOnAndCanDisable(t *testing.T) {
 	m.applySetting(Setting{Key: "advanced.stable_conversation_id", Value: "false"})
 	if m.config.Advanced.StableConversationID {
 		t.Fatal("stable conversation setting should be disableable from the TUI")
+	}
+}
+
+func TestStreamKeepaliveIntervalSettingDefaultsAndApplies(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	var keepalive *Setting
+	for i := range m.settings[TabNetwork] {
+		if m.settings[TabNetwork][i].Key == "network.stream_keepalive_interval" {
+			keepalive = &m.settings[TabNetwork][i]
+			break
+		}
+	}
+	if keepalive == nil {
+		t.Fatal("network.stream_keepalive_interval setting not found")
+	}
+	if keepalive.Value != "15s" || keepalive.ExtendedHelp.DefaultValue != "15s" {
+		t.Fatalf("value = %q, default help = %q, want 15s", keepalive.Value, keepalive.ExtendedHelp.DefaultValue)
+	}
+
+	m.applySetting(Setting{Key: "network.stream_keepalive_interval", Value: "5s"})
+	if m.config.Network.StreamKeepaliveInterval != 5*time.Second {
+		t.Fatalf("applied interval = %v, want 5s", m.config.Network.StreamKeepaliveInterval)
+	}
+	m.applySetting(Setting{Key: "network.stream_keepalive_interval", Value: "0s"})
+	if m.config.Network.StreamKeepaliveInterval != 0 {
+		t.Fatalf("applied interval = %v, want 0 (pings off)", m.config.Network.StreamKeepaliveInterval)
 	}
 }
 

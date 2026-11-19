@@ -531,6 +531,20 @@ func (m *Model) loadSettings() {
 			},
 		},
 		{
+			Key:         "network.stream_keepalive_interval",
+			Label:       "Stream Keepalive Interval",
+			Description: "Ping a streaming client after this much silence",
+			Type:        TypeText,
+			Value:       m.config.Network.StreamKeepaliveInterval.String(),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "15s",
+				RecommendedValue: "15s",
+				Sensitive:        false,
+				DetailedDesc:     "While Kiro sends nothing (it can take minutes before the first byte), the proxy sends the client an SSE ping after this much silence, so the client does not give up and resend the request. Lower it for a client with a shorter idle timeout. Set to 0 to turn the pings off. Applies to requests that start after the change. Format: 5s, 15s, 30s.",
+				ReferenceURL:     "https://pkg.go.dev/time#ParseDuration",
+			},
+		},
+		{
 			Key:         "network.max_concurrent_requests",
 			Label:       "Max Concurrent Requests",
 			Description: "Parallel requests to the Kiro backend",
@@ -884,6 +898,10 @@ func (m *Model) applySetting(s Setting) {
 	case "network.streaming_delay_max":
 		if d, err := parseDuration(s.Value); err == nil {
 			m.config.Network.StreamingDelayMax = d
+		}
+	case "network.stream_keepalive_interval":
+		if d, err := parseDuration(s.Value); err == nil && d >= 0 {
+			m.config.Network.StreamKeepaliveInterval = d
 		}
 	case "network.max_concurrent_requests":
 		if v, err := strconv.Atoi(s.Value); err == nil && v >= 1 {

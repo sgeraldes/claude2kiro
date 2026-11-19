@@ -640,12 +640,36 @@ func kiroConcurrencyLimit() int {
 
 // acquire blocks until fewer than the current limit are in flight.
 func (l *kiroLimiter) acquire() {
+	l.acquireCtx(context.Background())
+}
+
+// acquireCtx blocks until fewer than the current limit are in flight and
+// takes a slot, or until ctx is done, in which case it takes no slot and
+// returns false. A waiter whose client left stops waiting at once instead of
+// holding its place in the queue.
+func (l *kiroLimiter) acquireCtx(ctx context.Context) bool {
+	// sync.Cond cannot be cancelled, so wake every waiter when ctx ends. The
+	// broadcast takes the lock: a waiter is either still before its ctx check
+	// (and sees the error) or already parked in Wait (and is woken).
+	stop := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer stop()
+
 	l.mu.Lock()
-	for l.active >= kiroConcurrencyLimit() {
+	defer l.mu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		if l.active < kiroConcurrencyLimit() {
+			l.active++
+			return true
+		}
 		l.cond.Wait()
 	}
-	l.active++
-	l.mu.Unlock()
 }
 
 // release frees a slot and wakes any waiters (the limit may have risen).
@@ -1321,6 +1345,9 @@ var nativeEffortRank = map[string]int{
 	"max":    4,
 }
 
+// nativeEffortEnums is the offline fallback for effortLevelsFor: the levels of
+// the models known when it was written. The live catalog is the source of
+// truth and covers models released since.
 var nativeEffortEnums = map[string][]string{
 	"claude-opus-4.8":      {"low", "medium", "high", "xhigh", "max"},
 	"claude-opus-4.7":      {"low", "medium", "high", "xhigh", "max"},
@@ -1328,6 +1355,18 @@ var nativeEffortEnums = map[string][]string{
 	"claude-sonnet-4.6":    {"low", "medium", "high", "max"},
 	"claude-opus-4.6-1m":   {"low", "medium", "high", "max"},
 	"claude-sonnet-4.6-1m": {"low", "medium", "high", "max"},
+}
+
+// effortLevelsFor returns the reasoning effort levels kiroModel accepts. It
+// reads them from the live model catalog, which publishes them per model, and
+// only uses the static table when the catalog does not know the model. The
+// live catalog is authoritative: a model it lists without an effort schema gets
+// no effort, even when the static table has an entry for it.
+func effortLevelsFor(kiroModel string) []string {
+	if levels, known := modelCatalog.EffortLevels(kiroModel); known {
+		return levels
+	}
+	return nativeEffortEnums[kiroModel]
 }
 
 func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string {
@@ -1344,8 +1383,8 @@ func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string
 	if _, ok := nativeEffortRank[requested]; !ok {
 		return ""
 	}
-	allowed, ok := nativeEffortEnums[kiroModel]
-	if !ok || len(allowed) == 0 {
+	allowed := effortLevelsFor(kiroModel)
+	if len(allowed) == 0 {
 		return ""
 	}
 	if slices.Contains(allowed, requested) {
@@ -4145,9 +4184,9 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			if cfg.Advanced.ComparisonMode {
 				capture = &capturedKiroEvents
 			}
-			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, lg, sessionID, reqResult.RequestID, capture)
+			responsePreview = handleStreamRequestCtx(r.Context(), w, anthropicReq, lg, sessionID, reqResult.RequestID, capture)
 		} else {
-			responseStatus = handleNonStreamRequest(w, anthropicReq, lg, sessionID, reqResult.RequestID)
+			responseStatus = handleNonStreamRequestCtx(r.Context(), w, anthropicReq, lg, sessionID, reqResult.RequestID)
 		}
 
 		// Log response
@@ -4458,17 +4497,32 @@ func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Dur
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
 // capturedEvents: optional pointer to slice for capturing SSE events (for comparison mode)
 func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
+	return handleStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID, capturedEvents)
+}
+
+// handleStreamRequestCtx answers a streaming request. Events are forwarded as
+// the backend produces them, the client gets a ping whenever the stream has
+// been silent for network.stream_keepalive_interval, and ctx (the client's request
+// context) cancels the backend request when the client goes away.
+func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	flusher, ok := w.(http.Flusher)
+	rawFlusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return ""
 	}
+
+	// From here on every write goes through the keepalive writer, which also
+	// pings the client while the backend is silent.
+	keepalive := newKeepaliveWriter(w, rawFlusher, config.Get().Network.StreamKeepaliveInterval)
+	defer keepalive.stop()
+	w = keepalive
+	var flusher http.Flusher = keepalive
 
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
 
@@ -4510,7 +4564,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 	// Create streaming request
 	var proxyReq *http.Request
-	proxyReq, err = http.NewRequest(
+	proxyReq, err = http.NewRequestWithContext(
+		ctx,
 		http.MethodPost,
 		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
@@ -4527,8 +4582,27 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 
 	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
-	kiroSema.acquire()
+	queuedAt := time.Now()
+
+	// clientGone reports a client that disconnected; nothing is sent to it and
+	// the backend request, bound to ctx, is already cancelled.
+	clientGone := func(stage string) bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		lg.LogInfo(fmt.Sprintf("Client disconnected %s convId=%s after %s — backend request cancelled",
+			stage, cwReq.ConversationState.ConversationId[:8], time.Since(queuedAt).Round(time.Millisecond)))
+		return true
+	}
+	if !kiroSema.acquireCtx(ctx) {
+		// The client left while the request waited for a slot; it never took
+		// one and the backend never saw it.
+		clientGone("while queued")
+		return ""
+	}
 	defer kiroSema.release()
+	queueWait := time.Since(queuedAt)
+	sentAt := time.Now()
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response
@@ -4559,7 +4633,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || skipBackoff {
 			// Recreate request for retry (body was consumed)
-			proxyReq, err = http.NewRequest(
+			proxyReq, err = http.NewRequestWithContext(
+				ctx,
 				http.MethodPost,
 				cfg.Advanced.CodeWhispererEndpoint,
 				bytes.NewBuffer(cwReqBody),
@@ -4573,7 +4648,16 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			proxyReq.Header.Set("Accept", "text/event-stream")
 			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 			if !skipBackoff {
-				time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
+				// Exponential backoff with jitter, cut short when the client leaves.
+				backoff := time.NewTimer(retryBackoff(attempt))
+				select {
+				case <-backoff.C:
+				case <-ctx.Done():
+					backoff.Stop()
+				}
+				if clientGone("during the retry backoff") {
+					return ""
+				}
 			}
 			skipBackoff = false
 		}
@@ -4581,6 +4665,9 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		sent++
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
 		if lastErr != nil {
+			if clientGone("before the backend answered") {
+				return ""
+			}
 			lg.LogError(fmt.Sprintf("CodeWhisperer request error (attempt %d): %v", attempt+1, lastErr))
 			continue
 		}
@@ -4746,21 +4833,95 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	}
 	defer resp.Body.Close()
 
-	// Read entire response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
-		return ""
+	// Forward the response as it arrives: each backend frame is translated and
+	// sent before the next one is read. The raw bytes are kept for metering and
+	// the debug dump.
+	var rawResp bytes.Buffer
+	body := io.TeeReader(resp.Body, &rawResp)
+	translator := parser.NewStreamTranslator()
+	toolNames := buildToolNameMap(anthropicReq.Tools)
+	var responseText strings.Builder
+
+	delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds())
+	started := false
+	var firstEventAfter time.Duration
+	eventCount, toolBlockCount, outputChars := 0, 0, 0
+	hasTextContent := false
+
+	startMessage := func(inputTokens int) {
+		if started {
+			return
+		}
+		started = true
+		firstEventAfter = time.Since(sentAt)
+		sendSSEEvent(w, flusher, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":            messageId,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []any{},
+				"model":         anthropicReq.Model,
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage":         map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
+			},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"}, capturedEvents)
+	}
+	forward := func(events []parser.SSEEvent) {
+		// Restore original tool names (sanitized for CodeWhisperer's 64-char
+		// limit) so Claude Code recognizes its tools.
+		restoreToolNames(events, toolNames)
+		for _, e := range events {
+			if dataMap, ok := e.Data.(map[string]any); ok {
+				if delta, ok := dataMap["delta"].(map[string]any); ok {
+					if text, ok := delta["text"].(string); ok {
+						hasTextContent = true
+						outputChars += len(text)
+						responseText.WriteString(text)
+					}
+					if pj, ok := delta["partial_json"].(string); ok {
+						outputChars += len(pj)
+					}
+				}
+				if cb, ok := dataMap["content_block"].(map[string]any); ok && cb["type"] == "tool_use" {
+					toolBlockCount++
+				}
+			}
+			eventCount++
+			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
+			if delayMs > 0 {
+				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+			}
+		}
+	}
+
+	var readErr error
+	for {
+		payload, err := parser.ReadFramePayload(body)
+		if err != nil {
+			// Only io.EOF on a frame boundary is a finished response. A stream
+			// that ends inside a frame, a frame with impossible lengths or a
+			// transport error means the backend did not finish the answer.
+			if err != io.EOF {
+				readErr = err
+			}
+			break
+		}
+		events := translator.Translate(payload)
+		if len(events) == 0 {
+			continue
+		}
+		startMessage(len(cwReqBody) / 4) // approximate from the CodeWhisperer request size
+		forward(events)
 	}
 
 	// Debug: Save raw response for analysis
 	if cfg.Advanced.DebugMode {
-		debug.WriteDebugFile("cw-response", respBody)
+		debug.WriteDebugFile("cw-response", rawResp.Bytes())
 	}
-
-	// Use CodeWhisperer parser
-	events := parser.ParseEvents(respBody)
-	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(respBody)); usageMsg != "" {
+	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(rawResp.Bytes())); usageMsg != "" {
 		if cfg.Advanced.ComparisonMode {
 			lg.LogComparison(sessionID, requestID, usageMsg)
 		} else {
@@ -4768,177 +4929,44 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		}
 	}
 
-	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit)
-	// so Claude Code recognizes its tools.
-	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
-	var responseText strings.Builder
-
-	// Debug: Log if no events parsed
-	if len(events) == 0 {
-		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", len(respBody)))
+	if readErr != nil {
+		if clientGone("mid-response") {
+			return responseText.String()
+		}
+		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events: %v", cwReq.ConversationState.ConversationId[:8], eventCount, readErr))
+		// No content_block_stop, message_delta or message_stop: the client must
+		// see an unfinished answer as an error (overloaded, so it retries).
+		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
+		return ""
 	}
 
-	if len(events) > 0 {
-		// Check if this is a tool-only response (no text content events)
-		hasTextContent := false
-		hasToolUse := false
-		parserSentMessageDelta := false
-		toolBlockCount := 0
-		for _, e := range events {
-			if e.Event == "content_block_delta" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if delta, ok := dataMap["delta"].(map[string]any); ok {
-						if _, ok := delta["text"]; ok {
-							hasTextContent = true
-						}
-						if _, ok := delta["partial_json"]; ok {
-							hasToolUse = true
-						}
-					}
-				}
-			}
-			if e.Event == "content_block_start" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if cb, ok := dataMap["content_block"].(map[string]any); ok {
-						if cbType, ok := cb["type"].(string); ok && cbType == "tool_use" {
-							hasToolUse = true
-							toolBlockCount++
-						}
-					}
-				}
-			}
-			if e.Event == "message_delta" {
-				// Parser already sent a message_delta (for tool_use stop)
-				parserSentMessageDelta = true
-			}
-		}
+	if translator.Emitted() {
+		forward(translator.Finish())
 
-		// Log event analysis results
 		if cfg.Advanced.ComparisonMode {
-			// In comparison mode, show preview of actual response text
 			textPreview := responseText.String()
 			if len(textPreview) > 80 {
 				textPreview = textPreview[:80]
 			}
 			lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events, preview=%q (%d bytes), tools=%d",
-				len(events), textPreview, len(respBody), toolBlockCount))
+				eventCount, textPreview, rawResp.Len(), toolBlockCount))
 		} else {
-			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
-				len(events), hasTextContent, hasToolUse, toolBlockCount, parserSentMessageDelta))
+			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s",
+				eventCount, hasTextContent, toolBlockCount > 0, toolBlockCount,
+				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond)))
 		}
 
-		// Send start event
-		messageStart := map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            messageId,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []any{},
-				"model":         anthropicReq.Model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage": map[string]any{
-					"input_tokens":  len(cwReqBody) / 4, // Approximate from CW request body size
-					"output_tokens": 0,
-				},
-			},
-		}
-		sendSSEEvent(w, flusher, "message_start", messageStart, capturedEvents)
-		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"}, capturedEvents)
-
-		// Only send text content_block_start if there's text content (not tool-only)
-		if hasTextContent || !hasToolUse {
-			contentBlockStart := map[string]any{
-				"content_block": map[string]any{"text": "", "type": "text"},
-				"index":         0,
-				"type":          "content_block_start",
-			}
-			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, capturedEvents)
-		}
-
-		// Separate events into text deltas and non-text (tool blocks, message_delta).
-		// Anthropic requires text block to be fully closed before tool blocks begin.
-		outputChars := 0
-		var textEvents []parser.SSEEvent
-		var toolEvents []parser.SSEEvent
-		for _, e := range events {
-			if e.Event == "content_block_delta" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if delta, ok := dataMap["delta"].(map[string]any); ok {
-						if text, ok := delta["text"].(string); ok {
-							outputChars += len(text)
-							responseText.WriteString(text)
-							textEvents = append(textEvents, e)
-							continue
-						}
-						if pj, ok := delta["partial_json"].(string); ok {
-							outputChars += len(pj)
-						}
-					}
-				}
-			}
-			toolEvents = append(toolEvents, e)
-		}
-
-		delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds())
-		delayFn := func() {
-			if delayMs > 0 {
-				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
-			}
-		}
-
-		// Phase 1: Send text deltas
-		for _, e := range textEvents {
-			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
-			delayFn()
-		}
-
-		// Close text block before tool blocks (if we opened one)
-		if hasTextContent || !hasToolUse {
-			contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
-			sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop, capturedEvents)
-		}
-
-		// Phase 2: Send tool blocks and message_delta
-		for _, e := range toolEvents {
-			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
-			delayFn()
-		}
-
-		// Always send message_delta if parser didn't already send one
-		if !parserSentMessageDelta {
-			stopReason := "end_turn"
-			if hasToolUse && !hasTextContent {
-				stopReason = "tool_use"
-			}
-			contentBlockStopReason := map[string]any{
-				"type":  "message_delta",
-				"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-				"usage": map[string]any{"output_tokens": outputChars / 4},
-			}
-			sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason, capturedEvents)
-		}
-
-		messageStop := map[string]any{"type": "message_stop"}
-		sendSSEEvent(w, flusher, "message_stop", messageStop, capturedEvents)
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": translator.StopReason(), "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": outputChars / 4},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
 	} else {
 		// No events parsed - send an empty response to prevent Claude Code from hanging
+		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", rawResp.Len()))
 		lg.LogError("Sending empty response due to no parsed events")
-		messageStart := map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            messageId,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []any{},
-				"model":         anthropicReq.Model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-		}
-		sendSSEEvent(w, flusher, "message_start", messageStart, capturedEvents)
+		startMessage(0)
 		contentBlockStart := map[string]any{
 			"content_block": map[string]any{"text": "[Error: No response received from backend]", "type": "text"},
 			"index":         0,
@@ -5214,7 +5242,7 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "0.11.107" // Kiro IDE version to impersonate
+	kiroVersion      = "1.4.154" // Kiro IDE version to impersonate
 )
 
 // generatePKCE generates PKCE code verifier and challenge
@@ -7176,6 +7204,16 @@ func adoptReplacedCredentials(rejected TokenData) (bool, error) {
 // status it wrote so the caller's response log reflects backend errors instead
 // of a hardcoded 200 (streaming has no such choice: SSE commits 200 up front).
 func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string) int {
+	return handleNonStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID)
+}
+
+// statusClientClosedRequest is logged for a request whose client went away
+// before the answer was ready (nginx's 499); nothing is written to the client.
+const statusClientClosedRequest = 499
+
+// handleNonStreamRequestCtx is handleNonStreamRequest bound to the client's
+// request context: when the client disconnects, the backend request stops.
+func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string) int {
 	// Token and the identity it was read for, as one pair (see
 	// identity_failover.go). The dispatcher's own read of the token is only
 	// for the proactive refresh; it may belong to a previous identity by now.
@@ -7206,7 +7244,8 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 
 	// Create request
 	cfg := config.Get()
-	proxyReq, err := http.NewRequest(
+	proxyReq, err := http.NewRequestWithContext(
+		ctx,
 		http.MethodPost,
 		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
@@ -7245,7 +7284,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			return merr
 		}
 		cwReqBody = body
-		req, rerr := http.NewRequest(http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
 		if rerr != nil {
 			return rerr
 		}
@@ -7273,6 +7312,10 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	for {
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				logInfo("Client disconnected (non-stream) before the backend answered — backend request cancelled")
+				return statusClientClosedRequest
+			}
 			http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
 			return http.StatusInternalServerError
 		}
@@ -7280,6 +7323,10 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		// Read response
 		cwRespBody, err = io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if err != nil && ctx.Err() != nil {
+			logInfo("Client disconnected (non-stream) mid-response — backend request cancelled")
+			return statusClientClosedRequest
+		}
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
 			return http.StatusInternalServerError
@@ -7496,8 +7543,11 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 		})
 	}
 
-	io.Copy(w, strings.NewReader("event: "+eventType+"\n"))
-	io.Copy(w, strings.NewReader("data: "+string(json)+"\n\n"))
+	// One write per frame: the keepalive ping shares this writer and must
+	// never land between an event line and its data line.
+	if _, err := io.WriteString(w, "event: "+eventType+"\ndata: "+string(json)+"\n\n"); err != nil {
+		return // the client is gone; the handler learns it from the request context
+	}
 	flusher.Flush()
 
 }

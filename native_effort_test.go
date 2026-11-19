@@ -1,0 +1,55 @@
+package main
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/sgeraldes/claude2kiro/internal/models"
+)
+
+func modelWithEffort(id string, levels ...string) models.KiroModel {
+	m := models.KiroModel{ModelID: id}
+	if len(levels) > 0 {
+		m.RequestFields = &models.RequestFieldsSchema{}
+		m.RequestFields.Properties.OutputConfig.Properties.Effort.Enum = levels
+	}
+	return m
+}
+
+func effortRequest(effort string) AnthropicRequest {
+	return AnthropicRequest{Model: "x", OutputConfig: &AnthropicOutputConfig{Effort: effort}}
+}
+
+// A model released after the static table was written still gets the effort
+// the client asked for, because the catalog publishes its levels.
+func TestEffortIsForwardedForModelsOnlyTheCatalogKnows(t *testing.T) {
+	withStubCatalog(t, []models.KiroModel{
+		modelWithEffort("claude-sonnet-5.5", "low", "medium", "high", "xhigh", "max"),
+		modelWithEffort("auto"),
+	})
+
+	if got := resolveNativeEffort("claude-sonnet-5.5", effortRequest("medium")); got != "medium" {
+		t.Fatalf("effort for claude-sonnet-5.5 = %q, want medium", got)
+	}
+	if got := resolveNativeEffort("auto", effortRequest("medium")); got != "" {
+		t.Fatalf("effort for auto = %q, want none: auto accepts no request fields", got)
+	}
+	if got := resolveNativeEffort("claude-sonnet-5.5", AnthropicRequest{Model: "x"}); got != "" {
+		t.Fatalf("effort with none requested = %q, want none", got)
+	}
+}
+
+// Without a catalog the levels of the models known at build time still apply.
+func TestEffortFallsBackToTheStaticTableWithoutACatalog(t *testing.T) {
+	orig := modelCatalog
+	modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) { return nil, errors.New("offline") })
+	t.Cleanup(func() { modelCatalog = orig })
+
+	if got := resolveNativeEffort("claude-opus-4.8", effortRequest("xhigh")); got != "xhigh" {
+		t.Fatalf("effort for claude-opus-4.8 = %q, want xhigh", got)
+	}
+	if got := resolveNativeEffort("claude-sonnet-5.5", effortRequest("medium")); got != "" {
+		t.Fatalf("effort for an unknown model = %q, want none", got)
+	}
+}
