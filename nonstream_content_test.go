@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -114,6 +115,44 @@ func TestNonStreamInterleavedTextAndToolsKeepTheirOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Content, want) {
 		t.Fatalf("content =\n%v\nwant\n%v", got.Content, want)
+	}
+}
+
+// Tool input the backend sent as broken JSON is not turned into an empty
+// input: the client gets a 502 api_error and the log names the tool.
+func TestNonStreamMalformedToolInputIsAnError(t *testing.T) {
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		for _, p := range []string{
+			`{"content":"Running it."}`,
+			`{"name":"Bash","toolUseId":"tu_bad"}`,
+			`{"name":"Bash","toolUseId":"tu_bad","input":"{\"command\":"}`,
+			`{"name":"Bash","toolUseId":"tu_bad","stop":true}`,
+		} {
+			w.Write(cwFrame(p))
+		}
+	})
+	lg := logger.NewLogger(50)
+	rec := httptest.NewRecorder()
+	status := handleNonStreamRequestCtx(context.Background(), rec, testRequest(), lg, "sess", "req")
+	if status != http.StatusBadGateway || rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d (recorder %d), want 502; body %s", status, rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	if envelope.Type != "error" || envelope.Error.Type != "api_error" || !strings.Contains(envelope.Error.Message, "malformed tool input") {
+		t.Fatalf("envelope = %+v, want an api_error about malformed tool input", envelope)
+	}
+	if !loggedLine(lg, logger.LogTypeErr, "Bash", "tu_bad", "malformed") {
+		t.Fatalf("no error line naming the tool; entries: %+v", lg.GetEntries())
 	}
 }
 

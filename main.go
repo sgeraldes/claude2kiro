@@ -7708,7 +7708,21 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
 	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
 
-	contexts, toolCount, outputChars := nonStreamContentBlocks(events)
+	contexts, toolCount, outputChars, blocksErr := nonStreamContentBlocks(events)
+	if blocksErr != nil {
+		if lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream answer dropped: %v [%s:%s]", blocksErr, sessionID, requestID))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		if encErr := json.NewEncoder(w).Encode(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "api_error", "message": "The Kiro " + blocksErr.Error()},
+		}); encErr != nil && lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
+		}
+		return http.StatusBadGateway
+	}
 
 	if lg != nil {
 		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d%s [%s:%s]",
@@ -7751,8 +7765,10 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 // parsed events, in arrival order: one text block per run of text, and one
 // tool_use block per tool call with its own id, name and input. A text run of
 // only whitespace is dropped. It also returns the number of tool blocks and
-// the characters of text and tool input, for the usage estimate.
-func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, tools int, outputChars int) {
+// the characters of text and tool input, for the usage estimate. A tool call
+// whose input is not valid JSON is an error (malformedToolInputError): the
+// answer would otherwise carry a tool call with an input the model never gave.
+func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, tools int, outputChars int, err error) {
 	type toolBlock struct {
 		block map[string]any
 		input strings.Builder
@@ -7821,13 +7837,26 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 		}
 		input := map[string]any{}
 		if raw := p.tool.input.String(); raw != "" {
-			jsonStr.Unmarshal([]byte(raw), &input)
+			if uerr := jsonStr.Unmarshal([]byte(raw), &input); uerr != nil {
+				return nil, 0, 0, &malformedToolInputError{name: fmt.Sprint(p.tool.block["name"]), id: fmt.Sprint(p.tool.block["id"]), err: uerr}
+			}
 		}
 		p.tool.block["input"] = input
 		blocks = append(blocks, p.tool.block)
 		tools++
 	}
-	return blocks, tools, outputChars
+	return blocks, tools, outputChars, nil
+}
+
+// malformedToolInputError is a tool call of a non-streaming answer whose
+// input the backend sent as JSON that does not parse.
+type malformedToolInputError struct {
+	name, id string
+	err      error
+}
+
+func (e *malformedToolInputError) Error() string {
+	return fmt.Sprintf("backend sent malformed tool input for tool %s (%s): %v", e.name, e.id, e.err)
 }
 
 // sendSSEEvent sends an SSE event and optionally captures it
