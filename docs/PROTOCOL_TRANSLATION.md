@@ -98,7 +98,7 @@ schema declares it. When none applies the whole object is left out.
 **Event Types in Binary Stream:**
 - `assistantResponseEvent` - Text content: `{"content": "Hello", "stop": false}`
 - `toolUseEvent` - Tool calls: `{"name": "Bash", "toolUseId": "tooluse_...", "input": "{...}"}`
-- `reasoningContentEvent` - The model's reasoning: `{"text": "..."}`, then `{"signature": "..."}`
+- `reasoningContentEvent` - The model's reasoning: `{"text": "..."}`, then `{"signature": "..."}`, or `{"redactedContent": "..."}`
 - A stop frame - Why the model stopped: `{"stopReason": "TOOL_USE"}` (also `END_TURN`, `MAX_TOKENS`, `STOP_SEQUENCE`)
 - `meteringEvent` - Usage tracking: `{"unit": "credit", "usage": 0.79}`
 - `contextUsageEvent` - Context info: `{"contextUsagePercentage": 23.24}`
@@ -177,9 +177,72 @@ a positive `max_tokens`, the proxy sends it clamped to the schema's `minimum` an
 4. Generate proper indices for each content block
 5. Add single `message_delta` at the end
 
-Reasoning frames (`text`, `signature`), `contextUsagePercentage` and metering
-frames produce no client events and do not take a block index. Reasoning is not
-forwarded to the client; the proxy only counts its characters.
+Reasoning frames (`text`, `signature`, `redactedContent`), `contextUsagePercentage`
+and metering frames produce no client events and do not take a block index.
+Reasoning is not forwarded to the client. The proxy counts its characters and
+keeps it to give it back to the backend on later turns (see below).
+
+#### Reasoning given back (`advanced.reasoning_history_max_bytes`)
+
+The backend streams the model's reasoning: `{"text": "..."}` frames, then one
+`{"signature": "..."}`, or a `{"redactedContent": "..."}` blob. For `auto` the
+signature is an opaque envelope starting with `.KTR~~` of 140 to 180 KB; for
+Claude models it is a base64 string of up to about 70 KB. The official Kiro
+client sends the reasoning of earlier turns back inside the history, and the
+proxy does the same:
+
+```
+assistantResponseMessage: { content, toolUses: [...], reasoningContent: X }
+X is one of:
+  { "reasoningText": { "text": "<reasoning text>", "signature": "<signature>" } }
+  { "redactedContent": <the blob, in the JSON encoding it arrived in> }
+```
+
+Without it the model plans every turn from scratch. In a controlled second turn
+of a real 91k-token agent step with model `auto`, the request without the
+reasoning took 290 s, produced 36,815 reasoning characters, cost 4.22 credits
+and made one trivial tool call. The same request with the reasoning took 44.5 s,
+produced 55 reasoning characters, cost 1.36 credits and did the real work.
+
+Claude Code runs with thinking disabled and never receives or sends thinking
+blocks, so the client is not involved. Both translators keep the last
+reasoning block of each response: text appended across frames, the latest
+signature and the latest redacted blob. Reasoning that arrives after assistant
+text or a tool call starts a new block that replaces the earlier one. A block
+goes back only when it has text with a signature, or redacted content; unsigned
+reasoning is dropped. When a block has both, the text and signature are sent.
+
+After a successful response the proxy stores the block in memory under each
+`toolUseId` the response emitted, or, when it emitted no tool call, under a
+SHA-256 hash of its assistant text. The entry records the Kiro model id of the
+request (`auto` for `auto`). The store is shared by all sessions, bounded to
+128 MiB in total and evicts the least recently used entries first. It is not
+written to disk: after a restart the next turn simply carries no reasoning and
+the model thinks again.
+
+When the proxy builds a request, it looks up each assistant turn of the history
+(by its first tool use id with an entry, else by the hash of its text) and
+attaches `reasoningContent` only when the entry's model id equals the current
+request's Kiro model id. It attaches newest turns first and stops at the first
+turn whose reasoning would take the request past
+`advanced.reasoning_history_max_bytes` (default 4194304, 4 MiB; text plus
+signature or redacted bytes). `0` turns the feature off: nothing is kept and
+nothing is attached. Turns a history mode drops carry nothing, and the cap only
+counts turns that are sent. In `tool_mode: none_text` nothing is attached,
+because that history holds tool calls as text, which is not what the reasoning
+was signed with. A turn with no entry has no `reasoningContent` key at all.
+
+If the backend answers 400 with reason `THINKING_SIGNATURE_INVALID` to a request
+that carries reasoning, the proxy resends it once with every `reasoningContent`
+removed, forgets the turns it had attached and logs one info line starting with
+`THINKING_SIGNATURE_INVALID`. The resend does not count as a retry. A request
+that carries no reasoning and still gets that reason is not resent; the client
+gets a non-retryable error.
+
+The request log line ends with `reasoningAttached=<turns> reasoningBytes=<bytes>`.
+When a response frame carries a `modelId`, the `Parser:` line ends with
+`servedModel=<id>`, the last one seen; this is how to learn which model `auto`
+picked.
 
 #### Stop reason
 
@@ -206,9 +269,9 @@ A streaming request (`"stream": true`) is forwarded frame by frame. `parser.Read
 - `message_start` goes out with the first content frame. `message_delta` and `message_stop` close the response only when the backend stream ends on a frame boundary. A stream that ends inside a frame, a frame with impossible lengths or a transport error is a failed response: the client gets an `error` event (`overloaded_error`, so it retries) and no `message_stop`.
 - While the stream is silent the proxy sends a `ping` event every `network.stream_keepalive_interval` (default 15s, `0` turns the pings off), including the time before the backend's first byte, so a `ping` can arrive before `message_start`. The value is read when a request starts, so a change in the settings screen applies to the next request. Without the pings, a client that hears nothing for minutes gives up and resends the whole request while the first one is still running.
 - When the client disconnects, the backend request is cancelled (streaming and non-streaming) and its slot in `max_concurrent_requests` is freed. A streaming request that is still waiting for a slot stops waiting and never reaches the backend, and a retry backoff ends at once. Whether Kiro stops charging for a generation cancelled midway has not been measured.
-- The log line `Parser: N events, ... queueWait=… firstEvent=… stopReason=… reasoningChars=…` shows how long the request waited for a concurrency slot, how long the backend took to produce its first content, the stop reason as the backend sent it (`none` when it sent none) and how many characters of reasoning it produced.
+- The log line `Parser: N events, ... queueWait=… firstEvent=… stopReason=… reasoningChars=…` shows how long the request waited for a concurrency slot, how long the backend took to produce its first content, the stop reason as the backend sent it (`none` when it sent none) and how many characters of reasoning it produced. A trailing `servedModel=…` names the model the backend said served the response, when it said.
 
-Non-streaming requests (`"stream": false`) still read the whole backend response and translate it with `parser.ParseEventsWithSummary`, which also returns the stop reason and the reasoning size. Their log line is `Parser (non-stream): N events, hasText=…, hasToolUse=…, stopReason=… reasoningChars=…`.
+Non-streaming requests (`"stream": false`) still read the whole backend response and translate it with `parser.ParseEventsWithSummary`, which also returns the stop reason and the reasoning size. Their log line is `Parser (non-stream): N events, hasText=…, hasToolUse=…, stopReason=… reasoningChars=…`, with `servedModel=…` when the backend named a model.
 
 ## Credit-Efficiency Optimizations
 

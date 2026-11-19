@@ -4607,6 +4607,15 @@ func outputLimitLogLine(backendStopReason string, reasoningChars, responseBytes 
 		backendStopReasonLabel(backendStopReason), reasoningChars, responseBytes)
 }
 
+// servedModelField is the " servedModel=<id>" part of a Parser log line, or
+// nothing when the response named no model.
+func servedModelField(model string) string {
+	if model == "" {
+		return ""
+	}
+	return " servedModel=" + model
+}
+
 func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	return handleStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID, capturedEvents)
 }
@@ -4740,7 +4749,8 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	skipBackoff := false
 	refreshedFor := map[string]bool{} // the credentials a refresh of this request produced, by refresh token
 	var lastRecoverErr error
-	sent := 0 // requests this handler sent to the backend, switches and refreshes included
+	sent := 0                  // requests this handler sent to the backend, switches and refreshes included
+	reasoningStripped := false // the request was resent once without its reasoning
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || skipBackoff {
 			// Recreate request for retry (body was consumed)
@@ -4818,6 +4828,27 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			continue
 		}
 
+		// The backend rejected a reasoning signature the history carried. Resend
+		// once without any reasoning and forget the rejected turns; the model
+		// then plans again. This is not a transient retry and never repeats.
+		signatureInvalid := resp.StatusCode == 400 && isThinkingSignatureInvalid(body)
+		if signatureInvalid && !reasoningStripped && cwReq.reasoning.turns > 0 {
+			reasoningStripped = true
+			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
+			reasoningStore.Evict(cwReq.stripReasoning()...)
+			stripped, merr := jsonStr.Marshal(cwReq)
+			if merr != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", merr)
+				return ""
+			}
+			cwReqBody = stripped
+			lg.LogInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
+				cwReq.ConversationState.ConversationId[:8], turns, size))
+			attempt--
+			skipBackoff = true
+			continue
+		}
+
 		// Permanent 400s cannot succeed when resent unchanged. Classify the known
 		// structured reasons once and reuse them in both retry and error handling.
 		contextTooLong := resp.StatusCode == 400 && isContextLengthExceeded(body)
@@ -4881,7 +4912,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			}
 		}
 
-		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel)) {
+		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel && !signatureInvalid)) {
 			if overloaded {
 				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
@@ -4918,6 +4949,11 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			// classify the error as non-retryable so the client does not resend it.
 			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
 				"Kiro rejected the request body as invalid: %s", strings.TrimSpace(string(body))))
+		} else if signatureInvalid {
+			// Rejected even without reasoning (or again after the fallback):
+			// resending the same request cannot help.
+			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
+				"Kiro rejected a reasoning signature: %s", strings.TrimSpace(string(body))))
 		} else if invalidModel {
 			// Kiro does not serve this model id at all (backstop for when the
 			// pre-flight check couldn't run because the catalog was cold).
@@ -5053,6 +5089,8 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	if translator.Emitted() {
 		forward(translator.Finish())
+		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId,
+			translator.Reasoning(), translator.ToolUseIDs(), translator.Text())
 
 		if cfg.Advanced.ComparisonMode {
 			textPreview := responseText.String()
@@ -5062,10 +5100,11 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events, preview=%q (%d bytes), tools=%d",
 				eventCount, textPreview, rawResp.Len(), toolBlockCount))
 		} else {
-			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s stopReason=%s reasoningChars=%d",
+			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s stopReason=%s reasoningChars=%d%s",
 				eventCount, hasTextContent, toolBlockCount > 0, toolBlockCount,
 				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond),
-				backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars()))
+				backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars(),
+				servedModelField(translator.ServedModel())))
 		}
 
 		sendSSEEvent(w, flusher, "message_delta", map[string]any{
@@ -7445,6 +7484,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// changing under the request cannot keep it going
 	const bearerRetriesPerIdentity = 3
 	bearerRetries := 0
+	reasoningStripped := false // the request was resent once without its reasoning
 	for {
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
@@ -7466,6 +7506,21 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
 			return http.StatusInternalServerError
+		}
+
+		// A rejected reasoning signature: resend once without any reasoning and
+		// forget the rejected turns (see the streaming handler).
+		if resp.StatusCode == 400 && isThinkingSignatureInvalid(cwRespBody) && !reasoningStripped && cwReq.reasoning.turns > 0 {
+			reasoningStripped = true
+			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
+			reasoningStore.Evict(cwReq.stripReasoning()...)
+			logInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID (non-stream) convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
+				cwReq.ConversationState.ConversationId[:8], turns, size))
+			if err := adopt(token, ident); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
+				return http.StatusInternalServerError
+			}
+			continue
 		}
 
 		if isMonthlyQuotaExceeded(resp.StatusCode, cwRespBody) {
@@ -7566,6 +7621,8 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	}
 
 	events, summary := parser.ParseEventsWithSummary(cwRespBody)
+	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId,
+		summary.Reasoning, summary.ToolUseIDs, summary.Text)
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
 	}
@@ -7626,9 +7683,10 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	}
 
 	if lg != nil {
-		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d [%s:%s]",
+		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d%s [%s:%s]",
 			len(events), textContent != "", toolName != "",
-			backendStopReasonLabel(summary.BackendStopReason), summary.ReasoningChars, sessionID, requestID))
+			backendStopReasonLabel(summary.BackendStopReason), summary.ReasoningChars,
+			servedModelField(summary.ServedModel), sessionID, requestID))
 	}
 
 	// Build content blocks

@@ -220,12 +220,18 @@ no-tool suites; `aggressive_cache_points` cut ~34-36% on both suites.
 | Setting | Values | Effect |
 |---|---|---|
 | `advanced.thinking_mode` | `client` (default), `backend` | `client` sends the thinking the client asked for: off when it sent no `thinking` field (as Claude Code started by `claude2kiro run` does), adaptive when it asked for thinking, and only when the model's catalog schema allows that value. `backend` sends no `thinking` field, so Kiro applies its default, adaptive thinking on. Unknown values count as `client`. |
+| `advanced.reasoning_history_max_bytes` | int (default 4194304) | The proxy keeps the model's signed reasoning in memory and gives it back to Kiro in the history of later turns of the same model, newest turns first, up to this many bytes per request. `0` turns it off. Lost on restart. |
 
 Thinking changes speed and cost a lot. On one agent step of 91k input tokens,
 Opus 5.5 with adaptive thinking took 329 s and 8.26 credits; Opus 4.8 with
 thinking off took 13.2 s and 0.86 credits, Sonnet 5 with thinking off 5.2 s and
 0.43 credits. Opus 5.5 and Sonnet 5.5 cannot turn thinking off, so they keep it
 in both modes.
+
+The reasoning given back changes cost too. On a second turn of that step with
+`auto`, the request without the earlier reasoning took 290 s and 4.22 credits
+and the model planned again; with it, 44.5 s and 1.36 credits. Details in
+[PROTOCOL_TRANSLATION.md](PROTOCOL_TRANSLATION.md).
 
 The live web dashboard (`claude2kiro credits --web`) charts credit history,
 burn rate, and projected runout from samples recorded every 15 minutes while
