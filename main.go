@@ -43,6 +43,7 @@ import (
 	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
+	"github.com/sgeraldes/claude2kiro/internal/kiroide"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 
 	"github.com/sgeraldes/claude2kiro/internal/profile"
@@ -960,7 +961,7 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 		return nil, err
 	}
 	cfg := config.Get()
-	ua := fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS)
+	ua := kiroide.UserAgent()
 	return models.Fetch(
 		cfg.Advanced.CodeWhispererEndpoint,
 		token.AccessToken,
@@ -2060,7 +2061,7 @@ func fetchProfilesFromAPI(accessToken string) []kiroProfile {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
 	resp, err := client.Do(req)
@@ -3679,7 +3680,7 @@ func testProxy() {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	// Bound connection phases only: the streamed generation body may take a
 	// while, but headers arrive quickly — a server that never responds must
@@ -4712,7 +4713,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	proxyReq.Header.Set("Content-Type", "application/json")
 	proxyReq.Header.Set("Accept", "text/event-stream")
-	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	proxyReq.Header.Set("User-Agent", kiroide.UserAgent())
 
 	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
 	queuedAt := time.Now()
@@ -4780,7 +4781,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 			proxyReq.Header.Set("Content-Type", "application/json")
 			proxyReq.Header.Set("Accept", "text/event-stream")
-			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+			proxyReq.Header.Set("User-Agent", kiroide.UserAgent())
 			if !skipBackoff {
 				// Exponential backoff with jitter, cut short when the client leaves.
 				backoff := time.NewTimer(retryBackoff(attempt))
@@ -5438,7 +5439,6 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "1.4.154" // Kiro IDE version to impersonate
 )
 
 // generatePKCE generates PKCE code verifier and challenge
@@ -6190,7 +6190,7 @@ func registerSSOClient(startUrl, region string) (*SSOClientRegistration, error) 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6415,7 +6415,7 @@ func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6476,7 +6476,7 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 
 	// Set headers to match Kiro IDE
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6647,7 +6647,7 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -7456,7 +7456,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+		req.Header.Set("User-Agent", kiroide.UserAgent())
 	}
 
 	setKiroHeaders(proxyReq, token)
