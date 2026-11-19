@@ -1406,6 +1406,27 @@ func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string
 	return allowed[len(allowed)-1]
 }
 
+// capEffortWithoutThinking is the effort sent next to disabled thinking. The
+// official Kiro CLI keeps sending the effort then, but lowers xhigh and max to
+// the highest other level the model lists; lower levels pass unchanged. It
+// returns "" when the model lists no other level.
+func capEffortWithoutThinking(effort string, levels []string) string {
+	if effort != "xhigh" && effort != "max" {
+		return effort
+	}
+	capped := ""
+	for _, level := range levels {
+		rank, known := nativeEffortRank[level]
+		if !known || level == "xhigh" || level == "max" {
+			continue
+		}
+		if capped == "" || rank > nativeEffortRank[capped] {
+			capped = level
+		}
+	}
+	return capped
+}
+
 func isThinkingEnabled(anthropicReq AnthropicRequest) bool {
 	// "adaptive" asks for thinking as much as "enabled" does.
 	if t := anthropicReq.Thinking; t != nil && (strings.EqualFold(t.Type, "enabled") || strings.EqualFold(t.Type, "adaptive")) {
@@ -1426,7 +1447,11 @@ func buildAdditionalModelRequestFields(kiroModel string, anthropicReq AnthropicR
 		fields.Thinking = resolveThinking(entry.ThinkingTypes(), anthropicReq, advanced.EffectiveThinkingMode())
 		fields.MaxTokens = resolveMaxTokens(entry, anthropicReq.MaxTokens)
 	}
-	if effort := resolveNativeEffort(kiroModel, anthropicReq); effort != "" {
+	effort := resolveNativeEffort(kiroModel, anthropicReq)
+	if effort != "" && fields.Thinking != nil && fields.Thinking.Type == "disabled" {
+		effort = capEffortWithoutThinking(effort, effortLevelsFor(kiroModel))
+	}
+	if effort != "" {
 		fields.OutputConfig = &OutputConfig{Effort: effort}
 	}
 	if fields.Thinking == nil && fields.OutputConfig == nil && fields.MaxTokens == 0 {

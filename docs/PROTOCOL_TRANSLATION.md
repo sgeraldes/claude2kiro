@@ -347,7 +347,12 @@ benchmarks prove the trade-off is safe.
   the levels known at build time covers the case where the catalog is unreachable.
   `auto` accepts no request fields, so no effort is sent for it and Kiro decides.
   Effort is sent next to `thinking` and `max_tokens` when those apply (see
-  Request Translation above).
+  Request Translation above). When the proxy sends `thinking: disabled`, it
+  does what the official Kiro CLI does: the effort is still sent, but `xhigh`
+  and `max` are lowered to the highest other level the model lists (`high` for
+  the current Claude models); `low`, `medium` and `high` pass unchanged. The
+  backend accepted `claude-opus-5` with `thinking: disabled` and effort
+  `medium` in a live check.
 - **Environment state passthrough.** Claude Code's `<env>` system block is parsed for
   working directory and platform, then attached to the current message as
   `envState`. This is protocol parity with current Kiro clients, not a direct token

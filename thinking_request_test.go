@@ -228,3 +228,62 @@ func TestEffortThinkingAndMaxTokensTravelTogether(t *testing.T) {
 		t.Fatalf("output_config = %v, want effort high", fields["output_config"])
 	}
 }
+
+// With thinking disabled the official Kiro CLI still sends the effort, but
+// lowers xhigh and max to the highest other level the model lists.
+func TestEffortWithThinkingDisabledIsCappedBelowXhigh(t *testing.T) {
+	withLiveSchemaCatalog(t)
+	withThinkingMode(t, "client")
+
+	cases := []struct {
+		thinking *AnthropicThinking
+		effort   string
+		want     string
+	}{
+		{nil, "max", "high"},
+		{nil, "xhigh", "high"},
+		{&AnthropicThinking{Type: "disabled"}, "max", "high"},
+		{nil, "high", "high"},
+		{nil, "medium", "medium"},
+		{nil, "low", "low"},
+		{&AnthropicThinking{Type: "enabled"}, "max", "max"},
+		{&AnthropicThinking{Type: "adaptive"}, "xhigh", "xhigh"},
+	}
+	for _, c := range cases {
+		req := thinkingRequest("claude-opus-4.8", c.thinking, 0)
+		req.OutputConfig = &AnthropicOutputConfig{Effort: c.effort}
+		fields := requestFields(t, buildCodeWhispererRequest(req, TokenData{}))
+		assertOnlyDeclaredKeys(t, "claude-opus-4.8", fields)
+		if oc, _ := fields["output_config"].(map[string]any); oc["effort"] != c.want {
+			t.Errorf("thinking %+v, effort %s: output_config = %v, want effort %s (thinking=%q)",
+				c.thinking, c.effort, fields["output_config"], c.want, thinkingType(fields))
+		}
+	}
+
+	// A model whose schema cannot turn thinking off keeps the effort as asked.
+	req := thinkingRequest("claude-opus-5.5", nil, 0)
+	req.OutputConfig = &AnthropicOutputConfig{Effort: "max"}
+	fields := requestFields(t, buildCodeWhispererRequest(req, TokenData{}))
+	if oc, _ := fields["output_config"].(map[string]any); oc["effort"] != "max" || thinkingType(fields) != "" {
+		t.Fatalf("opus 5.5 without thinking: fields = %v, want effort max and no thinking", fields)
+	}
+}
+
+func TestCapEffortWithoutThinking(t *testing.T) {
+	cases := []struct {
+		effort string
+		levels []string
+		want   string
+	}{
+		{"max", []string{"low", "medium", "high", "xhigh", "max"}, "high"},
+		{"max", []string{"low", "medium", "high", "max"}, "high"},
+		{"xhigh", []string{"max", "low", "medium"}, "medium"},
+		{"medium", []string{"low", "medium", "high", "max"}, "medium"},
+		{"max", []string{"xhigh", "max"}, ""},
+	}
+	for _, c := range cases {
+		if got := capEffortWithoutThinking(c.effort, c.levels); got != c.want {
+			t.Errorf("capEffortWithoutThinking(%q, %v) = %q, want %q", c.effort, c.levels, got, c.want)
+		}
+	}
+}
