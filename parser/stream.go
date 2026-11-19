@@ -60,6 +60,7 @@ type StreamTranslator struct {
 
 	backendStop    string // stopReason as the backend sent it
 	reasoningChars int    // characters of reasoning text, never forwarded
+	collector      responseCollector
 }
 
 func NewStreamTranslator() *StreamTranslator {
@@ -68,14 +69,15 @@ func NewStreamTranslator() *StreamTranslator {
 
 // Translate returns the events one frame payload produces. Frames that carry
 // no assistant content (reasoning, signature, stop reason, context usage,
-// metering, unparseable payloads) produce none; the stop reason and the size
-// of the reasoning are recorded.
+// metering, unparseable payloads) produce none; the stop reason, the size of
+// the reasoning and the reasoning itself are recorded.
 func (t *StreamTranslator) Translate(payload []byte) []SSEEvent {
 	var evt assistantResponseEvent
 	if err := json.Unmarshal(payload, &evt); err != nil {
 		return nil
 	}
 	t.reasoningChars += evt.reasoningChars()
+	t.collector.observe(evt)
 	if evt.StopReason != "" {
 		t.backendStop = evt.StopReason
 	}
@@ -160,6 +162,18 @@ func (t *StreamTranslator) BackendStopReason() string { return t.backendStop }
 
 // ReasoningChars is the number of reasoning characters the backend sent.
 func (t *StreamTranslator) ReasoningChars() int { return t.reasoningChars }
+
+// Reasoning is the last reasoning block of the response so far.
+func (t *StreamTranslator) Reasoning() ReasoningBlock { return t.collector.reasoning }
+
+// ToolUseIDs are the ids of the tool calls the response opened, in order.
+func (t *StreamTranslator) ToolUseIDs() []string { return t.collector.toolUseIDs }
+
+// Text is the assistant text of the response so far.
+func (t *StreamTranslator) Text() string { return t.collector.text.String() }
+
+// ServedModel is the last modelId a frame carried, "" when none did.
+func (t *StreamTranslator) ServedModel() string { return t.collector.servedModel }
 
 // Emitted reports whether any frame produced an event.
 func (t *StreamTranslator) Emitted() bool { return t.emitted }

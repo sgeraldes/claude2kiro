@@ -57,9 +57,14 @@ type assistantResponseEvent struct {
 	Name      string  `json:"name"`
 	ToolUseId string  `json:"toolUseId"`
 	Stop      bool    `json:"stop"`
-	// Reasoning is the text of a reasoningContentEvent ({"text":"..."}). It
-	// is counted, never forwarded to the client.
-	Reasoning string `json:"text,omitempty"`
+	// Reasoning is the text of a reasoningContentEvent ({"text":"..."}), and
+	// Signature and RedactedContent are its other two frame kinds. They are
+	// kept for the next request, never forwarded to the client.
+	Reasoning       string          `json:"text,omitempty"`
+	Signature       string          `json:"signature,omitempty"`
+	RedactedContent json.RawMessage `json:"redactedContent,omitempty"`
+	// ModelId is the model the backend says produced the frame, when it says.
+	ModelId string `json:"modelId,omitempty"`
 	// StopReason is the backend's reason for ending the response, sent in a
 	// frame of its own ({"stopReason":"TOOL_USE"}).
 	StopReason string `json:"stopReason,omitempty"`
@@ -101,6 +106,11 @@ type ResponseSummary struct {
 	StopReason        string // Anthropic stop_reason for the response
 	BackendStopReason string // stopReason as the backend sent it; "" when it sent none
 	ReasoningChars    int    // characters of reasoning text the backend sent
+
+	Reasoning   ReasoningBlock // the response's last reasoning block
+	ToolUseIDs  []string       // tool use ids in the order the response opened them
+	Text        string         // the assistant text, concatenated
+	ServedModel string         // the last modelId a frame carried; "" when none did
 }
 
 type SSEEvent struct {
@@ -180,8 +190,9 @@ func ParseEvents(resp []byte) []SSEEvent {
 
 // ParseEventsWithSummary translates a whole CodeWhisperer response into
 // Anthropic SSE events and also reports the stop reason and how much reasoning
-// the backend produced. Reasoning, signature, context-usage and metering
-// frames produce no events.
+// the backend produced, and the last reasoning block, tool use ids, text and
+// served model (see ResponseSummary). Reasoning, signature, redacted,
+// context-usage and metering frames produce no events.
 func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	events := []SSEEvent{}
 	var summary ResponseSummary
@@ -202,6 +213,7 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	nextToolIndex := 0 // Will be adjusted to 1 if text content is present
 	hasToolUse := false
 	hasTextContent := false
+	var collector responseCollector
 
 	r := bytes.NewReader(resp)
 	for {
@@ -286,6 +298,7 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 				hasToolUse = true
 			}
 			summary.ReasoningChars += evt.reasoningChars()
+			collector.observe(evt)
 			if evt.StopReason != "" {
 				summary.BackendStopReason = evt.StopReason
 			}
@@ -308,6 +321,10 @@ func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	// Note: hasTextContent is used above to adjust tool indices, ensuring tools start at index 1
 	// when there's text content at index 0
 	summary.StopReason = AnthropicStopReason(summary.BackendStopReason, hasToolUse)
+	summary.Reasoning = collector.reasoning
+	summary.ToolUseIDs = collector.toolUseIDs
+	summary.Text = collector.text.String()
+	summary.ServedModel = collector.servedModel
 	if len(events) > 0 {
 		_ = hasTextContent // Used for index adjustment above
 		events = append(events, SSEEvent{
