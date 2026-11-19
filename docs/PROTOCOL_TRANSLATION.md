@@ -312,8 +312,8 @@ benchmarks prove the trade-off is safe.
   `content` and no structured results are sent. The request log reports
   `contentChars` (the `content` field) and `toolResultChars` (current tool results)
   separately.
-- **Native effort passthrough.** Claude Code `output_config.effort` or enabled
-  `thinking` is translated to Kiro's
+- **Native effort passthrough.** Claude Code `output_config.effort`, or `thinking`
+  of type `enabled` or `adaptive` (which get the default effort), is translated to Kiro's
   `additionalModelRequestFields.output_config.effort` for models that advertise an
   effort enum. Unsupported or absent effort is omitted. The enum is read from the
   live catalog (`additionalModelRequestFieldsSchema` in `ListAvailableModels`), so a

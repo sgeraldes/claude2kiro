@@ -1406,7 +1406,8 @@ func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string
 }
 
 func isThinkingEnabled(anthropicReq AnthropicRequest) bool {
-	if anthropicReq.Thinking != nil && strings.EqualFold(anthropicReq.Thinking.Type, "enabled") {
+	// "adaptive" asks for thinking as much as "enabled" does.
+	if t := anthropicReq.Thinking; t != nil && (strings.EqualFold(t.Type, "enabled") || strings.EqualFold(t.Type, "adaptive")) {
 		return true
 	}
 	model := strings.ToLower(anthropicReq.Model)
