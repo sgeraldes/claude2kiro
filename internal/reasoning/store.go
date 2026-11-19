@@ -32,22 +32,23 @@ type Entry struct {
 func (e Entry) Size() int { return len(e.Text) + len(e.Signature) + len(e.Redacted) }
 
 // ToolKey is the key of the turn that emitted the tool call toolUseID in the
-// client session session. A request without a session gets the unscoped key
-// (session ""): tool use ids are unique on their own.
-func ToolKey(session, toolUseID string) string {
-	if session == "" {
+// conversation scope (the caller's client session plus conversation
+// fingerprint). A request without a session gets the unscoped key (scope ""):
+// tool use ids are unique on their own.
+func ToolKey(scope, toolUseID string) string {
+	if scope == "" {
 		return "tool:" + toolUseID
 	}
-	return "tool:" + session + "\x00" + toolUseID
+	return "tool:" + scope + "\x00" + toolUseID
 }
 
-// TextKey is the key of a turn without tool calls: a hash of the client
-// session, the turn's position among the conversation's assistant turns, and
-// its text after NormalizeText. Without the session and the position, two
+// TextKey is the key of a turn without tool calls: a hash of the conversation
+// scope, the turn's position among the conversation's assistant turns, and its
+// text after NormalizeText. Without the scope and the position, two
 // conversations (or two turns of one) that said the same thing would share
 // reasoning.
-func TextKey(session string, turn int, text string) string {
-	sum := sha256.Sum256([]byte(session + "\x00" + strconv.Itoa(turn) + "\x00" + NormalizeText(text)))
+func TextKey(scope string, turn int, text string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + strconv.Itoa(turn) + "\x00" + NormalizeText(text)))
 	return "text:" + hex.EncodeToString(sum[:])
 }
 

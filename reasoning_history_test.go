@@ -142,14 +142,17 @@ func TestRedactedReasoningIsGivenBackAsItArrived(t *testing.T) {
 	withReasoningStore(t)
 	withReasoningConfig(t, config.DefaultReasoningHistoryMaxBytes, "full", "full")
 	kiroModel := getKiroModelID(reasoningTestModel)
-	// A turn without a tool call is found by its session, position and text.
-	rememberResponseIn(t, kiroModel, reasoningScope{session: scopeSessionA}, `{"redactedContent":"UkVEQUNURUQ="}`, `{"content":"The answer is 42."}`)
-
 	req := inSession(AnthropicRequest{Model: reasoningTestModel, MaxTokens: 64, Messages: []AnthropicRequestMessage{
 		{Role: "user", Content: "question"},
 		{Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "The answer is 42."}}},
 		{Role: "user", Content: "why?"},
 	}}, scopeSessionA)
+	// A turn without a tool call is found by its session, conversation,
+	// position and text: the scope of the request that produced it.
+	produced := req
+	produced.Messages = req.Messages[:1]
+	rememberResponseIn(t, kiroModel, responseScope(produced), `{"redactedContent":"UkVEQUNURUQ="}`, `{"content":"The answer is 42."}`)
+
 	cw := buildCodeWhispererRequest(req, TokenData{})
 	rcs := reasoningOf(t, cw)
 	if len(rcs) != 1 || rcs[0]["redactedContent"] != "UkVEQUNURUQ=" || len(rcs[0]) != 1 {
@@ -293,12 +296,12 @@ func TestDroppedHistoryTurnsCarryNoReasoning(t *testing.T) {
 	kiroModel := getKiroModelID(reasoningTestModel)
 	// Text-only turns: tool turns chained by their results are never dropped.
 	msgs := []AnthropicRequestMessage{}
-	for i, n := range []string{"d1", "d2", "d3"} {
-		rememberResponseIn(t, kiroModel, reasoningScope{session: scopeSessionA, turn: i},
+	for _, n := range []string{"d1", "d2", "d3"} {
+		msgs = append(msgs, AnthropicRequestMessage{Role: "user", Content: "question " + n})
+		produced := inSession(AnthropicRequest{Model: reasoningTestModel, MaxTokens: 64, Messages: msgs}, scopeSessionA)
+		rememberResponseIn(t, kiroModel, responseScope(produced),
 			`{"text":"plan `+n+`"}`, `{"signature":"SIG-`+n+`"}`, `{"content":"answer `+n+`"}`)
-		msgs = append(msgs,
-			AnthropicRequestMessage{Role: "user", Content: "question " + n},
-			AnthropicRequestMessage{Role: "assistant", Content: "answer " + n})
+		msgs = append(msgs, AnthropicRequestMessage{Role: "assistant", Content: "answer " + n})
 	}
 	msgs = append(msgs, AnthropicRequestMessage{Role: "user", Content: "next"})
 

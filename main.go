@@ -2373,6 +2373,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		// assistantTurn is the position of the next assistant message among
 		// the request's assistant messages: part of its reasoning store key.
 		assistantTurn := 0
+		conversationScope := requestScope(anthropicReq)
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			msg := anthropicReq.Messages[i]
 
@@ -2390,7 +2391,8 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				} else {
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
-				scope := reasoningScope{session: sessionKey, turn: assistantTurn}
+				scope := conversationScope
+				scope.turn = assistantTurn
 				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), assistantTurnText(msg.Content))
 				assistantTurn++
 				emit("assistant", assistantMsg)
