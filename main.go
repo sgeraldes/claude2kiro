@@ -580,6 +580,9 @@ type CodeWhispererRequest struct {
 
 	// reasoning is what attachReasoning put in the history. Not sent.
 	reasoning reasoningAttachment
+	// scope is responseScope of the request this was built from: where the
+	// response's reasoning is stored. Not sent.
+	scope reasoningScope
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
@@ -2204,6 +2207,7 @@ func requestProfileArn(token TokenData) string {
 // buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
 	cwReq := CodeWhispererRequest{}
+	cwReq.scope = responseScope(anthropicReq)
 	cwReq.ProfileArn = requestProfileArn(token)
 	cfg := config.Get()
 	kiroModel := getKiroModelID(anthropicReq.Model)
@@ -2390,7 +2394,8 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				} else {
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
-				scope := reasoningScope{session: sessionKey, turn: assistantTurn}
+				scope := cwReq.scope
+				scope.turn = assistantTurn
 				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), assistantTurnText(msg.Content))
 				assistantTurn++
 				emit("assistant", assistantMsg)
@@ -5168,7 +5173,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	if translator.Emitted() {
 		forward(translator.Finish())
-		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, responseScope(anthropicReq),
+		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
 			translator.Reasoning(), translator.ToolUseIDs(), translator.Text())
 
 		if cfg.Advanced.ComparisonMode {
@@ -7699,7 +7704,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	}
 
 	events, summary := parser.ParseEventsWithSummary(cwRespBody)
-	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, responseScope(anthropicReq),
+	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
 		summary.Reasoning, summary.ToolUseIDs, summary.Text)
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))

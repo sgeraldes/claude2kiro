@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/sgeraldes/claude2kiro/internal/config"
@@ -39,20 +43,28 @@ type reasoningAttachment struct {
 	keys  []string // the store keys of those turns, to evict them if rejected
 }
 
-// reasoningScope places an assistant turn: the client session it belongs to
-// and the turn's position among the conversation's assistant messages.
+// reasoningScope places an assistant turn: the client session and the
+// conversation within it that the turn belongs to, and the turn's position
+// among the conversation's assistant messages.
 type reasoningScope struct {
-	session string // extractSessionID's full id; "" when the client sent none
-	turn    int
+	session      string // extractSessionID's full id; "" when the client sent none
+	conversation string // conversationFingerprint of the request; set only with a session
+	turn         int
 }
 
 // responseScope is the scope of the turn a response to req produces: req's
-// session, and the position after req's own assistant messages. The position
-// counts req.Messages, never the history sent to the backend, so a history
-// mode that drops turns does not move it.
+// session and conversation, and the position after req's own assistant
+// messages. The position counts req.Messages, never the history sent to the
+// backend, so a history mode that drops turns does not move it.
+// buildCodeWhispererRequest computes it once and keeps it on the request:
+// lookup keys the history's turns with its session and conversation, and
+// capture stores the response under it, so both see the same fingerprint.
 func responseScope(req AnthropicRequest) reasoningScope {
 	_, session := extractSessionID(req.Metadata)
 	scope := reasoningScope{session: session}
+	if session != "" {
+		scope.conversation = conversationFingerprint(req.Messages)
+	}
 	for _, m := range req.Messages {
 		if m.Role == "assistant" {
 			scope.turn++
@@ -61,22 +73,127 @@ func responseScope(req AnthropicRequest) reasoningScope {
 	return scope
 }
 
+// storeScope is the scope string the store keys carry: the session and the
+// conversation fingerprint, or "" without a session. Claude Code sends one
+// session id for a conversation and every Task subagent it spawns, so the
+// session alone would let a parent and its subagent share keys.
+func (s reasoningScope) storeScope() string {
+	if s.session == "" {
+		return ""
+	}
+	return s.session + "\x00" + s.conversation
+}
+
 // keys are the store keys of a turn in this scope. A turn with tool calls is
 // keyed by its tool use ids only. A turn without one is keyed by its text and
 // position, and only within a session: without a session there is nothing to
 // keep two conversations' identical texts apart, so such a turn has no key.
 func (s reasoningScope) keys(toolUseIDs []string, text string) []string {
+	scope := s.storeScope()
 	if len(toolUseIDs) > 0 {
 		keys := make([]string, 0, len(toolUseIDs))
 		for _, id := range toolUseIDs {
-			keys = append(keys, reasoning.ToolKey(s.session, id))
+			keys = append(keys, reasoning.ToolKey(scope, id))
 		}
 		return keys
 	}
-	if s.session == "" || reasoning.NormalizeText(text) == "" {
+	if scope == "" || reasoning.NormalizeText(text) == "" {
 		return nil
 	}
-	return []string{reasoning.TextKey(s.session, s.turn, text)}
+	return []string{reasoning.TextKey(scope, s.turn, text)}
+}
+
+// systemReminderPattern matches the <system-reminder> spans Claude Code injects
+// into a user message.
+var systemReminderPattern = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+
+// onConversationFingerprint, when set, is called by every
+// conversationFingerprint. Tests set it to count the calls.
+var onConversationFingerprint func()
+
+// conversationFingerprint identifies the conversation msgs belong to by its
+// first message: a hash of its role and its text. Claude Code opens that
+// message with <system-reminder> blocks (instructions, a git status snapshot,
+// an attribution note) that can change between requests of one conversation,
+// and ends it with the prompt, which for a Task subagent is the task its parent
+// wrote. So the hash covers the text with the reminder spans removed: stable
+// across a conversation's turns, different between a parent and its
+// subagents. A first message that is all reminders hashes all its text, and
+// one with no text at all hashes its JSON without cache_control markers,
+// which the client moves between requests. When the client compacts or
+// rewrites the first message the fingerprint changes and earlier entries are
+// simply not found.
+func conversationFingerprint(msgs []AnthropicRequestMessage) string {
+	if onConversationFingerprint != nil {
+		onConversationFingerprint()
+	}
+	if len(msgs) == 0 {
+		return ""
+	}
+	first := msgs[0]
+	var blocks []string
+	switch v := first.Content.(type) {
+	case string:
+		blocks = []string{v}
+	case []any:
+		for _, block := range v {
+			if m, ok := block.(map[string]any); ok && m["type"] == "text" {
+				if s, ok := m["text"].(string); ok {
+					blocks = append(blocks, s)
+				}
+			}
+		}
+	}
+	// The blocks are joined with a space before the reminders are removed, so a
+	// reminder that opens in one block and closes in another goes too. A space
+	// is what normalizing turns any block boundary into anyway, so a first
+	// message whose reminders each sit in one block hashes as it did when they
+	// were removed block by block, and a space can never complete a tag.
+	joined := strings.Join(blocks, " ")
+	text := reasoning.NormalizeText(systemReminderPattern.ReplaceAllString(joined, " "))
+	if text == "" {
+		text = reasoning.NormalizeText(joined) // all reminders, or no text at all
+	}
+	var basis string
+	if text != "" {
+		basis = "text\x00" + text
+	} else {
+		content := withoutCacheControl(first.Content)
+		raw, err := json.Marshal(content)
+		if err != nil {
+			// Content decoded from JSON always marshals; for anything else
+			// fmt's form is stable too (it prints map keys sorted).
+			raw = []byte(fmt.Sprintf("%#v", content))
+		}
+		basis = "json\x00" + string(raw)
+	}
+	sum := sha256.Sum256([]byte(first.Role + "\x00" + basis))
+	return hex.EncodeToString(sum[:16])
+}
+
+// withoutCacheControl is content with the cache_control field of each block
+// removed, leaving content itself unchanged.
+func withoutCacheControl(content any) any {
+	list, ok := content.([]any)
+	if !ok {
+		return content
+	}
+	out := make([]any, len(list))
+	for i, block := range list {
+		m, ok := block.(map[string]any)
+		if !ok {
+			out[i] = block
+			continue
+		}
+		copied := make(map[string]any, len(m))
+		for k, v := range m {
+			if k != "cache_control" {
+				copied[k] = v
+			}
+		}
+		out[i] = copied
+	}
+	return out
 }
 
 // assistantTurnText is the text of a history assistant turn as its reasoning

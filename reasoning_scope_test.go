@@ -56,7 +56,13 @@ func inSession(req AnthropicRequest, session string) AnthropicRequest {
 // textConversation is a conversation whose earlier assistant turns are the
 // given texts, each after a user question, ending on a user question.
 func textConversation(session string, turns ...string) AnthropicRequest {
-	msgs := []AnthropicRequestMessage{{Role: "user", Content: "q0"}}
+	return textConversationFrom(session, "q0", turns...)
+}
+
+// textConversationFrom is textConversation with first as the content of the
+// conversation's first message.
+func textConversationFrom(session string, first any, turns ...string) AnthropicRequest {
+	msgs := []AnthropicRequestMessage{{Role: "user", Content: first}}
 	for i, text := range turns {
 		msgs = append(msgs,
 			AnthropicRequestMessage{Role: "assistant", Content: text},

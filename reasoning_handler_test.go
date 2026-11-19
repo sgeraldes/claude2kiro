@@ -269,7 +269,10 @@ func TestParallelRequestsOfOneSessionGetTheirOwnReasoning(t *testing.T) {
 	const session = "ce40736e-1347-467a-9cce-181e245edd92"
 	for i := 0; i < n; i++ {
 		id := "tu_par" + string(rune('a'+i))
-		rememberResponseIn(t, kiroModel, reasoningScope{session: session}, toolAnswer("plan "+id, "SIG-"+id, id)...)
+		produced := toolTurnRequest(reasoningTestModel, id)
+		produced.Messages = produced.Messages[:1]
+		produced.Metadata = map[string]any{"user_id": `{"session_id":"` + session + `"}`}
+		rememberResponseIn(t, kiroModel, responseScope(produced), toolAnswer("plan "+id, "SIG-"+id, id)...)
 	}
 
 	var wg sync.WaitGroup

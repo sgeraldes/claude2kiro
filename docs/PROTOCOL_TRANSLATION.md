@@ -215,14 +215,39 @@ goes back only when it has text with a signature, or redacted content; unsigned
 reasoning is dropped. When a block has both, the text and signature are sent.
 
 After a successful response the proxy stores the block in memory. Every key
-is scoped to the client session, the full session id Claude Code sends in
-`metadata.user_id` (the one the stable `conversationId` is derived from):
+is scoped to the conversation: the full session id Claude Code sends in
+`metadata.user_id` (the one the stable `conversationId` is derived from) plus
+a fingerprint of the conversation's first message. Claude Code sends one
+session id for a conversation and for every Task subagent it spawns, so the
+session alone would let a parent and its subagent share keys.
 
-- A response that emitted tool calls is stored under session plus each
-  `toolUseId`, and a history turn with tool calls is looked up by those keys
-  only, never by its text.
-- A response with no tool call is stored under a SHA-256 hash of session, the
-  turn's position and its assistant text. The text is the concatenation of
+The fingerprint is a SHA-256 hash of the role of `messages[0]` and its text,
+truncated to its first 128 bits. Claude Code opens that message with
+`<system-reminder>` blocks (instructions, a git status snapshot, an
+attribution note) that can change between requests of one conversation, and
+ends it with the prompt, which for a subagent is the task its parent wrote.
+The hash therefore covers the text blocks joined with a space, with every
+`<system-reminder>...</system-reminder>` span removed and whitespace collapsed
+as for turn text. The spans are removed from the joined text, so a reminder
+that opens in one block and closes in a later one is removed too. The result
+is stable across a conversation's turns and differs between a parent and its
+subagents. A first message that is all reminders hashes all its text; one
+with no text at all hashes its JSON with `cache_control` removed, since the
+client moves cache markers between requests. The proxy computes the
+fingerprint once per request, when it builds the backend request: lookup (the
+history's turns) and capture (storing the response) both use that value, and
+a resend of the same request, without reasoning or to another identity, keeps
+it. A later request computes it from its own `messages[0]`. When the client
+compacts or rewrites the first message the fingerprint changes, and every
+earlier entry of that conversation, text or tool keyed, becomes a miss: the
+turns carry no reasoning and the model thinks again. It never gets another
+conversation's reasoning.
+
+- A response that emitted tool calls is stored under the conversation scope
+  plus each `toolUseId`, and a history turn with tool calls is looked up by
+  those keys only, never by its text.
+- A response with no tool call is stored under a SHA-256 hash of the
+  conversation scope, the turn's position and its assistant text. The text is the concatenation of
   the response's text frames, or of the turn's text blocks in a later
   request, with every run of whitespace collapsed to one space and the ends
   trimmed, so a turn the client sends back split into several blocks is still
@@ -231,21 +256,23 @@ is scoped to the client session, the full session id Claude Code sends in
   request it is the turn's index among that request's assistant messages. Both
   count the client's `messages`, not the history sent to the backend, so a
   history mode that drops entries does not shift them. Two turns of one
-  session that said the same thing therefore each get their own reasoning.
+  conversation that said the same thing therefore each get their own
+  reasoning, and so do a parent and a subagent that said the same thing at
+  the same position.
 - A request with no session id (a client that sends no `metadata`) uses
-  unscoped tool keys only (tool use ids are unique). Its text-only turns are
-  neither stored nor looked up, so two clients without a session never share
-  reasoning.
+  unscoped tool keys only (tool use ids are unique) and no fingerprint. Its
+  text-only turns are neither stored nor looked up, so two clients without a
+  session never share reasoning.
 
 A response whose reasoning is not stored (unsigned, too large, or the feature
 off) removes whatever an earlier response left under the same keys, so a turn
 can only get reasoning that its own response produced. After the client
 compacts a conversation the positions restart and the summarised turns are
 gone: their entries are simply not found (a miss), and a new turn at a reused
-position replaces the old entry when its response arrives. One residual case
-remains: two conversations that share one session id (for example a subagent,
-if the client sends it under the parent's id) and produce identical text at the same position
-overwrite each other's entry, and the later one wins for both.
+position replaces the old entry when its response arrives. Two conversations
+of one session whose first messages have the same text once the reminders are
+removed (for example two subagents given the identical task) share a scope, as
+two turns of one conversation would.
 
 The entry records the Kiro model id of the request (`auto` for `auto`). The
 store holds all sessions together, bounded to 128 MiB in total, and evicts the
@@ -267,7 +294,7 @@ was signed with. A turn with no entry has no `reasoningContent` key at all.
 If the backend answers 400 with reason `THINKING_SIGNATURE_INVALID` to a request
 that carries reasoning, the proxy resends it once with every `reasoningContent`
 removed, forgets the turns it had attached (only that request's entries:
-the keys are scoped to its session) and logs one info line starting with
+the keys are scoped to its conversation) and logs one info line starting with
 `THINKING_SIGNATURE_INVALID`. The resend does not count as a retry. A request
 that carries no reasoning and still gets that reason is not resent; the client
 gets a non-retryable error.
