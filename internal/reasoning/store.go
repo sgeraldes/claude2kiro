@@ -43,13 +43,20 @@ func ToolKey(session, toolUseID string) string {
 
 // TextKey is the key of a turn without tool calls: a hash of the client
 // session, the turn's position among the conversation's assistant turns, and
-// its text without leading and trailing whitespace. Without the session and
-// the position, two conversations (or two turns of one) that said the same
-// thing would share reasoning.
+// its text after NormalizeText. Without the session and the position, two
+// conversations (or two turns of one) that said the same thing would share
+// reasoning.
 func TextKey(session string, turn int, text string) string {
-	sum := sha256.Sum256([]byte(session + "\x00" + strconv.Itoa(turn) + "\x00" + strings.TrimSpace(text)))
+	sum := sha256.Sum256([]byte(session + "\x00" + strconv.Itoa(turn) + "\x00" + NormalizeText(text)))
 	return "text:" + hex.EncodeToString(sum[:])
 }
+
+// NormalizeText is the form of a turn's text that TextKey hashes: every run of
+// whitespace becomes one space and the ends are trimmed. The response side
+// concatenates the text frames and the client may send the turn back split
+// into several text blocks; callers pass the concatenation of those blocks,
+// and this makes both hash the same thing.
+func NormalizeText(text string) string { return strings.Join(strings.Fields(text), " ") }
 
 type item struct {
 	keys  []string

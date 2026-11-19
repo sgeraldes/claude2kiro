@@ -220,7 +220,11 @@ is scoped to the client session, the full session id Claude Code sends in
   `toolUseId`, and a history turn with tool calls is looked up by those keys
   only, never by its text.
 - A response with no tool call is stored under a SHA-256 hash of session, the
-  turn's position and its assistant text. The position is the number of
+  turn's position and its assistant text. The text is the concatenation of
+  the response's text frames, or of the turn's text blocks in a later
+  request, with every run of whitespace collapsed to one space and the ends
+  trimmed, so a turn the client sends back split into several blocks is still
+  found. The position is the number of
   assistant messages in the request that produced the response; in a later
   request it is the turn's index among that request's assistant messages. Both
   count the client's `messages`, not the history sent to the backend, so a

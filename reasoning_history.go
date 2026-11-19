@@ -73,10 +73,32 @@ func (s reasoningScope) keys(toolUseIDs []string, text string) []string {
 		}
 		return keys
 	}
-	if s.session == "" || strings.TrimSpace(text) == "" {
+	if s.session == "" || reasoning.NormalizeText(text) == "" {
 		return nil
 	}
 	return []string{reasoning.TextKey(s.session, s.turn, text)}
+}
+
+// assistantTurnText is the text of a history assistant turn as its reasoning
+// key sees it: its text blocks concatenated with nothing between them, as the
+// response's text frames were (reasoning.NormalizeText evens out whitespace).
+func assistantTurnText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var text strings.Builder
+		for _, block := range v {
+			if m, ok := block.(map[string]any); ok && m["type"] == "text" {
+				if s, ok := m["text"].(string); ok {
+					text.WriteString(s)
+				}
+			}
+		}
+		return text.String()
+	default:
+		return ""
+	}
 }
 
 // historyToolUseIDs are the ids of a history turn's tool calls.

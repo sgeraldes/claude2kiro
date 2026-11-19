@@ -2368,7 +2368,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
 				scope := reasoningScope{session: sessionKey, turn: assistantTurn}
-				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), getMessageContent(msg.Content))
+				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), assistantTurnText(msg.Content))
 				assistantTurn++
 				emit("assistant", assistantMsg)
 				continue

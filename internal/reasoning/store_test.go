@@ -53,6 +53,9 @@ func TestKeysAreScopedToTheSessionAndTheTurn(t *testing.T) {
 	if ToolKey("s1", "t1") == ToolKey("s2", "t1") || ToolKey("s1", "t1") == ToolKey("", "t1") {
 		t.Fatal("a tool key must carry its session")
 	}
+	if TextKey("s1", 0, "Part one.\n\n  Part two. ") != TextKey("s1", 0, "Part one. Part two.") {
+		t.Fatal("the text key must not depend on how whitespace was split or joined")
+	}
 	if ToolKey("", "t1") != "tool:t1" {
 		t.Fatalf("the unscoped tool key = %q, want tool:t1", ToolKey("", "t1"))
 	}

@@ -154,6 +154,33 @@ func TestTwoIdenticalTextTurnsOfOneSessionEachGetTheirOwnReasoning(t *testing.T)
 	}
 }
 
+// The response side concatenates the text frames; the client sends the turn
+// back as several text blocks. Both hash the same normalized text.
+func TestTextArrivingAsTwoBlocksIsFoundAgain(t *testing.T) {
+	for name, run := range handlerRuns {
+		t.Run(name, func(t *testing.T) {
+			log := &bodyLog{}
+			reasoningHandlerSetup(t, scriptedBackend(log, nil, []string{
+				`{"text":"thinking"}`, `{"signature":"SIG-SPLIT"}`,
+				`{"content":"Part one. "}`, `{"content":"Part   two.\n"}`,
+			}))
+			lg := logger.NewLogger(100)
+			run(t, textConversation(scopeSessionA), lg)
+
+			req := textConversation(scopeSessionA, "")
+			req.Messages[1].Content = []any{
+				map[string]any{"type": "text", "text": "Part one. "},
+				map[string]any{"type": "text", "text": "Part two."},
+			}
+			run(t, req, lg)
+			bodies := log.all()
+			if got := historySignatures(t, bodies[1]); !equalStrings(got, []string{"SIG-SPLIT"}) {
+				t.Fatalf("the turn sent back as two blocks carries %q, want [SIG-SPLIT]:\n%s", got, bodies[1])
+			}
+		})
+	}
+}
+
 // A turn with tool calls is found by its tool use ids only, never by its text.
 func TestToolTurnWithoutItsEntryGetsNoReasoning(t *testing.T) {
 	log := &bodyLog{}
