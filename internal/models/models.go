@@ -35,6 +35,34 @@ type KiroModel struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	// RequestFields is the schema of the model-specific request options the
+	// backend accepts (additionalModelRequestFields). Nil for models that take
+	// none, such as "auto".
+	RequestFields *RequestFieldsSchema `json:"additionalModelRequestFieldsSchema"`
+}
+
+// RequestFieldsSchema is the part of a model's additionalModelRequestFields
+// JSON schema the proxy reads: the reasoning effort levels the model accepts.
+type RequestFieldsSchema struct {
+	Properties struct {
+		OutputConfig struct {
+			Properties struct {
+				Effort struct {
+					Enum    []string `json:"enum"`
+					Default string   `json:"default"`
+				} `json:"effort"`
+			} `json:"properties"`
+		} `json:"output_config"`
+	} `json:"properties"`
+}
+
+// EffortLevels returns the reasoning effort levels the model accepts, in the
+// order the backend lists them (lowest first). Empty when it accepts none.
+func (m KiroModel) EffortLevels() []string {
+	if m.RequestFields == nil {
+		return nil
+	}
+	return m.RequestFields.Properties.OutputConfig.Properties.Effort.Enum
 }
 
 type listResponse struct {
@@ -283,6 +311,18 @@ func (c *Catalog) Has(modelID string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.ids[modelID]
+}
+
+// EffortLevels returns the reasoning effort levels modelID accepts according
+// to the live list. known is false when the catalog does not hold that model
+// (never fetched, or the model is not offered), so the caller can fall back.
+func (c *Catalog) EffortLevels(modelID string) (levels []string, known bool) {
+	for _, m := range c.Models() {
+		if m.ModelID == modelID {
+			return m.EffortLevels(), true
+		}
+	}
+	return nil, false
 }
 
 // Available reports whether the catalog currently holds any model data.
