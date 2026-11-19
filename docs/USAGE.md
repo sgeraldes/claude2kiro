@@ -215,6 +215,18 @@ change model behavior:
 Benchmarked locally (see the benchmark doc): `none_text` cut credits ~68% on
 no-tool suites; `aggressive_cache_points` cut ~34-36% on both suites.
 
+### Thinking
+
+| Setting | Values | Effect |
+|---|---|---|
+| `advanced.thinking_mode` | `client` (default), `backend` | `client` sends the thinking the client asked for: off when it sent no `thinking` field (as Claude Code started by `claude2kiro run` does), adaptive when it asked for thinking, and only when the model's catalog schema allows that value. `backend` sends no `thinking` field, so Kiro applies its default, adaptive thinking on. Unknown values count as `client`. |
+
+Thinking changes speed and cost a lot. On one agent step of 91k input tokens,
+Opus 5.5 with adaptive thinking took 329 s and 8.26 credits; Opus 4.8 with
+thinking off took 13.2 s and 0.86 credits, Sonnet 5 with thinking off 5.2 s and
+0.43 credits. Opus 5.5 and Sonnet 5.5 cannot turn thinking off, so they keep it
+in both modes.
+
 The live web dashboard (`claude2kiro credits --web`) charts credit history,
 burn rate, and projected runout from samples recorded every 15 minutes while
 the proxy runs.

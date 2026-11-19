@@ -76,10 +76,15 @@ data: {"type": "message_stop"}
   },
   "profileArn": "arn:aws:codewhisperer:us-east-1:...",
   "additionalModelRequestFields": {
-    "output_config": {"effort": "medium"}
+    "thinking": {"type": "disabled"},
+    "output_config": {"effort": "medium"},
+    "max_tokens": 64000
   }
 }
 ```
+
+Each key of `additionalModelRequestFields` is sent only when the model's catalog
+schema declares it. When none applies the whole object is left out.
 
 **Response Format:** Binary Event Stream
 ```
@@ -93,8 +98,13 @@ data: {"type": "message_stop"}
 **Event Types in Binary Stream:**
 - `assistantResponseEvent` - Text content: `{"content": "Hello", "stop": false}`
 - `toolUseEvent` - Tool calls: `{"name": "Bash", "toolUseId": "tooluse_...", "input": "{...}"}`
+- `reasoningContentEvent` - The model's reasoning: `{"text": "..."}`, then `{"signature": "..."}`
+- A stop frame - Why the model stopped: `{"stopReason": "TOOL_USE"}` (also `END_TURN`, `MAX_TOKENS`, `STOP_SEQUENCE`)
 - `meteringEvent` - Usage tracking: `{"unit": "credit", "usage": 0.79}`
 - `contextUsageEvent` - Context info: `{"contextUsagePercentage": 23.24}`
+
+The parser tells frames apart by their payload keys; it does not read the frame
+headers.
 
 ## Key Differences
 
@@ -114,9 +124,46 @@ data: {"type": "message_stop"}
 2. Convert to CodeWhisperer conversation history
 3. Map model names (e.g., `claude-sonnet-4-20250514` → `CLAUDE_SONNET_4_20250514_V1_0`)
 4. Transform tool definitions to CodeWhisperer format
-5. Add current Kiro protocol fields (`agentTaskType`, native `output_config.effort`,
-   and `envState` when Claude Code sends an `<env>` system block)
+5. Add current Kiro protocol fields (`agentTaskType`, `additionalModelRequestFields`
+   with `thinking`, `output_config.effort` and `max_tokens`, and `envState` when
+   Claude Code sends an `<env>` system block)
 6. Add required AWS metadata (profileArn, customizationArn)
+
+#### Thinking (`advanced.thinking_mode`)
+
+Without a `thinking` field the backend applies its default, which is adaptive
+thinking on. Claude Code launched by `claude2kiro run` has thinking disabled
+(`CLAUDE_CODE_DISABLE_THINKING=1`) and sends no `thinking` field, which in the
+Anthropic API means no thinking. On one real agent step of 91k input tokens,
+Opus 5.5 with adaptive thinking took 329 s and 8.26 credits, while Opus 4.8 with
+thinking disabled took 13.2 s and 0.86 credits. Lowering the effort did not
+shorten the reasoning.
+
+The setting `advanced.thinking_mode` decides what the proxy sends:
+
+- `client` (default) translates the client's request. A request with no
+  `thinking` field, or with `"type": "disabled"`, becomes
+  `"thinking": {"type": "disabled"}` when the model's schema lists `disabled`.
+  A request with `"type": "enabled"` or `"adaptive"` becomes
+  `"thinking": {"type": "adaptive"}` when the schema lists `adaptive`. The
+  budget tokens are not forwarded. When the schema does not list the value
+  needed, nothing is sent: Opus 5.5 lists only `adaptive` and Sonnet 5.5
+  lists `adaptive` and `between_tools`, so thinking cannot be turned off for
+  them.
+- `backend` never sends a `thinking` field, as the proxy did before this
+  setting existed.
+
+An unknown value counts as `client`. Models with no schema (`auto`, the 4.5
+models, DeepSeek, MiniMax, GLM, Qwen), models whose schema has no `thinking`
+property (GPT, Grok) and models the catalog does not list get no thinking
+field in either mode.
+
+#### max_tokens
+
+In both modes, when the model's schema declares `max_tokens` and the client sent
+a positive `max_tokens`, the proxy sends it clamped to the schema's `minimum` and
+`maximum`. Claude Code sends 128000; Opus 5.5 accepts at most 64000, so it gets
+64000.
 
 ### Response Translation (parser/sse_parser.go)
 
@@ -130,6 +177,27 @@ data: {"type": "message_stop"}
 4. Generate proper indices for each content block
 5. Add single `message_delta` at the end
 
+Reasoning frames (`text`, `signature`), `contextUsagePercentage` and metering
+frames produce no client events and do not take a block index. Reasoning is not
+forwarded to the client; the proxy only counts its characters.
+
+#### Stop reason
+
+The `message_delta` carries the stop reason the backend sent in its
+`stopReason` frame: `END_TURN` becomes `end_turn`, `TOOL_USE` becomes
+`tool_use`, `MAX_TOKENS` becomes `max_tokens` and `STOP_SEQUENCE` becomes
+`stop_sequence`. When the frame is missing or holds another value the proxy
+derives it as before: `tool_use` if the response used a tool, else `end_turn`.
+Both the streaming and the non-streaming paths do this.
+
+A model can spend its whole output budget on reasoning and stop with
+`MAX_TOKENS` before writing anything. The proxy then answers a normal message
+with one text block, `[Kiro stopped at the output limit before producing an
+answer]`, and `stop_reason: "max_tokens"`, and logs an error line with the
+reasoning size. A response with no content and any other stop reason is
+answered as before (`[Error: No response received from backend]` when
+streaming).
+
 ### Streaming (parser/stream.go, stream_keepalive.go)
 
 A streaming request (`"stream": true`) is forwarded frame by frame. `parser.ReadFramePayload` reads one binary frame from the backend response and `parser.StreamTranslator` turns it into Anthropic events, which the proxy sends before it reads the next frame. The client sees text and tool input while the backend is still generating.
@@ -138,9 +206,9 @@ A streaming request (`"stream": true`) is forwarded frame by frame. `parser.Read
 - `message_start` goes out with the first content frame. `message_delta` and `message_stop` close the response when the backend stream ends.
 - While the stream is silent the proxy sends a `ping` event every 15 seconds, including the time before the backend's first byte. Without it, a client that hears nothing for minutes gives up and resends the whole request while the first one is still running.
 - When the client disconnects, the backend request is cancelled (streaming and non-streaming). It stops consuming credits and frees its slot in `max_concurrent_requests`.
-- The log line `Parser: N events, ... queueWait=… firstEvent=…` shows how long the request waited for a concurrency slot and how long the backend took to produce its first content.
+- The log line `Parser: N events, ... queueWait=… firstEvent=… stopReason=… reasoningChars=…` shows how long the request waited for a concurrency slot, how long the backend took to produce its first content, the stop reason as the backend sent it (`none` when it sent none) and how many characters of reasoning it produced.
 
-Non-streaming requests (`"stream": false`) still read the whole backend response and translate it with `parser.ParseEvents`.
+Non-streaming requests (`"stream": false`) still read the whole backend response and translate it with `parser.ParseEventsWithSummary`, which also returns the stop reason and the reasoning size. Their log line is `Parser (non-stream): N events, hasText=…, hasToolUse=…, stopReason=… reasoningChars=…`.
 
 ## Credit-Efficiency Optimizations
 
@@ -186,6 +254,8 @@ benchmarks prove the trade-off is safe.
   model released after this build gets the requested effort too. A static table of
   the levels known at build time covers the case where the catalog is unreachable.
   `auto` accepts no request fields, so no effort is sent for it and Kiro decides.
+  Effort is sent next to `thinking` and `max_tokens` when those apply (see
+  Request Translation above).
 - **Environment state passthrough.** Claude Code's `<env>` system block is parsed for
   working directory and platform, then attached to the current message as
   `envState`. This is protocol parity with current Kiro clients, not a direct token
