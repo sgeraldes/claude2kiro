@@ -326,6 +326,7 @@ Use this when you want to upgrade without reinstalling manually.
 - [Protocol translation](docs/PROTOCOL_TRANSLATION.md)
 - [Anthropic SSE format](docs/ANTHROPIC_SSE_FORMAT.md)
 - [CodeWhisperer binary format](docs/CODEWHISPERER_BINARY_FORMAT.md)
+- [Task time and model choice (2026-11-19)](docs/benchmarks/2026-11-19-task-time-and-model-choice.md)
 
 ## Adoption
 
