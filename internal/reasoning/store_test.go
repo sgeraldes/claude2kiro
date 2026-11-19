@@ -38,7 +38,8 @@ func TestPutAndGetByToolIDAndByTextHash(t *testing.T) {
 	if ToolKey("", "x") == TextKey("s", 0, "x") {
 		t.Fatal("a tool id and a text must never share a key")
 	}
-	if TextKey("s", 0, "a") == TextKey("s", 0, "b") || TextKey("s", 0, "same") != TextKey("s", 0, "same") {
+	first, second := TextKey("s", 0, "same"), TextKey("s", 0, "same")
+	if TextKey("s", 0, "a") == TextKey("s", 0, "b") || first != second {
 		t.Fatal("the text key must be a stable hash of the text")
 	}
 }
