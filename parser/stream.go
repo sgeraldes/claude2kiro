@@ -45,8 +45,11 @@ func ReadFramePayload(r io.Reader) ([]byte, error) {
 // StreamTranslator turns CodeWhisperer frames into Anthropic content-block
 // events one frame at a time, so the proxy can forward a response while the
 // backend is still producing it. Blocks get their index in arrival order and a
-// text block is closed before a tool block starts, as the Anthropic stream
-// requires. It is not safe for concurrent use.
+// text block is closed before a tool block starts. A tool block stays open
+// until its stop frame or Finish, even when text arrives in between: that text
+// gets its own block, so two blocks can be open at once. Clients follow blocks
+// by index, and ParseEvents produced the same shape. It is not safe for
+// concurrent use.
 type StreamTranslator struct {
 	nextIndex int
 	textIndex int            // index of the open text block, -1 when none is open
@@ -72,7 +75,8 @@ func (t *StreamTranslator) Translate(payload []byte) []SSEEvent {
 	switch {
 	case evt.Content != "":
 		if t.textIndex < 0 {
-			out = append(out, t.closeTools()...)
+			// An open tool block stays open: its input may still arrive after
+			// this text, and closing it would lose that input.
 			t.textIndex = t.nextIndex
 			t.nextIndex++
 			out = append(out, SSEEvent{Event: "content_block_start", Data: map[string]any{
@@ -90,7 +94,7 @@ func (t *StreamTranslator) Translate(payload []byte) []SSEEvent {
 	case evt.ToolUseId != "" && evt.Name != "" && !evt.Stop:
 		index, known := t.toolIndex[evt.ToolUseId]
 		if known && !t.openTools[evt.ToolUseId] {
-			return nil // input for a block that is already closed
+			return nil // input after the tool's own stop frame: its block is closed
 		}
 		if !known {
 			out = append(out, t.closeText()...)
