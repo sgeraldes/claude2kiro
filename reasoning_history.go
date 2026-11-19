@@ -189,8 +189,9 @@ func (r *CodeWhispererRequest) stripReasoning() []string {
 
 // isThinkingSignatureInvalid reports a 400 whose reason says the backend
 // rejected a reasoning signature the request carried:
-// {"reason":"THINKING_SIGNATURE_INVALID",...}. Only the structured reason is
-// trusted (see isInvalidModelID).
+// {"reason":"THINKING_SIGNATURE_INVALID",...}. A JSON body counts only by its
+// reason field, never by its message, which can echo request content. A body
+// that is not JSON counts when it contains the enum, as in isInvalidModelID.
 func isThinkingSignatureInvalid(body []byte) bool {
 	var parsed struct {
 		Reason string `json:"reason"`
