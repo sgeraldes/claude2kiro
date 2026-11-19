@@ -2132,28 +2132,31 @@ func discoverProfileArn(accessToken string) string {
 	return selectProfileArn(profiles)
 }
 
-// buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
-func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
-	cwReq := CodeWhispererRequest{}
-
-	// Set ProfileArn.
-	//
-	// The Kiro backend associates each request with a CodeWhisperer profile. For
-	// IdC/Enterprise users the correct profile is account-specific and is
-	// discovered + persisted on the token (see discoverProfileArn). Sending the
-	// WRONG profile is worse than sending none — it 403s or silently loses model
-	// access — so we never blindly fall back to the shared consumer profile for
-	// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+// requestProfileArn is the profileArn a request made with token carries.
+//
+// The Kiro backend associates each request with a CodeWhisperer profile. For
+// IdC/Enterprise users the correct profile is account-specific and is
+// discovered + persisted on the token (see discoverProfileArn). Sending the
+// WRONG profile is worse than sending none — it 403s or silently loses model
+// access — so we never blindly fall back to the shared consumer profile for
+// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+func requestProfileArn(token TokenData) string {
 	switch {
 	case token.ProfileArn != "":
-		cwReq.ProfileArn = token.ProfileArn
+		return token.ProfileArn
 	case token.AuthMethod != "IdC":
-		cwReq.ProfileArn = consumerProfileArn
+		return consumerProfileArn
 	default:
 		// IdC with no discovered profile: omit (works for tokens the backend
 		// doesn't yet require a profile for).
-		cwReq.ProfileArn = ""
+		return ""
 	}
+}
+
+// buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
+func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
+	cwReq := CodeWhispererRequest{}
+	cwReq.ProfileArn = requestProfileArn(token)
 	cfg := config.Get()
 	kiroModel := getKiroModelID(anthropicReq.Model)
 	historyMode := cfg.Advanced.HistoryMode
@@ -4746,7 +4749,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	// profileArn in the body, everything else (conversationId, history) kept.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		cwReq.ProfileArn = requestProfileArn(tok)
 		body, merr := jsonStr.Marshal(cwReq)
 		if merr != nil {
 			return merr
@@ -7474,7 +7477,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// adopt rebuilds the outgoing request for another identity's token.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		cwReq.ProfileArn = requestProfileArn(tok)
 		body, merr := jsonStr.Marshal(cwReq)
 		if merr != nil {
 			return merr
