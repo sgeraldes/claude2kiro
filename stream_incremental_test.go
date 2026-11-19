@@ -306,7 +306,7 @@ func TestStreamRetryBackoffEndsWhenTheClientLeaves(t *testing.T) {
 }
 
 func TestKeepaliveWriterStopIsSafeTwice(t *testing.T) {
-	k := newKeepaliveWriter(newLiveRecorder(), newLiveRecorder(), 10*time.Millisecond)
+	k := newKeepaliveWriter(newLiveRecorder(), 10*time.Millisecond, nil)
 	k.stop()
 	k.stop()
 }
@@ -390,5 +390,44 @@ func TestNonStreamCancelsTheBackendWhenTheClientDisconnects(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatalf("timed out waiting for %s", name)
 		}
+	}
+}
+
+// With streaming_delay_max set, a client that leaves ends the per-event pause
+// at once instead of the handler sleeping it out.
+func TestStreamDelayEndsWhenTheClientLeaves(t *testing.T) {
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write(cwFrame(`{"content":"FIRST"}`))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	})
+	cfg := *config.Get()
+	cfg.Network.StreamingDelayMax = 10 * time.Second
+	cfg.Network.StreamKeepaliveInterval = 0
+	withConfig(t, &cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := newLiveRecorder()
+	done := make(chan struct{})
+	go func() {
+		handleStreamRequestCtx(ctx, rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
+		close(done)
+	}()
+
+	waitForBody(t, rec, "event: content_block_start")
+	cancelled := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(25 * time.Second):
+		t.Fatal("the handler did not return after the client left")
+	}
+	if waited := time.Since(cancelled); waited > 500*time.Millisecond {
+		t.Fatalf("the handler slept %v of the streaming delay after the client left", waited)
 	}
 }

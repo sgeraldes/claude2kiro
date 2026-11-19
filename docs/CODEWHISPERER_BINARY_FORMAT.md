@@ -95,6 +95,37 @@ Tool/function call.
 }
 ```
 
+### reasoningContentEvent
+
+The model's reasoning, streamed in chunks, followed by a signature. The proxy
+counts the characters of `text` (logged as `reasoningChars`) and does not
+forward either frame to the client.
+
+```json
+{
+  "text": "Let me look at the failing test first."
+}
+```
+
+```json
+{
+  "signature": "EqQBCkYIBxgCKkDx..."
+}
+```
+
+### Stop reason
+
+Why the model stopped. Seen values are `TOOL_USE` and `MAX_TOKENS`; `END_TURN`
+and `STOP_SEQUENCE` are expected too. The proxy maps them to the Anthropic
+`stop_reason` (`tool_use`, `max_tokens`, `end_turn`, `stop_sequence`). A missing
+or unknown value falls back to `tool_use` when a tool was used, else `end_turn`.
+
+```json
+{
+  "stopReason": "TOOL_USE"
+}
+```
+
 ### meteringEvent
 
 Usage/billing information.

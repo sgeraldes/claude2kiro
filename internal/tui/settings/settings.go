@@ -550,14 +550,13 @@ func (m *Model) loadSettings() {
 			Description: "Parallel requests to the Kiro backend",
 			Type:        TypeNumber,
 			Value:       fmt.Sprintf("%d", m.config.Network.MaxConcurrentReqs),
-			Min:         1,
-			Max:         32,
+			Min:         1, // no Max: like config.yaml, any value from 1 up
 			Step:        1,
 			ExtendedHelp: ExtendedHelp{
 				DefaultValue:     "4",
 				RecommendedValue: "4",
 				Sensitive:        false,
-				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Range: 1-32.",
+				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Any value from 1 up.",
 			},
 		},
 		{
@@ -794,6 +793,35 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "EXPERIMENTAL. Adds Kiro cachePoint entries after tools even when Claude Code did not send Anthropic cache_control. Only enable while measuring whether Kiro credits drop.",
 			},
 		},
+		{
+			Key:         "advanced.thinking_mode",
+			Label:       "Thinking Mode",
+			Description: "Who decides whether the model thinks",
+			Type:        TypeSelect,
+			Value:       m.config.Advanced.EffectiveThinkingMode(),
+			Options:     []string{config.ThinkingModeClient, config.ThinkingModeBackend},
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     config.ThinkingModeClient,
+				RecommendedValue: config.ThinkingModeClient,
+				Sensitive:        false,
+				DetailedDesc:     "client sends Kiro the thinking the client asked for: off when the client sent no thinking field (claude2kiro run turns it off), adaptive when it asked for thinking. A model whose catalog entry cannot turn thinking off keeps the backend default. backend never sends a thinking field, so Kiro applies its default, which is adaptive thinking on: slower and more credits per request.",
+			},
+		},
+		{
+			Key:         "advanced.reasoning_history_max_bytes",
+			Label:       "Reasoning History Bytes",
+			Description: "Max reasoning bytes given back per request",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.ReasoningHistoryMaxBytes),
+			Min:         0,
+			Max:         128 << 20,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     strconv.Itoa(config.DefaultReasoningHistoryMaxBytes),
+				RecommendedValue: strconv.Itoa(config.DefaultReasoningHistoryMaxBytes),
+				Sensitive:        false,
+				DetailedDesc:     "The proxy keeps the model's reasoning (in memory, lost on restart) and gives it back to Kiro in the history of later turns, as the Kiro IDE does, so the model does not plan every step again. This caps the reasoning bytes one request carries, newest turns first. 0 turns the feature off. Range: 0-134217728.",
+			},
+		},
 	}
 }
 
@@ -952,6 +980,12 @@ func (m *Model) applySetting(s Setting) {
 		}
 	case "advanced.aggressive_cache_points":
 		m.config.Advanced.AggressiveCachePoints = stringToBool(s.Value)
+	case "advanced.thinking_mode":
+		m.config.Advanced.ThinkingMode = s.Value
+	case "advanced.reasoning_history_max_bytes":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.ReasoningHistoryMaxBytes = v
+		}
 	}
 }
 
@@ -1185,15 +1219,8 @@ func (m Model) handleEditing(msg tea.Msg) (Model, tea.Cmd) {
 					m.textInput.Blur()
 					return m, nil
 				} else {
-					// Clamp to range
 					if s.Min != 0 || s.Max != 0 {
-						if v < s.Min {
-							v = s.Min
-						}
-						if v > s.Max {
-							v = s.Max
-						}
-						newValue = fmt.Sprintf("%d", v)
+						newValue = fmt.Sprintf("%d", clampNumber(*s, v))
 					}
 				}
 			}
@@ -1727,8 +1754,11 @@ func (m Model) renderHelpPanel(width, height int) string {
 		lines = append(lines, hintStyle.Render("Options: "+strings.Join(s.Options, ", ")))
 	case TypeNumber:
 		hint := "Press Enter to edit, Up/Down to adjust ±1"
-		if s.Min != 0 || s.Max != 0 {
+		switch {
+		case s.Max != 0:
 			hint += fmt.Sprintf("\nRange: %d - %d", s.Min, s.Max)
+		case s.Min != 0:
+			hint += fmt.Sprintf("\nMinimum: %d", s.Min)
 		}
 		lines = append(lines, hintStyle.Render(hint))
 	case TypeText:
@@ -1871,4 +1901,15 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("esc", "back"),
 		),
 	}
+}
+
+// clampNumber keeps v within the setting's range. Max 0 means no upper bound.
+func clampNumber(s Setting, v int) int {
+	if v < s.Min {
+		v = s.Min
+	}
+	if s.Max != 0 && v > s.Max {
+		v = s.Max
+	}
+	return v
 }

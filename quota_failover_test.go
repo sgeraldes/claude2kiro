@@ -46,6 +46,9 @@ type fakeQuotaBackend struct {
 
 func newFakeQuotaBackend(t *testing.T, exhausted ...string) *fakeQuotaBackend {
 	t.Helper()
+	// Every request the fake sees is recorded, so catalog lookups made while a
+	// request is built must not reach it (see failoverConfig).
+	withOfflineCatalog(t)
 	f := &fakeQuotaBackend{exhausted: map[string]bool{}, expired: map[string]bool{}}
 	for _, b := range exhausted {
 		f.exhausted[b] = true
@@ -192,8 +195,12 @@ func fallbackToken() TokenData {
 	return TokenData{AccessToken: "kiro2-token", AuthMethod: "IdC", ProfileArn: "arn:kiro2", ExpiresAt: farFuture()}
 }
 
+// failoverConfig points the proxy at backend. The fake backends count every
+// request they see, so the model catalog is taken offline: building a request
+// looks the model up in the catalog, and that lookup must not reach them.
 func failoverConfig(t *testing.T, backend string, fallbacks ...string) *config.Config {
 	t.Helper()
+	withOfflineCatalog(t)
 	cfg := *config.Get()
 	cfg.Advanced.CodeWhispererEndpoint = backend
 	cfg.Auth.FallbackProfiles = fallbacks

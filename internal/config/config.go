@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,7 +106,31 @@ type AdvancedConfig struct {
 	ToolMode              string `yaml:"tool_mode"`               // Request diet tool mode: full, compact, none_text (default: full)
 	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
 	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
-	Profile               string `yaml:"profile"`                 // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+	ThinkingMode          string `yaml:"thinking_mode"`           // Who decides the model's thinking: client (translate the client's thinking field, default) or backend (send none, the backend default applies)
+	// ReasoningHistoryMaxBytes caps the reasoning the proxy gives back to the
+	// backend in one request's history, newest turns first (default 4 MiB). 0
+	// turns the feature off: no reasoning is kept or sent back.
+	ReasoningHistoryMaxBytes int    `yaml:"reasoning_history_max_bytes"`
+	Profile                  string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+}
+
+// DefaultReasoningHistoryMaxBytes is the default of
+// AdvancedConfig.ReasoningHistoryMaxBytes, 4 MiB.
+const DefaultReasoningHistoryMaxBytes = 4 << 20
+
+// Values of AdvancedConfig.ThinkingMode.
+const (
+	ThinkingModeClient  = "client"  // translate what the client asked for
+	ThinkingModeBackend = "backend" // never send a thinking field
+)
+
+// EffectiveThinkingMode returns ThinkingMode, or client when it is empty or
+// not a known value. Case and surrounding spaces are ignored.
+func (a AdvancedConfig) EffectiveThinkingMode() string {
+	if strings.EqualFold(strings.TrimSpace(a.ThinkingMode), ThinkingModeBackend) {
+		return ThinkingModeBackend
+	}
+	return ThinkingModeClient
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -183,6 +208,9 @@ func Default() *Config {
 			ToolMode:              "full",
 			ToolCompactMaxChars:   1024,
 			AggressiveCachePoints: false,
+			ThinkingMode:          ThinkingModeClient,
+
+			ReasoningHistoryMaxBytes: DefaultReasoningHistoryMaxBytes,
 		},
 	}
 }
@@ -309,6 +337,40 @@ func Set(cfg *Config) {
 	currentMu.Lock()
 	current = cfg
 	currentMu.Unlock()
+
+	changeMu.Lock()
+	fns := make([]func(), 0, len(changeFns))
+	for _, fn := range changeFns {
+		fns = append(fns, fn)
+	}
+	changeMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// Change listeners, called after every Set. A reader that parks on a value from
+// the config (the concurrency limiter's waiters) registers one so a live change
+// reaches it at once instead of at its next unrelated wake-up.
+var (
+	changeMu   sync.Mutex
+	changeNext int
+	changeFns  = map[int]func(){}
+)
+
+// OnChange registers fn to run after every Set, outside the config lock, and
+// returns a function that removes it.
+func OnChange(fn func()) (remove func()) {
+	changeMu.Lock()
+	id := changeNext
+	changeNext++
+	changeFns[id] = fn
+	changeMu.Unlock()
+	return func() {
+		changeMu.Lock()
+		delete(changeFns, id)
+		changeMu.Unlock()
+	}
 }
 
 // Reload reloads configuration from file

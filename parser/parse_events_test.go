@@ -148,6 +148,70 @@ func TestParseEvents_MultipleToolsDistinctIndices(t *testing.T) {
 	}
 }
 
+// blockIndices lists, per event that has an index, its kind and index:
+// "text" for a text delta, the tool id for a tool start.
+func blockIndices(t *testing.T, events []SSEEvent) map[string]any {
+	t.Helper()
+	got := map[string]any{}
+	texts := 0
+	lastText := -1
+	for _, e := range events {
+		switch e.Event {
+		case "content_block_start":
+			cb := dataField(t, e, "content_block").(map[string]any)
+			got[cb["id"].(string)] = dataField(t, e, "index")
+			lastText = -1
+		case "content_block_delta":
+			d := dataField(t, e, "delta").(map[string]any)
+			if d["type"] != "text_delta" {
+				continue
+			}
+			idx := dataField(t, e, "index").(int)
+			if idx != lastText {
+				got["text"+string(rune('0'+texts))] = idx
+				texts++
+				lastText = idx
+			}
+		}
+	}
+	return got
+}
+
+// Blocks get their index in arrival order, as in StreamTranslator: a tool
+// that comes before any text is at 0 and later text gets the next index.
+func TestParseEvents_IndicesFollowArrivalOrder(t *testing.T) {
+	cases := []struct {
+		name     string
+		payloads []string
+		want     map[string]any
+	}{
+		{"tool then text", []string{
+			`{"name":"Read","toolUseId":"tu_1"}`, `{"toolUseId":"tu_1","stop":true}`,
+			`{"content":"done"}`,
+		}, map[string]any{"tu_1": 0, "text0": 1}},
+		{"text, tool, text", []string{
+			`{"content":"first"}`, `{"name":"Read","toolUseId":"tu_1"}`, `{"toolUseId":"tu_1","stop":true}`,
+			`{"content":"second"}`, `{"content":" more"}`,
+		}, map[string]any{"text0": 0, "tu_1": 1, "text1": 2}},
+		{"tool, text, tool", []string{
+			`{"name":"Read","toolUseId":"tu_1"}`, `{"content":"between"}`, `{"name":"Bash","toolUseId":"tu_2"}`,
+		}, map[string]any{"tu_1": 0, "text0": 1, "tu_2": 2}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := blockIndices(t, ParseEvents(frames(c.payloads...)))
+			if len(got) != len(c.want) {
+				t.Fatalf("indices = %v, want %v", got, c.want)
+			}
+			for k, v := range c.want {
+				if got[k] != v {
+					t.Fatalf("indices = %v, want %v", got, c.want)
+				}
+			}
+		})
+	}
+}
+
 func TestParseEvents_EmptyAndGarbageAreSafe(t *testing.T) {
 	// Each must return no events and must not panic.
 	cases := map[string][]byte{

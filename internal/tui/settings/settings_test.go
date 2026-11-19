@@ -153,3 +153,101 @@ func TestRequestDietSettingsDefaultConservativeAndApply(t *testing.T) {
 		t.Fatal("aggressive cache points should apply true")
 	}
 }
+
+func TestReasoningHistoryMaxBytesSettingDefaultsAndApplies(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	s := findAdvancedSetting(m, "advanced.reasoning_history_max_bytes")
+	if s == nil {
+		t.Fatal("advanced.reasoning_history_max_bytes setting not found")
+	}
+	if s.Type != TypeNumber {
+		t.Fatalf("setting type = %v, want TypeNumber", s.Type)
+	}
+	if s.Value != "4194304" || s.ExtendedHelp.DefaultValue != "4194304" {
+		t.Fatalf("value = %q default = %q, want 4194304", s.Value, s.ExtendedHelp.DefaultValue)
+	}
+
+	m.applySetting(Setting{Key: "advanced.reasoning_history_max_bytes", Value: "0"})
+	if m.config.Advanced.ReasoningHistoryMaxBytes != 0 {
+		t.Fatalf("applied value = %d, want 0", m.config.Advanced.ReasoningHistoryMaxBytes)
+	}
+	m.applySetting(Setting{Key: "advanced.reasoning_history_max_bytes", Value: "-5"})
+	if m.config.Advanced.ReasoningHistoryMaxBytes != 0 {
+		t.Fatalf("a negative value must be ignored, got %d", m.config.Advanced.ReasoningHistoryMaxBytes)
+	}
+}
+
+func TestThinkingModeSettingDefaultsToClientAndApplies(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	thinking := findAdvancedSetting(m, "advanced.thinking_mode")
+	if thinking == nil {
+		t.Fatal("advanced.thinking_mode setting not found")
+	}
+	if thinking.Type != TypeSelect {
+		t.Fatalf("thinking mode setting type = %v, want TypeSelect", thinking.Type)
+	}
+	if thinking.Value != "client" || thinking.ExtendedHelp.DefaultValue != "client" {
+		t.Fatalf("thinking mode value = %q default = %q, want client", thinking.Value, thinking.ExtendedHelp.DefaultValue)
+	}
+	if strings.Join(thinking.Options, ",") != "client,backend" {
+		t.Fatalf("thinking mode options = %v, want client,backend", thinking.Options)
+	}
+
+	m.applySetting(Setting{Key: "advanced.thinking_mode", Value: "backend"})
+	if m.config.Advanced.ThinkingMode != "backend" {
+		t.Fatalf("applied thinking mode = %q, want backend", m.config.Advanced.ThinkingMode)
+	}
+}
+
+// max_concurrent_requests accepts any value from 1 up, like config.yaml: the
+// screen neither caps it nor claims a range it does not enforce.
+func TestMaxConcurrentRequestsSettingHasNoUpperBound(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	var conc *Setting
+	for i := range m.settings[TabNetwork] {
+		if m.settings[TabNetwork][i].Key == "network.max_concurrent_requests" {
+			conc = &m.settings[TabNetwork][i]
+			break
+		}
+	}
+	if conc == nil {
+		t.Fatal("network.max_concurrent_requests setting not found")
+	}
+	if got := clampNumber(*conc, 40); got != 40 {
+		t.Fatalf("clampNumber(40) = %d, want 40 (no upper bound)", got)
+	}
+	if got := clampNumber(*conc, 0); got != 1 {
+		t.Fatalf("clampNumber(0) = %d, want the minimum 1", got)
+	}
+	if strings.Contains(conc.ExtendedHelp.DetailedDesc, "32") {
+		t.Fatalf("help still claims an upper bound: %q", conc.ExtendedHelp.DetailedDesc)
+	}
+
+	m.applySetting(Setting{Key: "network.max_concurrent_requests", Value: "40"})
+	if m.config.Network.MaxConcurrentReqs != 40 {
+		t.Fatalf("applied limit = %d, want 40", m.config.Network.MaxConcurrentReqs)
+	}
+}
+
+// A bounded number setting is still clamped on both sides.
+func TestClampNumberKeepsABoundedRange(t *testing.T) {
+	s := Setting{Type: TypeNumber, Min: 1, Max: 200}
+	if got := clampNumber(s, 500); got != 200 {
+		t.Fatalf("clampNumber(500) = %d, want 200", got)
+	}
+	if got := clampNumber(s, -3); got != 1 {
+		t.Fatalf("clampNumber(-3) = %d, want 1", got)
+	}
+}

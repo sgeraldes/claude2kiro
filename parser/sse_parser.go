@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 )
@@ -56,6 +57,60 @@ type assistantResponseEvent struct {
 	Name      string  `json:"name"`
 	ToolUseId string  `json:"toolUseId"`
 	Stop      bool    `json:"stop"`
+	// Reasoning is the text of a reasoningContentEvent ({"text":"..."}), and
+	// Signature and RedactedContent are its other two frame kinds. They are
+	// kept for the next request, never forwarded to the client.
+	Reasoning       string          `json:"text,omitempty"`
+	Signature       string          `json:"signature,omitempty"`
+	RedactedContent json.RawMessage `json:"redactedContent,omitempty"`
+	// ModelId is the model the backend says produced the frame, when it says.
+	ModelId string `json:"modelId,omitempty"`
+	// StopReason is the backend's reason for ending the response, sent in a
+	// frame of its own ({"stopReason":"TOOL_USE"}).
+	StopReason string `json:"stopReason,omitempty"`
+}
+
+// reasoningChars is the number of reasoning characters a frame carries. A
+// frame with assistant content or a tool is not a reasoning frame.
+func (e assistantResponseEvent) reasoningChars() int {
+	if e.Content != "" || e.ToolUseId != "" {
+		return 0
+	}
+	return utf8.RuneCountInString(e.Reasoning)
+}
+
+// backendStopReasons maps the backend's stopReason values to the Anthropic
+// stop_reason.
+var backendStopReasons = map[string]string{
+	"END_TURN":      "end_turn",
+	"TOOL_USE":      "tool_use",
+	"MAX_TOKENS":    "max_tokens",
+	"STOP_SEQUENCE": "stop_sequence",
+}
+
+// AnthropicStopReason maps the backend's stopReason to the Anthropic
+// stop_reason. An absent or unknown value falls back to tool_use when the
+// response used a tool, else end_turn.
+func AnthropicStopReason(backend string, sawTool bool) string {
+	if mapped, ok := backendStopReasons[strings.ToUpper(strings.TrimSpace(backend))]; ok {
+		return mapped
+	}
+	if sawTool {
+		return "tool_use"
+	}
+	return "end_turn"
+}
+
+// ResponseSummary is what a response says besides its content blocks.
+type ResponseSummary struct {
+	StopReason        string // Anthropic stop_reason for the response
+	BackendStopReason string // stopReason as the backend sent it; "" when it sent none
+	ReasoningChars    int    // characters of reasoning text the backend sent
+
+	Reasoning   ReasoningBlock // the response's last reasoning block
+	ToolUseIDs  []string       // tool use ids in the order the response opened them
+	Text        string         // the assistant text, concatenated
+	ServedModel string         // the last modelId a frame carried; "" when none did
 }
 
 type SSEEvent struct {
@@ -126,8 +181,21 @@ func ParseMeteringEvents(resp []byte) []MeteringEvent {
 	return events
 }
 
+// ParseEvents translates a whole CodeWhisperer response into Anthropic SSE
+// events. See ParseEventsWithSummary.
 func ParseEvents(resp []byte) []SSEEvent {
+	events, _ := ParseEventsWithSummary(resp)
+	return events
+}
+
+// ParseEventsWithSummary translates a whole CodeWhisperer response into
+// Anthropic SSE events and also reports the stop reason and how much reasoning
+// the backend produced, and the last reasoning block, tool use ids, text and
+// served model (see ResponseSummary). Reasoning, signature, redacted,
+// context-usage and metering frames produce no events.
+func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	events := []SSEEvent{}
+	var summary ResponseSummary
 
 	// Debug info collection
 	var debugInfo *ParseDebugInfo
@@ -140,11 +208,9 @@ func ParseEvents(resp []byte) []SSEEvent {
 	}
 	frameIndex := 0
 
-	// Track tool indices by tool ID for multi-tool responses
-	toolIndices := make(map[string]int)
-	nextToolIndex := 0 // Will be adjusted to 1 if text content is present
+	indices := newBlockIndexer()
 	hasToolUse := false
-	hasTextContent := false
+	var collector responseCollector
 
 	r := bytes.NewReader(resp)
 	for {
@@ -210,23 +276,18 @@ func ParseEvents(resp []byte) []SSEEvent {
 				}
 			}
 
-			// Track if we have text content - this affects tool indexing
-			if evt.Content != "" {
-				hasTextContent = true
-				// If we haven't assigned any tool indices yet, bump to 1
-				// so tools don't conflict with text at index 0
-				if len(toolIndices) == 0 && nextToolIndex == 0 {
-					nextToolIndex = 1
-				}
-			}
-
-			sseEvent := convertAssistantEventToSSEWithIndex(evt, toolIndices, &nextToolIndex)
+			sseEvent := convertAssistantEventToSSEWithIndex(evt, indices)
 			if sseEvent.Event != "" {
 				events = append(events, sseEvent)
 			}
 
 			if evt.ToolUseId != "" && evt.Name != "" {
 				hasToolUse = true
+			}
+			summary.ReasoningChars += evt.reasoningChars()
+			collector.observe(evt)
+			if evt.StopReason != "" {
+				summary.BackendStopReason = evt.StopReason
 			}
 		} else {
 			// Debug: capture parse error
@@ -241,23 +302,21 @@ func ParseEvents(resp []byte) []SSEEvent {
 		}
 	}
 
-	// Add a single message_delta at the end for ALL responses
-	// - Tool responses get stop_reason: "tool_use"
-	// - Text-only responses get stop_reason: "end_turn"
-	// Note: hasTextContent is used above to adjust tool indices, ensuring tools start at index 1
-	// when there's text content at index 0
+	// Add a single message_delta at the end for every response with content.
+	// It carries the backend's stop reason; without one, tool responses get
+	// "tool_use" and text-only responses "end_turn".
+	summary.StopReason = AnthropicStopReason(summary.BackendStopReason, hasToolUse)
+	summary.Reasoning = collector.reasoning
+	summary.ToolUseIDs = collector.toolUseIDs
+	summary.Text = collector.text.String()
+	summary.ServedModel = collector.servedModel
 	if len(events) > 0 {
-		_ = hasTextContent // Used for index adjustment above
-		stopReason := "end_turn"
-		if hasToolUse {
-			stopReason = "tool_use"
-		}
 		events = append(events, SSEEvent{
 			Event: "message_delta",
 			Data: map[string]any{
 				"type": "message_delta",
 				"delta": map[string]any{
-					"stop_reason":   stopReason,
+					"stop_reason":   summary.StopReason,
 					"stop_sequence": nil,
 				},
 				"usage": map[string]any{"output_tokens": 0},
@@ -273,16 +332,49 @@ func ParseEvents(resp []byte) []SSEEvent {
 		writeDebugFile(debugInfo)
 	}
 
-	return events
+	return events, summary
 }
 
-func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices map[string]int, nextToolIndex *int) SSEEvent {
+// blockIndexer gives content blocks their index in arrival order, as
+// StreamTranslator does: a run of text gets the next index when it starts,
+// and each tool call gets the next index when it is first seen and ends the
+// text run, so text after a tool starts a new block.
+type blockIndexer struct {
+	next  int
+	text  int // index of the current text run, -1 when none
+	tools map[string]int
+}
+
+func newBlockIndexer() *blockIndexer {
+	return &blockIndexer{text: -1, tools: map[string]int{}}
+}
+
+func (b *blockIndexer) textIndex() int {
+	if b.text < 0 {
+		b.text = b.next
+		b.next++
+	}
+	return b.text
+}
+
+func (b *blockIndexer) toolIndex(id string) int {
+	if index, known := b.tools[id]; known {
+		return index
+	}
+	b.text = -1
+	index := b.next
+	b.next++
+	b.tools[id] = index
+	return index
+}
+
+func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, indices *blockIndexer) SSEEvent {
 	if evt.Content != "" {
 		return SSEEvent{
 			Event: "content_block_delta",
 			Data: map[string]any{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": indices.textIndex(),
 				"delta": map[string]any{
 					"type": "text_delta",
 					"text": evt.Content,
@@ -290,13 +382,7 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 			},
 		}
 	} else if evt.ToolUseId != "" && evt.Name != "" && !evt.Stop {
-		// Get or assign index for this tool
-		toolIndex, exists := toolIndices[evt.ToolUseId]
-		if !exists {
-			toolIndex = *nextToolIndex
-			toolIndices[evt.ToolUseId] = toolIndex
-			*nextToolIndex++
-		}
+		toolIndex := indices.toolIndex(evt.ToolUseId)
 
 		if evt.Input == nil {
 			// First event for this tool - content_block_start
@@ -329,7 +415,7 @@ func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices
 		}
 	} else if evt.Stop && evt.ToolUseId != "" {
 		// Tool stop event
-		toolIndex, exists := toolIndices[evt.ToolUseId]
+		toolIndex, exists := indices.tools[evt.ToolUseId]
 		if !exists {
 			toolIndex = 0 // Fallback, shouldn't happen
 		}

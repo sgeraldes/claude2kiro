@@ -4,11 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 )
 
 // Store manages attachment storage with SHA256-based deduplication
@@ -245,12 +248,43 @@ func (s *Store) saveManifestLocked() error {
 	}
 
 	// Atomic rename
-	if err := os.Rename(tmpPath, manifestPath); err != nil {
+	if err := replaceManifest(tmpPath, manifestPath); err != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		return fmt.Errorf("failed to rename manifest: %w", err)
 	}
 
 	return nil
+}
+
+// renameManifest moves the new manifest over the old one. tokenfile.Replace
+// replaces the target even while another process reads it with delete
+// sharing; tests swap it.
+var renameManifest = tokenfile.Replace
+
+// On Windows another process (an indexer, a virus scanner) can hold the
+// manifest briefly so that the rename fails with "Access is denied" or a
+// sharing violation. Such a rename is tried renameAttempts times, with
+// renameRetryPause between attempts.
+const renameAttempts = 5
+
+var renameRetryPause = 20 * time.Millisecond
+
+// replaceManifest renames tmp over path, retrying a rename that another
+// process briefly blocked. Any other error is returned at once.
+func replaceManifest(tmp, path string) error {
+	var err error
+	for attempt := 1; attempt <= renameAttempts; attempt++ {
+		if err = renameManifest(tmp, path); err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrPermission) && !isSharingError(err) {
+			return err
+		}
+		if attempt < renameAttempts {
+			time.Sleep(renameRetryPause)
+		}
+	}
+	return err
 }
 
 // getExtension maps media type to file extension

@@ -43,6 +43,7 @@ import (
 	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
+	"github.com/sgeraldes/claude2kiro/internal/kiroide"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 
 	"github.com/sgeraldes/claude2kiro/internal/profile"
@@ -206,7 +207,14 @@ type HistoryAssistantMessage struct {
 	AssistantResponseMessage struct {
 		Content  string `json:"content"`
 		ToolUses []any  `json:"toolUses"`
+		// ReasoningContent is the model's own reasoning for this turn, kept
+		// by the proxy and given back (see reasoning_history.go).
+		ReasoningContent *ReasoningContent `json:"reasoningContent,omitempty"`
 	} `json:"assistantResponseMessage"`
+
+	// turnKeys are the reasoning store keys of this turn: its tool use ids or,
+	// without one, its text (reasoningScope.keys). Not sent.
+	turnKeys []string
 }
 
 // AnthropicRequest represents the Anthropic API request structure
@@ -305,7 +313,11 @@ func sanitizeHistoryContent(content string) string {
 	return content
 }
 
-// getMessageContent extracts text content from a message
+// getMessageContent extracts the text blocks of a message. tool_result blocks
+// are skipped: their text travels once, in userInputMessageContext.toolResults
+// (getMessageToolResults). Repeating it here doubled the ingested tokens of
+// every tool-heavy turn. A message holding only tool results yields "", which
+// Kiro accepts when toolResults is present.
 func getMessageContent(content any) string {
 	switch v := content.(type) {
 	case string:
@@ -316,29 +328,11 @@ func getMessageContent(content any) string {
 	case []any:
 		var texts []string
 		hasToolUse := false
-		hasToolResult := false
 		for _, block := range v {
 			if m, ok := block.(map[string]any); ok {
 				// Get the block type
 				blockType, _ := m["type"].(string)
 				switch blockType {
-				case "tool_result":
-					hasToolResult = true
-					// Tool result content can be a string or an array of content blocks
-					if contentStr, ok := m["content"].(string); ok {
-						texts = append(texts, contentStr)
-					} else if contentArr, ok := m["content"].([]any); ok {
-						// Content is an array of blocks - extract text from each
-						for _, innerBlock := range contentArr {
-							if innerMap, ok := innerBlock.(map[string]any); ok {
-								if innerType, _ := innerMap["type"].(string); innerType == "text" {
-									if textVal, ok := innerMap["text"].(string); ok {
-										texts = append(texts, textVal)
-									}
-								}
-							}
-						}
-					}
 				case "text":
 					if textVal, ok := m["text"].(string); ok {
 						texts = append(texts, textVal)
@@ -350,7 +344,6 @@ func getMessageContent(content any) string {
 				}
 			}
 		}
-		_ = hasToolResult // Used for debugging if needed
 		if len(texts) == 0 {
 			if hasToolUse {
 				// Tool-only message - return empty content
@@ -584,12 +577,23 @@ type CodeWhispererRequest struct {
 	} `json:"conversationState"`
 	ProfileArn                   string                        `json:"profileArn,omitempty"`
 	AdditionalModelRequestFields *AdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
+
+	// reasoning is what attachReasoning put in the history. Not sent.
+	reasoning reasoningAttachment
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
-// Kiro CLI wire format. Today that is only output_config.effort.
+// Kiro CLI wire format: thinking, output_config.effort and max_tokens. Each
+// model's catalog entry publishes a schema of the keys it accepts and rejects
+// any other key, so a field is only set when that schema declares it.
 type AdditionalModelRequestFields struct {
-	OutputConfig *OutputConfig `json:"output_config,omitempty"`
+	Thinking     *ThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig *OutputConfig   `json:"output_config,omitempty"`
+	MaxTokens    int             `json:"max_tokens,omitempty"`
+}
+
+type ThinkingConfig struct {
+	Type string `json:"type"`
 }
 
 type OutputConfig struct {
@@ -657,6 +661,15 @@ func (l *kiroLimiter) acquireCtx(ctx context.Context) bool {
 		l.mu.Unlock()
 	})
 	defer stop()
+	// The waiters re-read the limit only when woken, so a live change of
+	// max_concurrent_requests (settings screen, dashboard: both go through
+	// config.Set) wakes them too; a raised limit admits them at once.
+	removeListener := config.OnChange(func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer removeListener()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -948,7 +961,7 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 		return nil, err
 	}
 	cfg := config.Get()
-	ua := fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS)
+	ua := kiroide.UserAgent()
 	return models.Fetch(
 		cfg.Advanced.CodeWhispererEndpoint,
 		token.AccessToken,
@@ -1393,12 +1406,110 @@ func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string
 	return allowed[len(allowed)-1]
 }
 
+// capEffortWithoutThinking is the effort sent next to disabled thinking. The
+// official Kiro CLI keeps sending the effort then, but lowers xhigh and max to
+// the highest other level the model lists; lower levels pass unchanged. It
+// returns "" when the model lists no other level.
+func capEffortWithoutThinking(effort string, levels []string) string {
+	if effort != "xhigh" && effort != "max" {
+		return effort
+	}
+	capped := ""
+	for _, level := range levels {
+		rank, known := nativeEffortRank[level]
+		if !known || level == "xhigh" || level == "max" {
+			continue
+		}
+		if capped == "" || rank > nativeEffortRank[capped] {
+			capped = level
+		}
+	}
+	return capped
+}
+
 func isThinkingEnabled(anthropicReq AnthropicRequest) bool {
-	if anthropicReq.Thinking != nil && strings.EqualFold(anthropicReq.Thinking.Type, "enabled") {
+	// "adaptive" asks for thinking as much as "enabled" does.
+	if t := anthropicReq.Thinking; t != nil && (strings.EqualFold(t.Type, "enabled") || strings.EqualFold(t.Type, "adaptive")) {
 		return true
 	}
 	model := strings.ToLower(anthropicReq.Model)
 	return strings.Contains(model, "[1m]") || strings.Contains(model, "context-1m")
+}
+
+// buildAdditionalModelRequestFields assembles the model-specific options for
+// kiroModel. It returns nil when there is nothing to send, so the key is left
+// out of the request entirely. Thinking and max_tokens are only sent for a
+// model the catalog holds, and only in the form its schema declares; a model
+// the catalog does not know gets neither.
+func buildAdditionalModelRequestFields(kiroModel string, anthropicReq AnthropicRequest, advanced config.AdvancedConfig) *AdditionalModelRequestFields {
+	var fields AdditionalModelRequestFields
+	if entry, known := modelCatalog.Lookup(kiroModel); known {
+		fields.Thinking = resolveThinking(entry.ThinkingTypes(), anthropicReq, advanced.EffectiveThinkingMode())
+		fields.MaxTokens = resolveMaxTokens(entry, anthropicReq.MaxTokens)
+	}
+	effort := resolveNativeEffort(kiroModel, anthropicReq)
+	if effort != "" && fields.Thinking != nil && fields.Thinking.Type == "disabled" {
+		effort = capEffortWithoutThinking(effort, effortLevelsFor(kiroModel))
+	}
+	if effort != "" {
+		fields.OutputConfig = &OutputConfig{Effort: effort}
+	}
+	if fields.Thinking == nil && fields.OutputConfig == nil && fields.MaxTokens == 0 {
+		return nil
+	}
+	return &fields
+}
+
+// resolveThinking translates the client's thinking request into the thinking
+// field to send to a model whose schema lists accepted as its thinking.type
+// values. The backend's default for a request without the field is adaptive thinking
+// on, which a client that sent no thinking field (claude2kiro run sets
+// CLAUDE_CODE_DISABLE_THINKING) did not ask for. So with mode client, no
+// thinking or "disabled" becomes {"type":"disabled"} when the schema allows
+// it, and "enabled" or "adaptive" becomes {"type":"adaptive"} when the schema
+// allows that. A value the schema does not list, an unrecognised client type
+// and mode backend all send no field.
+func resolveThinking(accepted []string, anthropicReq AnthropicRequest, mode string) *ThinkingConfig {
+	if mode == config.ThinkingModeBackend || len(accepted) == 0 {
+		return nil
+	}
+	requested := ""
+	if anthropicReq.Thinking != nil {
+		requested = strings.ToLower(strings.TrimSpace(anthropicReq.Thinking.Type))
+	}
+	var want string
+	switch requested {
+	case "", "disabled":
+		want = "disabled"
+	case "enabled", "adaptive":
+		want = "adaptive"
+	default:
+		return nil
+	}
+	if !slices.Contains(accepted, want) {
+		return nil
+	}
+	return &ThinkingConfig{Type: want}
+}
+
+// resolveMaxTokens returns the client's max_tokens clamped to the range the
+// model's schema declares, or 0 (not sent) when the client sent none or the
+// schema does not declare max_tokens.
+func resolveMaxTokens(entry models.KiroModel, requested int) int {
+	if requested <= 0 {
+		return 0
+	}
+	minimum, maximum, accepted := entry.MaxTokensRange()
+	if !accepted {
+		return 0
+	}
+	if minimum > 0 && requested < minimum {
+		return minimum
+	}
+	if maximum > 0 && requested > maximum {
+		return maximum
+	}
+	return requested
 }
 
 var (
@@ -1606,7 +1717,10 @@ func compactToolDescription(desc string, maxChars int) string {
 	return desc[:cut]
 }
 
-// extractImagesFromContent extracts images from Anthropic message content
+// extractImagesFromContent extracts the images of an Anthropic message: its
+// top-level image blocks, then the image blocks inside the content arrays of
+// its tool_result blocks, each in order. The backend takes images only on the
+// current message (history user messages have no images field).
 func extractImagesFromContent(content any) []ImageBlock {
 	var images []ImageBlock
 
@@ -1616,54 +1730,74 @@ func extractImagesFromContent(content any) []ImageBlock {
 	}
 
 	for _, block := range contentBlocks {
+		if img, ok := imageBlockFrom(block); ok {
+			images = append(images, img)
+		}
+	}
+	for _, block := range contentBlocks {
 		blockMap, ok := block.(map[string]any)
-		if !ok {
+		if !ok || blockMap["type"] != "tool_result" {
 			continue
 		}
-
-		blockType, _ := blockMap["type"].(string)
-		if blockType != "image" {
-			continue
+		items, _ := blockMap["content"].([]any)
+		for _, item := range items {
+			if img, ok := imageBlockFrom(item); ok {
+				images = append(images, img)
+			}
 		}
-
-		source, ok := blockMap["source"].(map[string]any)
-		if !ok {
-			continue
-		}
-
-		sourceType, _ := source["type"].(string)
-		if sourceType != "base64" {
-			continue
-		}
-
-		mediaType, _ := source["media_type"].(string)
-		data, _ := source["data"].(string)
-
-		if data == "" {
-			continue
-		}
-
-		// Convert media type to format (e.g., "image/png" -> "png")
-		format := "png" // default
-		switch mediaType {
-		case "image/png":
-			format = "png"
-		case "image/jpeg", "image/jpg":
-			format = "jpeg"
-		case "image/gif":
-			format = "gif"
-		case "image/webp":
-			format = "webp"
-		}
-
-		imgBlock := ImageBlock{
-			Format: format,
-		}
-		imgBlock.Source.Bytes = data
-		images = append(images, imgBlock)
 	}
 
 	return images
+}
+
+// imageBlockFrom converts one Anthropic base64 image block. Any other block,
+// and an image without data, yields false.
+func imageBlockFrom(block any) (ImageBlock, bool) {
+	blockMap, ok := block.(map[string]any)
+	if !ok {
+		return ImageBlock{}, false
+	}
+
+	blockType, _ := blockMap["type"].(string)
+	if blockType != "image" {
+		return ImageBlock{}, false
+	}
+
+	source, ok := blockMap["source"].(map[string]any)
+	if !ok {
+		return ImageBlock{}, false
+	}
+
+	sourceType, _ := source["type"].(string)
+	if sourceType != "base64" {
+		return ImageBlock{}, false
+	}
+
+	mediaType, _ := source["media_type"].(string)
+	data, _ := source["data"].(string)
+
+	if data == "" {
+		return ImageBlock{}, false
+	}
+
+	// Convert media type to format (e.g., "image/png" -> "png")
+	format := "png" // default
+	switch mediaType {
+	case "image/png":
+		format = "png"
+	case "image/jpeg", "image/jpg":
+		format = "jpeg"
+	case "image/gif":
+		format = "gif"
+	case "image/webp":
+		format = "webp"
+	}
+
+	imgBlock := ImageBlock{
+		Format: format,
+	}
+	imgBlock.Source.Bytes = data
+	return imgBlock, true
 }
 
 // resolveSchemaRefs resolves $ref references by inlining definitions from $defs.
@@ -1875,8 +2009,17 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		convID = convID[:8]
 	}
 
+	// contentChars counts the content field only; tool result text is sent once,
+	// in toolResults, and is counted separately.
+	toolResultChars := 0
+	for _, result := range context.ToolResults {
+		for _, c := range result.Content {
+			toolResultChars += len(c.Text)
+		}
+	}
+
 	return fmt.Sprintf(
-		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v",
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d",
 		convID,
 		current.ModelId,
 		reqBytes,
@@ -1885,9 +2028,12 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		len(context.Tools),
 		len(context.ToolResults),
 		len(current.Content),
+		toolResultChars,
 		historyMode,
 		toolMode,
 		advanced.AggressiveCachePoints,
+		cwReq.reasoning.turns,
+		cwReq.reasoning.bytes,
 	)
 }
 
@@ -1963,7 +2109,7 @@ func fetchProfilesFromAPI(accessToken string) []kiroProfile {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
 	resp, err := client.Do(req)
@@ -2034,28 +2180,31 @@ func discoverProfileArn(accessToken string) string {
 	return selectProfileArn(profiles)
 }
 
-// buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
-func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
-	cwReq := CodeWhispererRequest{}
-
-	// Set ProfileArn.
-	//
-	// The Kiro backend associates each request with a CodeWhisperer profile. For
-	// IdC/Enterprise users the correct profile is account-specific and is
-	// discovered + persisted on the token (see discoverProfileArn). Sending the
-	// WRONG profile is worse than sending none — it 403s or silently loses model
-	// access — so we never blindly fall back to the shared consumer profile for
-	// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+// requestProfileArn is the profileArn a request made with token carries.
+//
+// The Kiro backend associates each request with a CodeWhisperer profile. For
+// IdC/Enterprise users the correct profile is account-specific and is
+// discovered + persisted on the token (see discoverProfileArn). Sending the
+// WRONG profile is worse than sending none — it 403s or silently loses model
+// access — so we never blindly fall back to the shared consumer profile for
+// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+func requestProfileArn(token TokenData) string {
 	switch {
 	case token.ProfileArn != "":
-		cwReq.ProfileArn = token.ProfileArn
+		return token.ProfileArn
 	case token.AuthMethod != "IdC":
-		cwReq.ProfileArn = consumerProfileArn
+		return consumerProfileArn
 	default:
 		// IdC with no discovered profile: omit (works for tokens the backend
 		// doesn't yet require a profile for).
-		cwReq.ProfileArn = ""
+		return ""
 	}
+}
+
+// buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
+func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
+	cwReq := CodeWhispererRequest{}
+	cwReq.ProfileArn = requestProfileArn(token)
 	cfg := config.Get()
 	kiroModel := getKiroModelID(anthropicReq.Model)
 	historyMode := cfg.Advanced.HistoryMode
@@ -2075,16 +2224,13 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	// conversationId and reuses it across turns while still sending prior turns in
 	// history. Users can disable this for the older proxy behavior of one fresh
 	// random UUID per request.
-	if _, sessionKey := extractSessionID(anthropicReq.Metadata); cfg.Advanced.StableConversationID && sessionKey != "" {
+	_, sessionKey := extractSessionID(anthropicReq.Metadata)
+	if cfg.Advanced.StableConversationID && sessionKey != "" {
 		cwReq.ConversationState.ConversationId = stableConversationID(sessionKey)
 	} else {
 		cwReq.ConversationState.ConversationId = generateUUID()
 	}
-	if effort := resolveNativeEffort(kiroModel, anthropicReq); effort != "" {
-		cwReq.AdditionalModelRequestFields = &AdditionalModelRequestFields{
-			OutputConfig: &OutputConfig{Effort: effort},
-		}
-	}
+	cwReq.AdditionalModelRequestFields = buildAdditionalModelRequestFields(kiroModel, anthropicReq, cfg.Advanced)
 	if envState := parseEnvState(anthropicReq.System); envState != nil {
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.EnvState = envState
 	}
@@ -2224,6 +2370,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		}
 
 		// All messages except the last one (the last is the current message).
+		// assistantTurn is the position of the next assistant message among
+		// the request's assistant messages: part of its reasoning store key.
+		assistantTurn := 0
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			msg := anthropicReq.Messages[i]
 
@@ -2241,6 +2390,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				} else {
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
+				scope := reasoningScope{session: sessionKey, turn: assistantTurn}
+				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), assistantTurnText(msg.Content))
+				assistantTurn++
 				emit("assistant", assistantMsg)
 				continue
 			}
@@ -2265,6 +2417,13 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		cfgCopy.HistoryMode = historyMode
 		systemPrefix := 2 * len(anthropicReq.System) // user+assistant pair per system message
 		cwReq.ConversationState.History = applyHistoryModeWithToolResultProtection(history, cfgCopy, currentToolResults, systemPrefix)
+
+		// Give the backend its own reasoning back on the turns that remain.
+		// In none_text mode the history holds tool calls as text, not what the
+		// reasoning was signed with, so nothing is attached there.
+		if toolMode != "none_text" {
+			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes)
+		}
 	}
 
 	return cwReq
@@ -3578,7 +3737,7 @@ func testProxy() {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	// Bound connection phases only: the streamed generation body may take a
 	// while, but headers arrive quickly — a server that never responds must
@@ -4496,6 +4655,35 @@ func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Dur
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
 // capturedEvents: optional pointer to slice for capturing SSE events (for comparison mode)
+// outputLimitNote is the answer the client gets when the backend stopped at
+// its output limit (stopReason MAX_TOKENS) before producing any content.
+const outputLimitNote = "[Kiro stopped at the output limit before producing an answer]"
+
+// backendStopReasonLabel is how the backend's stopReason appears in log
+// lines: as sent, or "none" when it sent none.
+func backendStopReasonLabel(reason string) string {
+	if reason == "" {
+		return "none"
+	}
+	return reason
+}
+
+// outputLimitLogLine is the error line logged when the backend stopped at
+// its output limit without producing content.
+func outputLimitLogLine(backendStopReason string, reasoningChars, responseBytes int) string {
+	return fmt.Sprintf("Kiro stopped at the output limit before producing an answer: stopReason=%s reasoningChars=%d (%d bytes response)",
+		backendStopReasonLabel(backendStopReason), reasoningChars, responseBytes)
+}
+
+// servedModelField is the " servedModel=<id>" part of a Parser log line, or
+// nothing when the response named no model.
+func servedModelField(model string) string {
+	if model == "" {
+		return ""
+	}
+	return " servedModel=" + model
+}
+
 func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	return handleStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID, capturedEvents)
 }
@@ -4511,15 +4699,18 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	rawFlusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return ""
 	}
 
 	// From here on every write goes through the keepalive writer, which also
-	// pings the client while the backend is silent.
-	keepalive := newKeepaliveWriter(w, rawFlusher, config.Get().Network.StreamKeepaliveInterval)
+	// pings the client while the backend is silent. A write that fails (its
+	// deadline passed: the client stopped reading) cancels ctx, so the handler
+	// ends through its client-gone path like after a disconnect.
+	ctx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	keepalive := newKeepaliveWriter(w, config.Get().Network.StreamKeepaliveInterval, cancelStream)
 	defer keepalive.stop()
 	w = keepalive
 	var flusher http.Flusher = keepalive
@@ -4579,7 +4770,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	proxyReq.Header.Set("Content-Type", "application/json")
 	proxyReq.Header.Set("Accept", "text/event-stream")
-	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	proxyReq.Header.Set("User-Agent", kiroide.UserAgent())
 
 	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
 	queuedAt := time.Now()
@@ -4612,7 +4803,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	// profileArn in the body, everything else (conversationId, history) kept.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		cwReq.ProfileArn = requestProfileArn(tok)
 		body, merr := jsonStr.Marshal(cwReq)
 		if merr != nil {
 			return merr
@@ -4629,7 +4820,8 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	skipBackoff := false
 	refreshedFor := map[string]bool{} // the credentials a refresh of this request produced, by refresh token
 	var lastRecoverErr error
-	sent := 0 // requests this handler sent to the backend, switches and refreshes included
+	sent := 0                  // requests this handler sent to the backend, switches and refreshes included
+	reasoningStripped := false // the request was resent once without its reasoning
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || skipBackoff {
 			// Recreate request for retry (body was consumed)
@@ -4646,7 +4838,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 			proxyReq.Header.Set("Content-Type", "application/json")
 			proxyReq.Header.Set("Accept", "text/event-stream")
-			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+			proxyReq.Header.Set("User-Agent", kiroide.UserAgent())
 			if !skipBackoff {
 				// Exponential backoff with jitter, cut short when the client leaves.
 				backoff := time.NewTimer(retryBackoff(attempt))
@@ -4702,6 +4894,27 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 				sendErrorEvent(w, flusher, "Failed to serialize request", err)
 				return ""
 			}
+			attempt--
+			skipBackoff = true
+			continue
+		}
+
+		// The backend rejected a reasoning signature the history carried. Resend
+		// once without any reasoning and forget the rejected turns; the model
+		// then plans again. This is not a transient retry and never repeats.
+		signatureInvalid := resp.StatusCode == 400 && isThinkingSignatureInvalid(body)
+		if signatureInvalid && !reasoningStripped && cwReq.reasoning.turns > 0 {
+			reasoningStripped = true
+			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
+			reasoningStore.Evict(cwReq.stripReasoning()...)
+			stripped, merr := jsonStr.Marshal(cwReq)
+			if merr != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", merr)
+				return ""
+			}
+			cwReqBody = stripped
+			lg.LogInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
+				cwReq.ConversationState.ConversationId[:8], turns, size))
 			attempt--
 			skipBackoff = true
 			continue
@@ -4770,7 +4983,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			}
 		}
 
-		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel)) {
+		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel && !signatureInvalid)) {
 			if overloaded {
 				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
@@ -4807,6 +5020,11 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			// classify the error as non-retryable so the client does not resend it.
 			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
 				"Kiro rejected the request body as invalid: %s", strings.TrimSpace(string(body))))
+		} else if signatureInvalid {
+			// Rejected even without reasoning (or again after the fallback):
+			// resending the same request cannot help.
+			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
+				"Kiro rejected a reasoning signature: %s", strings.TrimSpace(string(body))))
 		} else if invalidModel {
 			// Kiro does not serve this model id at all (backstop for when the
 			// pre-flight check couldn't run because the catalog was cold).
@@ -4892,7 +5110,15 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			eventCount++
 			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
 			if delayMs > 0 {
-				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+				// The pause ends when the client leaves; nothing more is sent
+				// and the read loop ends through the client-gone path.
+				pause := time.NewTimer(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+				select {
+				case <-pause.C:
+				case <-ctx.Done():
+					pause.Stop()
+					return
+				}
 			}
 		}
 	}
@@ -4942,6 +5168,8 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	if translator.Emitted() {
 		forward(translator.Finish())
+		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, responseScope(anthropicReq),
+			translator.Reasoning(), translator.ToolUseIDs(), translator.Text())
 
 		if cfg.Advanced.ComparisonMode {
 			textPreview := responseText.String()
@@ -4951,9 +5179,11 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events, preview=%q (%d bytes), tools=%d",
 				eventCount, textPreview, rawResp.Len(), toolBlockCount))
 		} else {
-			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s",
+			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s stopReason=%s reasoningChars=%d%s",
 				eventCount, hasTextContent, toolBlockCount > 0, toolBlockCount,
-				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond)))
+				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond),
+				backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars(),
+				servedModelField(translator.ServedModel())))
 		}
 
 		sendSSEEvent(w, flusher, "message_delta", map[string]any{
@@ -4962,9 +5192,33 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			"usage": map[string]any{"output_tokens": outputChars / 4},
 		}, capturedEvents)
 		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+	} else if translator.StopReason() == "max_tokens" {
+		// The model spent its whole output budget (on reasoning) before it
+		// wrote anything. Say so in a normal message instead of an error.
+		lg.LogError(outputLimitLogLine(translator.BackendStopReason(), translator.ReasoningChars(), rawResp.Len()))
+		startMessage(len(cwReqBody) / 4)
+		sendSSEEvent(w, flusher, "content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": outputLimitNote},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "max_tokens", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 0},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+		responseText.WriteString(outputLimitNote)
 	} else {
 		// No events parsed - send an empty response to prevent Claude Code from hanging
-		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", rawResp.Len()))
+		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response (stopReason=%s reasoningChars=%d)",
+			rawResp.Len(), backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars()))
 		lg.LogError("Sending empty response due to no parsed events")
 		startMessage(0)
 		contentBlockStart := map[string]any{
@@ -5242,7 +5496,6 @@ func interactiveIdCLogin() *LoginConfig {
 
 const (
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroVersion      = "1.4.154" // Kiro IDE version to impersonate
 )
 
 // generatePKCE generates PKCE code verifier and challenge
@@ -5994,7 +6247,7 @@ func registerSSOClient(startUrl, region string) (*SSOClientRegistration, error) 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6219,7 +6472,7 @@ func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6280,7 +6533,7 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 
 	// Set headers to match Kiro IDE
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6451,7 +6704,7 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -7260,7 +7513,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+		req.Header.Set("User-Agent", kiroide.UserAgent())
 	}
 
 	setKiroHeaders(proxyReq, token)
@@ -7278,7 +7531,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// adopt rebuilds the outgoing request for another identity's token.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		cwReq.ProfileArn = requestProfileArn(tok)
 		body, merr := jsonStr.Marshal(cwReq)
 		if merr != nil {
 			return merr
@@ -7309,6 +7562,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// changing under the request cannot keep it going
 	const bearerRetriesPerIdentity = 3
 	bearerRetries := 0
+	reasoningStripped := false // the request was resent once without its reasoning
 	for {
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
@@ -7330,6 +7584,21 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
 			return http.StatusInternalServerError
+		}
+
+		// A rejected reasoning signature: resend once without any reasoning and
+		// forget the rejected turns (see the streaming handler).
+		if resp.StatusCode == 400 && isThinkingSignatureInvalid(cwRespBody) && !reasoningStripped && cwReq.reasoning.turns > 0 {
+			reasoningStripped = true
+			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
+			reasoningStore.Evict(cwReq.stripReasoning()...)
+			logInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID (non-stream) convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
+				cwReq.ConversationState.ConversationId[:8], turns, size))
+			if err := adopt(token, ident); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
+				return http.StatusInternalServerError
+			}
+			continue
 		}
 
 		if isMonthlyQuotaExceeded(resp.StatusCode, cwRespBody) {
@@ -7429,7 +7698,9 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		os.WriteFile(filepath.Join(debugDir, "last-cw-response.bin"), cwRespBody, 0600)
 	}
 
-	events := parser.ParseEvents(cwRespBody)
+	events, summary := parser.ParseEventsWithSummary(cwRespBody)
+	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, responseScope(anthropicReq),
+		summary.Reasoning, summary.ToolUseIDs, summary.Text)
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
 	}
@@ -7437,74 +7708,36 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
 	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
 
-	textContent := ""
-	toolName := ""
-	toolUseId := ""
-	partialJsonStr := ""
-
-	contexts := []map[string]any{}
-
-	// Extract content from parsed events.
-	// Parser generates: content_block_delta (text_delta/input_json_delta) and message_delta.
-	// Note: parser does NOT generate content_block_start or content_block_stop events.
-	for _, event := range events {
-		if event.Data == nil {
-			continue
+	contexts, toolCount, outputChars, blocksErr := nonStreamContentBlocks(events)
+	if blocksErr != nil {
+		if lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream answer dropped: %v [%s:%s]", blocksErr, sessionID, requestID))
 		}
-		dataMap, ok := event.Data.(map[string]any)
-		if !ok {
-			continue
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		if encErr := json.NewEncoder(w).Encode(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "api_error", "message": "The Kiro " + blocksErr.Error()},
+		}); encErr != nil && lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
 		}
-
-		switch event.Event {
-		case "content_block_delta":
-			if delta, ok := dataMap["delta"].(map[string]any); ok {
-				switch delta["type"] {
-				case "text_delta":
-					if text, ok := delta["text"].(string); ok {
-						textContent += text
-					}
-				case "input_json_delta":
-					if pj, ok := delta["partial_json"].(string); ok {
-						partialJsonStr += pj
-					}
-				}
-			}
-			// Also check direct content field (Kiro raw format)
-			if content, ok := dataMap["content"].(string); ok && content != "" {
-				textContent += content
-			}
-
-		case "content_block_start":
-			if cb, ok := dataMap["content_block"].(map[string]any); ok {
-				if cb["type"] == "tool_use" {
-					if name, ok := cb["name"].(string); ok {
-						toolName = name
-					}
-					if id, ok := cb["id"].(string); ok {
-						toolUseId = id
-					}
-				}
-			}
-		}
+		return http.StatusBadGateway
 	}
 
-	// Build content blocks
-	if strings.TrimSpace(textContent) != "" {
-		contexts = append(contexts, map[string]any{
-			"type": "text",
-			"text": textContent,
-		})
+	if lg != nil {
+		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d%s [%s:%s]",
+			len(events), len(contexts) > toolCount, toolCount > 0,
+			backendStopReasonLabel(summary.BackendStopReason), summary.ReasoningChars,
+			servedModelField(summary.ServedModel), sessionID, requestID))
 	}
-	if toolName != "" && partialJsonStr != "" {
-		toolInput := map[string]any{}
-		jsonStr.Unmarshal([]byte(partialJsonStr), &toolInput)
-		contexts = append(contexts, map[string]any{
-			"type":  "tool_use",
-			"id":    toolUseId,
-			"name":  toolName,
-			"input": toolInput,
-		})
+
+	if len(contexts) == 0 && summary.StopReason == "max_tokens" {
+		// The model spent its whole output budget (on reasoning) before it
+		// wrote anything. Say so in a normal message instead of nothing.
+		if lg != nil {
+			lg.LogError(outputLimitLogLine(summary.BackendStopReason, summary.ReasoningChars, len(cwRespBody)))
+		}
+		contexts = append(contexts, map[string]any{"type": "text", "text": outputLimitNote})
 	}
 
 	// Build Anthropic response
@@ -7512,19 +7745,141 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		"content":       contexts,
 		"model":         anthropicReq.Model,
 		"role":          "assistant",
-		"stop_reason":   "end_turn",
+		"stop_reason":   summary.StopReason,
 		"stop_sequence": nil,
 		"type":          "message",
+		// The same estimates as the streaming path: characters / 4.
 		"usage": map[string]any{
-			"input_tokens":  len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
-			"output_tokens": len(textContent),
+			"input_tokens":  len(cwReqBody) / 4,
+			"output_tokens": outputChars / 4,
 		},
 	}
 
 	// Send response
 	w.Header().Set("Content-Type", "application/json")
-	jsonStr.NewEncoder(w).Encode(anthropicResp)
+	if err := writeNonStreamJSON(w, anthropicResp); err != nil && lg != nil {
+		lg.LogError(fmt.Sprintf("Non-stream response write failed [%s:%s]: %v", sessionID, requestID, err))
+	}
 	return http.StatusOK
+}
+
+// writeNonStreamJSON writes a non-streaming answer under the per-write
+// deadline streaming uses (streamWriteTimeout), so a client that stops reading
+// without closing cannot hold the handler forever. It flushes before clearing
+// the deadline, so the whole answer is written under it and no deadline stays
+// armed for a later request on the same connection. A writer without
+// deadlines answers http.ErrNotSupported, which is ignored.
+func writeNonStreamJSON(w http.ResponseWriter, v any) error {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	if err := jsonStr.NewEncoder(w).Encode(v); err != nil {
+		return err
+	}
+	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
+}
+
+// nonStreamContentBlocks builds the content of a non-streaming answer from the
+// parsed events, in arrival order: one text block per run of text, and one
+// tool_use block per tool call with its own id, name and input. A text run of
+// only whitespace is dropped. It also returns the number of tool blocks and
+// the characters of text and tool input, for the usage estimate. A tool call
+// whose input is not valid JSON is an error (malformedToolInputError): the
+// answer would otherwise carry a tool call with an input the model never gave.
+func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, tools int, outputChars int, err error) {
+	type toolBlock struct {
+		block map[string]any
+		input strings.Builder
+	}
+	type pending struct {
+		text *strings.Builder
+		tool *toolBlock
+	}
+	var order []pending
+	toolsByIndex := map[any]*toolBlock{}
+	appendText := func(text string) {
+		outputChars += len(text)
+		if n := len(order); n > 0 && order[n-1].text != nil {
+			order[n-1].text.WriteString(text)
+			return
+		}
+		b := &strings.Builder{}
+		b.WriteString(text)
+		order = append(order, pending{text: b})
+	}
+
+	for _, event := range events {
+		dataMap, ok := event.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch event.Event {
+		case "content_block_start":
+			cb, ok := dataMap["content_block"].(map[string]any)
+			if !ok || cb["type"] != "tool_use" {
+				continue
+			}
+			tb := &toolBlock{block: map[string]any{"type": "tool_use", "id": cb["id"], "name": cb["name"]}}
+			toolsByIndex[dataMap["index"]] = tb
+			order = append(order, pending{tool: tb})
+		case "content_block_delta":
+			if delta, ok := dataMap["delta"].(map[string]any); ok {
+				switch delta["type"] {
+				case "text_delta":
+					if text, ok := delta["text"].(string); ok {
+						appendText(text)
+					}
+				case "input_json_delta":
+					if pj, ok := delta["partial_json"].(string); ok {
+						outputChars += len(pj)
+						if tb := toolsByIndex[dataMap["index"]]; tb != nil {
+							tb.input.WriteString(pj)
+						}
+					}
+				}
+			}
+			// Also check direct content field (Kiro raw format)
+			if content, ok := dataMap["content"].(string); ok && content != "" {
+				appendText(content)
+			}
+		}
+	}
+
+	blocks = []map[string]any{} // an empty answer is "content": [], never null
+	for _, p := range order {
+		if p.text != nil {
+			if text := p.text.String(); strings.TrimSpace(text) != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": text})
+			}
+			continue
+		}
+		input := map[string]any{}
+		if raw := p.tool.input.String(); raw != "" {
+			if uerr := jsonStr.Unmarshal([]byte(raw), &input); uerr != nil {
+				return nil, 0, 0, &malformedToolInputError{name: fmt.Sprint(p.tool.block["name"]), id: fmt.Sprint(p.tool.block["id"]), err: uerr}
+			}
+		}
+		p.tool.block["input"] = input
+		blocks = append(blocks, p.tool.block)
+		tools++
+	}
+	return blocks, tools, outputChars, nil
+}
+
+// malformedToolInputError is a tool call of a non-streaming answer whose
+// input the backend sent as JSON that does not parse.
+type malformedToolInputError struct {
+	name, id string
+	err      error
+}
+
+func (e *malformedToolInputError) Error() string {
+	return fmt.Sprintf("backend sent malformed tool input for tool %s (%s): %v", e.name, e.id, e.err)
 }
 
 // sendSSEEvent sends an SSE event and optionally captures it

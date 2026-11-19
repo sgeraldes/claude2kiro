@@ -17,6 +17,7 @@ import (
 
 	"github.com/sgeraldes/claude2kiro/internal/attachments"
 	"github.com/sgeraldes/claude2kiro/internal/config"
+	"github.com/sgeraldes/claude2kiro/internal/kiroide"
 	"github.com/sgeraldes/claude2kiro/internal/profile"
 	"github.com/sgeraldes/claude2kiro/internal/tokenfile"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
@@ -70,8 +71,6 @@ type SSOCreateTokenResponse struct {
 	ExpiresIn    int    `json:"expiresIn"`
 	TokenType    string `json:"tokenType"`
 }
-
-const kiroVersion = "1.4.154"
 
 // GetTokenFilePath returns the cross-platform token file path
 func GetTokenFilePath() string {
@@ -187,7 +186,7 @@ func RefreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: config.Get().Network.HTTPTimeout}
 	resp, err := client.Do(req)
@@ -1249,7 +1248,7 @@ func GetCreditsInfo() CreditsInfo {
 
 	// Add headers
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: config.Get().Network.HTTPTimeout}
 	resp, err := client.Do(req)

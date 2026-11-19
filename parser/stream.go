@@ -46,10 +46,12 @@ func ReadFramePayload(r io.Reader) ([]byte, error) {
 // events one frame at a time, so the proxy can forward a response while the
 // backend is still producing it. Blocks get their index in arrival order and a
 // text block is closed before a tool block starts. A tool block stays open
-// until its stop frame or Finish, even when text arrives in between: that text
-// gets its own block, so two blocks can be open at once. Clients follow blocks
-// by index, and ParseEvents produced the same shape. It is not safe for
-// concurrent use.
+// until its stop frame or Finish. Text that arrives while a tool block is open
+// gets its own block, so two blocks can be open at once. That order is handled
+// defensively and has not been observed: in the live responses captured so far
+// (about a dozen) text frames always came before the tool frames, never inside
+// an open tool call. Clients follow blocks by index, and ParseEvents produced
+// the same shape. It is not safe for concurrent use.
 type StreamTranslator struct {
 	nextIndex int
 	textIndex int            // index of the open text block, -1 when none is open
@@ -57,6 +59,10 @@ type StreamTranslator struct {
 	openTools map[string]bool
 	sawTool   bool
 	emitted   bool
+
+	backendStop    string // stopReason as the backend sent it
+	reasoningChars int    // characters of reasoning text, never forwarded
+	collector      responseCollector
 }
 
 func NewStreamTranslator() *StreamTranslator {
@@ -64,19 +70,26 @@ func NewStreamTranslator() *StreamTranslator {
 }
 
 // Translate returns the events one frame payload produces. Frames that carry
-// no assistant content (metering, unparseable payloads) produce none.
+// no assistant content (reasoning, signature, stop reason, context usage,
+// metering, unparseable payloads) produce none; the stop reason, the size of
+// the reasoning and the reasoning itself are recorded.
 func (t *StreamTranslator) Translate(payload []byte) []SSEEvent {
 	var evt assistantResponseEvent
 	if err := json.Unmarshal(payload, &evt); err != nil {
 		return nil
+	}
+	t.reasoningChars += evt.reasoningChars()
+	t.collector.observe(evt)
+	if evt.StopReason != "" {
+		t.backendStop = evt.StopReason
 	}
 
 	var out []SSEEvent
 	switch {
 	case evt.Content != "":
 		if t.textIndex < 0 {
-			// An open tool block stays open: its input may still arrive after
-			// this text, and closing it would lose that input.
+			// An open tool block stays open: if its input arrived after this
+			// text (not observed so far), closing it would lose that input.
 			t.textIndex = t.nextIndex
 			t.nextIndex++
 			out = append(out, SSEEvent{Event: "content_block_start", Data: map[string]any{
@@ -139,13 +152,30 @@ func (t *StreamTranslator) Finish() []SSEEvent {
 	return append(t.closeText(), t.closeTools()...)
 }
 
-// StopReason is the Anthropic stop_reason for the response translated so far.
+// StopReason is the Anthropic stop_reason for the response translated so far:
+// the backend's stopReason when it sent a known one, else tool_use when a tool
+// was used and end_turn otherwise.
 func (t *StreamTranslator) StopReason() string {
-	if t.sawTool {
-		return "tool_use"
-	}
-	return "end_turn"
+	return AnthropicStopReason(t.backendStop, t.sawTool)
 }
+
+// BackendStopReason is the stopReason the backend sent, "" when none.
+func (t *StreamTranslator) BackendStopReason() string { return t.backendStop }
+
+// ReasoningChars is the number of reasoning characters the backend sent.
+func (t *StreamTranslator) ReasoningChars() int { return t.reasoningChars }
+
+// Reasoning is the last reasoning block of the response so far.
+func (t *StreamTranslator) Reasoning() ReasoningBlock { return t.collector.reasoning }
+
+// ToolUseIDs are the ids of the tool calls the response opened, in order.
+func (t *StreamTranslator) ToolUseIDs() []string { return t.collector.toolUseIDs }
+
+// Text is the assistant text of the response so far.
+func (t *StreamTranslator) Text() string { return t.collector.text.String() }
+
+// ServedModel is the last modelId a frame carried, "" when none did.
+func (t *StreamTranslator) ServedModel() string { return t.collector.servedModel }
 
 // Emitted reports whether any frame produced an event.
 func (t *StreamTranslator) Emitted() bool { return t.emitted }

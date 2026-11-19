@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -14,23 +15,48 @@ import (
 
 const sseKeepalivePing = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
 
+// defaultStreamWriteTimeout bounds each write (and flush) of a streaming
+// response. The servers have no global write timeout, which would cut long
+// streams; without a per-write bound a client that stops reading without
+// closing would block a write, and with it the handler, forever.
+const defaultStreamWriteTimeout = 60 * time.Second
+
+// streamWriteTimeout is defaultStreamWriteTimeout; tests shorten it.
+var streamWriteTimeout = defaultStreamWriteTimeout
+
+// errStreamClientGone is returned by writes after one write failed.
+var errStreamClientGone = errors.New("stream client gone: an earlier write failed")
+
 // keepaliveWriter is the ResponseWriter of a streaming response. It serializes
 // every write and, from its own goroutine, writes a ping whenever nothing has
-// been written for the interval. Callers must write whole SSE frames in one
-// Write, and must call stop before the handler returns.
+// been written for the interval. Every write and flush runs under a write
+// deadline of streamWriteTimeout. The first write or flush that fails (the
+// deadline passed, or the connection broke) marks the client gone: onGone is
+// called once and nothing more is written. Callers must write whole SSE frames
+// in one Write, and must call stop before the handler returns.
 type keepaliveWriter struct {
-	mu        sync.Mutex
-	w         http.ResponseWriter
-	flusher   http.Flusher
-	lastWrite time.Time
+	mu           sync.Mutex
+	w            http.ResponseWriter
+	rc           *http.ResponseController
+	writeTimeout time.Duration
+	onGone       func()
+	gone         bool
+	lastWrite    time.Time
 
 	done     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
 
-func newKeepaliveWriter(w http.ResponseWriter, flusher http.Flusher, interval time.Duration) *keepaliveWriter {
-	k := &keepaliveWriter{w: w, flusher: flusher, lastWrite: time.Now(), done: make(chan struct{})}
+func newKeepaliveWriter(w http.ResponseWriter, interval time.Duration, onGone func()) *keepaliveWriter {
+	k := &keepaliveWriter{
+		w:            w,
+		rc:           http.NewResponseController(w),
+		writeTimeout: streamWriteTimeout,
+		onGone:       onGone,
+		lastWrite:    time.Now(),
+		done:         make(chan struct{}),
+	}
 	if interval > 0 {
 		k.wg.Add(1)
 		go k.pingLoop(interval)
@@ -49,14 +75,67 @@ func (k *keepaliveWriter) WriteHeader(status int) {
 func (k *keepaliveWriter) Write(p []byte) (int, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if k.gone {
+		return 0, errStreamClientGone
+	}
 	k.lastWrite = time.Now()
-	return k.w.Write(p)
+	return k.writeLocked(p)
 }
 
 func (k *keepaliveWriter) Flush() {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.flusher.Flush()
+	k.flushLocked()
+}
+
+// writeLocked writes p under the write deadline. Callers hold mu.
+func (k *keepaliveWriter) writeLocked(p []byte) (int, error) {
+	if !k.setDeadline(time.Now().Add(k.writeTimeout)) {
+		return 0, errStreamClientGone
+	}
+	n, err := k.w.Write(p)
+	if err != nil {
+		k.markGone()
+		return n, err
+	}
+	k.setDeadline(time.Time{})
+	return n, nil
+}
+
+// flushLocked flushes under the write deadline. Callers hold mu.
+func (k *keepaliveWriter) flushLocked() {
+	if k.gone || !k.setDeadline(time.Now().Add(k.writeTimeout)) {
+		return
+	}
+	if err := k.rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		k.markGone()
+		return
+	}
+	k.setDeadline(time.Time{})
+}
+
+// setDeadline sets (or, with the zero time, clears) the write deadline and
+// reports whether writing may go on. A writer without deadlines (a test
+// recorder) answers http.ErrNotSupported, which is ignored; any other error
+// means the connection is unusable, so the client is gone. Callers hold mu.
+func (k *keepaliveWriter) setDeadline(t time.Time) bool {
+	if err := k.rc.SetWriteDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		k.markGone()
+		return false
+	}
+	return true
+}
+
+// markGone records that the client is unreachable and tells the handler once.
+// Callers hold mu.
+func (k *keepaliveWriter) markGone() {
+	if k.gone {
+		return
+	}
+	k.gone = true
+	if k.onGone != nil {
+		k.onGone()
+	}
 }
 
 // stop ends the ping goroutine and waits for it, so nothing is written to the
@@ -84,13 +163,13 @@ func (k *keepaliveWriter) pingLoop(interval time.Duration) {
 func (k *keepaliveWriter) pingIfSilent(interval time.Duration) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if time.Since(k.lastWrite) < interval {
+	if k.gone || time.Since(k.lastWrite) < interval {
 		return
 	}
 	k.lastWrite = time.Now()
-	// A failed write means the client is gone; the handler learns that from
-	// the request context, so there is nothing to do with the error here.
-	if _, err := k.w.Write([]byte(sseKeepalivePing)); err == nil {
-		k.flusher.Flush()
+	// A failed write marks the client gone (writeLocked); the handler learns
+	// that through onGone, so there is nothing to do with the error here.
+	if _, err := k.writeLocked([]byte(sseKeepalivePing)); err == nil {
+		k.flushLocked()
 	}
 }
