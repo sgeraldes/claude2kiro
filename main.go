@@ -572,9 +572,17 @@ type CodeWhispererRequest struct {
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
-// Kiro CLI wire format. Today that is only output_config.effort.
+// Kiro CLI wire format: thinking, output_config.effort and max_tokens. Each
+// model's catalog entry publishes a schema of the keys it accepts and rejects
+// any other key, so a field is only set when that schema declares it.
 type AdditionalModelRequestFields struct {
-	OutputConfig *OutputConfig `json:"output_config,omitempty"`
+	Thinking     *ThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig *OutputConfig   `json:"output_config,omitempty"`
+	MaxTokens    int             `json:"max_tokens,omitempty"`
+}
+
+type ThinkingConfig struct {
+	Type string `json:"type"`
 }
 
 type OutputConfig struct {
@@ -1360,6 +1368,78 @@ func isThinkingEnabled(anthropicReq AnthropicRequest) bool {
 	return strings.Contains(model, "[1m]") || strings.Contains(model, "context-1m")
 }
 
+// buildAdditionalModelRequestFields assembles the model-specific options for
+// kiroModel. It returns nil when there is nothing to send, so the key is left
+// out of the request entirely. Thinking and max_tokens are only sent for a
+// model the catalog holds, and only in the form its schema declares; a model
+// the catalog does not know gets neither.
+func buildAdditionalModelRequestFields(kiroModel string, anthropicReq AnthropicRequest, advanced config.AdvancedConfig) *AdditionalModelRequestFields {
+	var fields AdditionalModelRequestFields
+	if entry, known := modelCatalog.Lookup(kiroModel); known {
+		fields.Thinking = resolveThinking(entry.ThinkingTypes(), anthropicReq, advanced.EffectiveThinkingMode())
+		fields.MaxTokens = resolveMaxTokens(entry, anthropicReq.MaxTokens)
+	}
+	if effort := resolveNativeEffort(kiroModel, anthropicReq); effort != "" {
+		fields.OutputConfig = &OutputConfig{Effort: effort}
+	}
+	if fields.Thinking == nil && fields.OutputConfig == nil && fields.MaxTokens == 0 {
+		return nil
+	}
+	return &fields
+}
+
+// resolveThinking translates the client's thinking request into the thinking
+// field a model accepting accepted (its schema's thinking.type values) takes.
+// The backend's default for a request without the field is adaptive thinking
+// on, which a client that sent no thinking field (claude2kiro run sets
+// CLAUDE_CODE_DISABLE_THINKING) did not ask for. So with mode client, no
+// thinking or "disabled" becomes {"type":"disabled"} when the schema allows
+// it, and "enabled" or "adaptive" becomes {"type":"adaptive"} when the schema
+// allows that. A value the schema does not list, an unrecognised client type
+// and mode backend all send no field.
+func resolveThinking(accepted []string, anthropicReq AnthropicRequest, mode string) *ThinkingConfig {
+	if mode == config.ThinkingModeBackend || len(accepted) == 0 {
+		return nil
+	}
+	requested := ""
+	if anthropicReq.Thinking != nil {
+		requested = strings.ToLower(strings.TrimSpace(anthropicReq.Thinking.Type))
+	}
+	var want string
+	switch requested {
+	case "", "disabled":
+		want = "disabled"
+	case "enabled", "adaptive":
+		want = "adaptive"
+	default:
+		return nil
+	}
+	if !slices.Contains(accepted, want) {
+		return nil
+	}
+	return &ThinkingConfig{Type: want}
+}
+
+// resolveMaxTokens returns the client's max_tokens clamped to the range the
+// model's schema declares, or 0 (not sent) when the client sent none or the
+// schema does not declare max_tokens.
+func resolveMaxTokens(entry models.KiroModel, requested int) int {
+	if requested <= 0 {
+		return 0
+	}
+	minimum, maximum, accepted := entry.MaxTokensRange()
+	if !accepted {
+		return 0
+	}
+	if minimum > 0 && requested < minimum {
+		return minimum
+	}
+	if maximum > 0 && requested > maximum {
+		return maximum
+	}
+	return requested
+}
+
 var (
 	envBlockRe      = regexp.MustCompile(`(?s)<env>(.*?)</env>`)
 	envWorkingDirRe = regexp.MustCompile(`(?m)^Working directory:\s*(.+?)\s*$`)
@@ -2049,11 +2129,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	} else {
 		cwReq.ConversationState.ConversationId = generateUUID()
 	}
-	if effort := resolveNativeEffort(kiroModel, anthropicReq); effort != "" {
-		cwReq.AdditionalModelRequestFields = &AdditionalModelRequestFields{
-			OutputConfig: &OutputConfig{Effort: effort},
-		}
-	}
+	cwReq.AdditionalModelRequestFields = buildAdditionalModelRequestFields(kiroModel, anthropicReq, cfg.Advanced)
 	if envState := parseEnvState(anthropicReq.System); envState != nil {
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.EnvState = envState
 	}

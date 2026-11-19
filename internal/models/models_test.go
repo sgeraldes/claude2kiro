@@ -463,3 +463,59 @@ func TestEffortLevelsComeFromTheRequestFieldsSchema(t *testing.T) {
 		t.Fatal("a model the catalog does not list must be reported unknown")
 	}
 }
+
+// The thinking types and the max_tokens range come from the same schema. The
+// snippets are the ones the live backend published.
+func TestThinkingTypesAndMaxTokensComeFromTheRequestFieldsSchema(t *testing.T) {
+	const body = `{"models":[
+		{"modelId":"auto","additionalModelRequestFieldsSchema":null},
+		{"modelId":"claude-opus-5.5","additionalModelRequestFieldsSchema":{"type":"object","properties":{"thinking":{"type":"object","properties":{"type":{"type":"string","enum":["adaptive"]},"display":{"type":"string","enum":["summarized","omitted"]}},"required":["type"]},"output_config":{"type":"object","properties":{"effort":{"type":"string","enum":["low","medium","high","xhigh","max"],"default":"medium"}}},"max_tokens":{"type":"integer","minimum":1024,"maximum":64000}},"additionalProperties":false}},
+		{"modelId":"claude-sonnet-5.5","additionalModelRequestFieldsSchema":{"type":"object","properties":{"thinking":{"type":"object","properties":{"type":{"type":"string","enum":["adaptive","between_tools"]}}}},"additionalProperties":false}},
+		{"modelId":"claude-opus-4.8","additionalModelRequestFieldsSchema":{"type":"object","properties":{"thinking":{"type":"object","properties":{"type":{"type":"string","enum":["adaptive","disabled"]}}},"max_tokens":{"type":"integer","minimum":1}},"additionalProperties":false}},
+		{"modelId":"gpt-5.6-sol","additionalModelRequestFieldsSchema":{"type":"object","properties":{"reasoning":{"type":"object"}}}}
+	]}`
+	var lr listResponse
+	if err := json.Unmarshal([]byte(body), &lr); err != nil {
+		t.Fatal(err)
+	}
+	cat := NewCatalog(time.Minute, func() ([]KiroModel, error) { return lr.Models, nil })
+
+	thinking := map[string]string{
+		"claude-opus-5.5":   "adaptive",
+		"claude-sonnet-5.5": "adaptive,between_tools",
+		"claude-opus-4.8":   "adaptive,disabled",
+		"auto":              "",
+		"gpt-5.6-sol":       "",
+	}
+	for id, want := range thinking {
+		types, known := cat.ThinkingTypes(id)
+		if !known || strings.Join(types, ",") != want {
+			t.Errorf("%s thinking types = %v known=%v, want %q", id, types, known, want)
+		}
+	}
+	if _, known := cat.ThinkingTypes("not-offered"); known {
+		t.Error("thinking types of a model the catalog does not list must be reported unknown")
+	}
+
+	ranges := []struct {
+		id               string
+		accepted         bool
+		minimum, maximum int
+	}{
+		{"claude-opus-5.5", true, 1024, 64000},
+		{"claude-opus-4.8", true, 1, 0}, // no maximum published
+		{"claude-sonnet-5.5", false, 0, 0},
+		{"auto", false, 0, 0},
+		{"gpt-5.6-sol", false, 0, 0},
+	}
+	for _, r := range ranges {
+		minimum, maximum, accepted, known := cat.MaxTokensRange(r.id)
+		if !known || accepted != r.accepted || minimum != r.minimum || maximum != r.maximum {
+			t.Errorf("%s max_tokens = [%d,%d] accepted=%v known=%v, want [%d,%d] accepted=%v",
+				r.id, minimum, maximum, accepted, known, r.minimum, r.maximum, r.accepted)
+		}
+	}
+	if _, _, accepted, known := cat.MaxTokensRange("not-offered"); known || accepted {
+		t.Error("max_tokens of a model the catalog does not list must be reported unknown and not accepted")
+	}
+}

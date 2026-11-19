@@ -122,3 +122,29 @@ func TestRequestDietSettingsDefaultConservativeAndApply(t *testing.T) {
 		t.Fatal("aggressive cache points should apply true")
 	}
 }
+
+func TestThinkingModeSettingDefaultsToClientAndApplies(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	thinking := findAdvancedSetting(m, "advanced.thinking_mode")
+	if thinking == nil {
+		t.Fatal("advanced.thinking_mode setting not found")
+	}
+	if thinking.Type != TypeSelect {
+		t.Fatalf("thinking mode setting type = %v, want TypeSelect", thinking.Type)
+	}
+	if thinking.Value != "client" || thinking.ExtendedHelp.DefaultValue != "client" {
+		t.Fatalf("thinking mode value = %q default = %q, want client", thinking.Value, thinking.ExtendedHelp.DefaultValue)
+	}
+	if strings.Join(thinking.Options, ",") != "client,backend" {
+		t.Fatalf("thinking mode options = %v, want client,backend", thinking.Options)
+	}
+
+	m.applySetting(Setting{Key: "advanced.thinking_mode", Value: "backend"})
+	if m.config.Advanced.ThinkingMode != "backend" {
+		t.Fatalf("applied thinking mode = %q, want backend", m.config.Advanced.ThinkingMode)
+	}
+}

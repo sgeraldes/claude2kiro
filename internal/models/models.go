@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -42,7 +43,8 @@ type KiroModel struct {
 }
 
 // RequestFieldsSchema is the part of a model's additionalModelRequestFields
-// JSON schema the proxy reads: the reasoning effort levels the model accepts.
+// JSON schema the proxy reads: the reasoning effort levels, the thinking types
+// and the max_tokens range the model accepts.
 type RequestFieldsSchema struct {
 	Properties struct {
 		OutputConfig struct {
@@ -53,6 +55,19 @@ type RequestFieldsSchema struct {
 				} `json:"effort"`
 			} `json:"properties"`
 		} `json:"output_config"`
+		Thinking struct {
+			Properties struct {
+				Type struct {
+					Enum []string `json:"enum"`
+				} `json:"type"`
+			} `json:"properties"`
+		} `json:"thinking"`
+		// MaxTokens is nil when the schema does not declare max_tokens. The
+		// bounds are floats because JSON schema numbers need not be integers.
+		MaxTokens *struct {
+			Minimum *float64 `json:"minimum"`
+			Maximum *float64 `json:"maximum"`
+		} `json:"max_tokens"`
 	} `json:"properties"`
 }
 
@@ -63,6 +78,32 @@ func (m KiroModel) EffortLevels() []string {
 		return nil
 	}
 	return m.RequestFields.Properties.OutputConfig.Properties.Effort.Enum
+}
+
+// ThinkingTypes returns the thinking.type values the model accepts (for
+// example "adaptive", "disabled"), in the order the backend lists them. Empty
+// when the model takes no thinking field.
+func (m KiroModel) ThinkingTypes() []string {
+	if m.RequestFields == nil {
+		return nil
+	}
+	return m.RequestFields.Properties.Thinking.Properties.Type.Enum
+}
+
+// MaxTokensRange reports whether the model accepts max_tokens and the bounds
+// the schema puts on it. A bound of 0 means the schema sets none.
+func (m KiroModel) MaxTokensRange() (minimum, maximum int, accepted bool) {
+	if m.RequestFields == nil || m.RequestFields.Properties.MaxTokens == nil {
+		return 0, 0, false
+	}
+	mt := m.RequestFields.Properties.MaxTokens
+	if mt.Minimum != nil && *mt.Minimum > 0 {
+		minimum = int(math.Ceil(*mt.Minimum))
+	}
+	if mt.Maximum != nil && *mt.Maximum > 0 {
+		maximum = int(math.Floor(*mt.Maximum))
+	}
+	return minimum, maximum, true
 }
 
 type listResponse struct {
@@ -317,12 +358,42 @@ func (c *Catalog) Has(modelID string) bool {
 // to the live list. known is false when the catalog does not hold that model
 // (never fetched, or the model is not offered), so the caller can fall back.
 func (c *Catalog) EffortLevels(modelID string) (levels []string, known bool) {
-	for _, m := range c.Models() {
-		if m.ModelID == modelID {
-			return m.EffortLevels(), true
-		}
+	if m, ok := c.Lookup(modelID); ok {
+		return m.EffortLevels(), true
 	}
 	return nil, false
+}
+
+// ThinkingTypes returns the thinking.type values modelID accepts according to
+// the live list. known is false when the catalog does not hold that model; the
+// caller then sends no thinking field.
+func (c *Catalog) ThinkingTypes(modelID string) (types []string, known bool) {
+	if m, ok := c.Lookup(modelID); ok {
+		return m.ThinkingTypes(), true
+	}
+	return nil, false
+}
+
+// MaxTokensRange reports whether modelID accepts max_tokens according to the
+// live list, and the bounds on it (0 means unbounded). known is false, and
+// accepted with it, when the catalog does not hold that model.
+func (c *Catalog) MaxTokensRange(modelID string) (minimum, maximum int, accepted, known bool) {
+	if m, ok := c.Lookup(modelID); ok {
+		minimum, maximum, accepted = m.MaxTokensRange()
+		return minimum, maximum, accepted, true
+	}
+	return 0, 0, false, false
+}
+
+// Lookup returns the catalog entry for modelID (refreshing if stale). ok is
+// false when the catalog does not hold that model.
+func (c *Catalog) Lookup(modelID string) (KiroModel, bool) {
+	for _, m := range c.Models() {
+		if m.ModelID == modelID {
+			return m, true
+		}
+	}
+	return KiroModel{}, false
 }
 
 // Available reports whether the catalog currently holds any model data.

@@ -780,6 +780,20 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "EXPERIMENTAL. Adds Kiro cachePoint entries after tools even when Claude Code did not send Anthropic cache_control. Only enable while measuring whether Kiro credits drop.",
 			},
 		},
+		{
+			Key:         "advanced.thinking_mode",
+			Label:       "Thinking Mode",
+			Description: "Who decides whether the model thinks",
+			Type:        TypeSelect,
+			Value:       m.config.Advanced.EffectiveThinkingMode(),
+			Options:     []string{config.ThinkingModeClient, config.ThinkingModeBackend},
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     config.ThinkingModeClient,
+				RecommendedValue: config.ThinkingModeClient,
+				Sensitive:        false,
+				DetailedDesc:     "client sends Kiro the thinking the client asked for: off when the client sent no thinking field (claude2kiro run turns it off), adaptive when it asked for thinking. A model whose catalog entry cannot turn thinking off keeps the backend default. backend never sends a thinking field, so Kiro applies its default, which is adaptive thinking on: slower and more credits per request.",
+			},
+		},
 	}
 }
 
@@ -934,6 +948,8 @@ func (m *Model) applySetting(s Setting) {
 		}
 	case "advanced.aggressive_cache_points":
 		m.config.Advanced.AggressiveCachePoints = stringToBool(s.Value)
+	case "advanced.thinking_mode":
+		m.config.Advanced.ThinkingMode = s.Value
 	}
 }
 

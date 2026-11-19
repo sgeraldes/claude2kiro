@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,7 +105,23 @@ type AdvancedConfig struct {
 	ToolMode              string `yaml:"tool_mode"`               // Request diet tool mode: full, compact, none_text (default: full)
 	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
 	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
+	ThinkingMode          string `yaml:"thinking_mode"`           // Who decides the model's thinking: client (translate the client's thinking field, default) or backend (send none, the backend default applies)
 	Profile               string `yaml:"profile"`                 // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+}
+
+// Values of AdvancedConfig.ThinkingMode.
+const (
+	ThinkingModeClient  = "client"  // translate what the client asked for
+	ThinkingModeBackend = "backend" // never send a thinking field
+)
+
+// EffectiveThinkingMode returns ThinkingMode, or client when it is empty or
+// not a known value. Case and surrounding spaces are ignored.
+func (a AdvancedConfig) EffectiveThinkingMode() string {
+	if strings.EqualFold(strings.TrimSpace(a.ThinkingMode), ThinkingModeBackend) {
+		return ThinkingModeBackend
+	}
+	return ThinkingModeClient
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -181,6 +198,7 @@ func Default() *Config {
 			ToolMode:              "full",
 			ToolCompactMaxChars:   1024,
 			AggressiveCachePoints: false,
+			ThinkingMode:          ThinkingModeClient,
 		},
 	}
 }

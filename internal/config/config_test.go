@@ -32,6 +32,27 @@ func TestDefaultRequestDietSettingsAreConservative(t *testing.T) {
 	}
 }
 
+func TestThinkingModeDefaultsToClientAndFallsBackToIt(t *testing.T) {
+	if got := Default().Advanced.ThinkingMode; got != "client" {
+		t.Fatalf("thinking_mode default = %q, want client", got)
+	}
+	cfg := Default()
+	if err := yaml.Unmarshal([]byte("advanced:\n  thinking_mode: backend\n"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Advanced.EffectiveThinkingMode(); got != "backend" {
+		t.Fatalf("thinking_mode backend read as %q", got)
+	}
+	for _, v := range []string{"", "client", "bogus", "adaptive"} {
+		if got := (AdvancedConfig{ThinkingMode: v}).EffectiveThinkingMode(); got != "client" {
+			t.Errorf("thinking_mode %q = %q, want client", v, got)
+		}
+	}
+	if got := (AdvancedConfig{ThinkingMode: " Backend "}).EffectiveThinkingMode(); got != "backend" {
+		t.Errorf("thinking_mode %q = %q, want backend", " Backend ", got)
+	}
+}
+
 func TestAuthFallbackProfilesParseAndDefaultEmpty(t *testing.T) {
 	if got := Default().Auth.FallbackProfiles; len(got) != 0 {
 		t.Fatalf("default fallback profiles must be empty, got %v", got)
