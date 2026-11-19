@@ -221,18 +221,23 @@ a fingerprint of the conversation's first message. Claude Code sends one
 session id for a conversation and for every Task subagent it spawns, so the
 session alone would let a parent and its subagent share keys.
 
-The fingerprint is a SHA-256 hash of the role of `messages[0]` and its text.
-Claude Code opens that message with `<system-reminder>` blocks (instructions,
-a git status snapshot, an attribution note) that can change between requests
-of one conversation, and ends it with the prompt, which for a subagent is the
-task its parent wrote. The hash therefore covers the text blocks with every
+The fingerprint is a SHA-256 hash of the role of `messages[0]` and its text,
+truncated to its first 128 bits. Claude Code opens that message with
+`<system-reminder>` blocks (instructions, a git status snapshot, an
+attribution note) that can change between requests of one conversation, and
+ends it with the prompt, which for a subagent is the task its parent wrote.
+The hash therefore covers the text blocks joined with a space, with every
 `<system-reminder>...</system-reminder>` span removed and whitespace collapsed
-as for turn text: it is stable across a conversation's turns and differs
-between a parent and its subagents. A first message that is all reminders
-hashes all its text; one with no text at all hashes its JSON with
-`cache_control` removed, since the client moves cache markers between
-requests. Capture (the request that produced the response) and lookup (a later
-request's history) compute it from the same `messages[0]`. When the client
+as for turn text. The spans are removed from the joined text, so a reminder
+that opens in one block and closes in a later one is removed too. The result
+is stable across a conversation's turns and differs between a parent and its
+subagents. A first message that is all reminders hashes all its text; one
+with no text at all hashes its JSON with `cache_control` removed, since the
+client moves cache markers between requests. The proxy computes the
+fingerprint once per request, when it builds the backend request: lookup (the
+history's turns) and capture (storing the response) both use that value, and
+a resend of the same request, without reasoning or to another identity, keeps
+it. A later request computes it from its own `messages[0]`. When the client
 compacts or rewrites the first message the fingerprint changes, and every
 earlier entry of that conversation, text or tool keyed, becomes a miss: the
 turns carry no reasoning and the model thinks again. It never gets another

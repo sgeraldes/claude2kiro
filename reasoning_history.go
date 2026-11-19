@@ -52,24 +52,19 @@ type reasoningScope struct {
 	turn         int
 }
 
-// requestScope is the scope of req's conversation at position 0. Capture
-// (responseScope) and lookup (buildCodeWhispererRequest) both start from it,
-// so they compute the session and the fingerprint from the same request data.
-func requestScope(req AnthropicRequest) reasoningScope {
+// responseScope is the scope of the turn a response to req produces: req's
+// session and conversation, and the position after req's own assistant
+// messages. The position counts req.Messages, never the history sent to the
+// backend, so a history mode that drops turns does not move it.
+// buildCodeWhispererRequest computes it once and keeps it on the request:
+// lookup keys the history's turns with its session and conversation, and
+// capture stores the response under it, so both see the same fingerprint.
+func responseScope(req AnthropicRequest) reasoningScope {
 	_, session := extractSessionID(req.Metadata)
 	scope := reasoningScope{session: session}
 	if session != "" {
 		scope.conversation = conversationFingerprint(req.Messages)
 	}
-	return scope
-}
-
-// responseScope is the scope of the turn a response to req produces: req's
-// session and conversation, and the position after req's own assistant
-// messages. The position counts req.Messages, never the history sent to the
-// backend, so a history mode that drops turns does not move it.
-func responseScope(req AnthropicRequest) reasoningScope {
-	scope := requestScope(req)
 	for _, m := range req.Messages {
 		if m.Role == "assistant" {
 			scope.turn++
@@ -112,6 +107,10 @@ func (s reasoningScope) keys(toolUseIDs []string, text string) []string {
 // into a user message.
 var systemReminderPattern = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
 
+// onConversationFingerprint, when set, is called by every
+// conversationFingerprint. Tests set it to count the calls.
+var onConversationFingerprint func()
+
 // conversationFingerprint identifies the conversation msgs belong to by its
 // first message: a hash of its role and its text. Claude Code opens that
 // message with <system-reminder> blocks (instructions, a git status snapshot,
@@ -125,6 +124,9 @@ var systemReminderPattern = regexp.MustCompile(`(?s)<system-reminder>.*?</system
 // rewrites the first message the fingerprint changes and earlier entries are
 // simply not found.
 func conversationFingerprint(msgs []AnthropicRequestMessage) string {
+	if onConversationFingerprint != nil {
+		onConversationFingerprint()
+	}
 	if len(msgs) == 0 {
 		return ""
 	}
@@ -142,9 +144,20 @@ func conversationFingerprint(msgs []AnthropicRequestMessage) string {
 			}
 		}
 	}
-	all := reasoning.NormalizeText(strings.Join(blocks, " "))
+	// The blocks are joined with a space before the reminders are removed, so a
+	// reminder that opens in one block and closes in another goes too. A space
+	// is what normalizing turns any block boundary into anyway, so a first
+	// message whose reminders each sit in one block hashes as it did when they
+	// were removed block by block, and a space can never complete a tag.
+	joined := strings.Join(blocks, " ")
+	text := reasoning.NormalizeText(systemReminderPattern.ReplaceAllString(joined, " "))
+	if text == "" {
+		text = reasoning.NormalizeText(joined) // all reminders, or no text at all
+	}
 	var basis string
-	if all == "" {
+	if text != "" {
+		basis = "text\x00" + text
+	} else {
 		content := withoutCacheControl(first.Content)
 		raw, err := json.Marshal(content)
 		if err != nil {
@@ -153,16 +166,6 @@ func conversationFingerprint(msgs []AnthropicRequestMessage) string {
 			raw = []byte(fmt.Sprintf("%#v", content))
 		}
 		basis = "json\x00" + string(raw)
-	} else {
-		stripped := make([]string, len(blocks))
-		for i, b := range blocks {
-			stripped[i] = systemReminderPattern.ReplaceAllString(b, " ")
-		}
-		text := reasoning.NormalizeText(strings.Join(stripped, " "))
-		if text == "" {
-			text = all
-		}
-		basis = "text\x00" + text
 	}
 	sum := sha256.Sum256([]byte(first.Role + "\x00" + basis))
 	return hex.EncodeToString(sum[:16])

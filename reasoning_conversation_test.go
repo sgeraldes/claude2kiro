@@ -1,9 +1,13 @@
 package main
 
 import (
+	"io"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/sgeraldes/claude2kiro/internal/config"
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 )
 
@@ -100,6 +104,120 @@ func TestChangedReminderInTheFirstMessageKeepsTheConversation(t *testing.T) {
 	}
 }
 
+// splitReminderFirstMessage is a first message whose git status reminder opens
+// in one text block and closes in the next, followed by the prompt.
+func splitReminderFirstMessage(prompt, gitStatus string) []any {
+	return []any{
+		map[string]any{"type": "text", "text": "<system-reminder>\n# gitStatus\n"},
+		map[string]any{"type": "text", "text": gitStatus + "\n</system-reminder>"},
+		map[string]any{"type": "text", "text": prompt},
+	}
+}
+
+// A reminder whose opening and closing tags fall in different text blocks is
+// still removed: its changing text does not move the conversation.
+func TestReminderSplitAcrossBlocksKeepsTheConversation(t *testing.T) {
+	for name, run := range handlerRuns {
+		t.Run(name, func(t *testing.T) {
+			log := &bodyLog{}
+			reasoningHandlerSetup(t, scriptedBackend(log, nil, textAnswer("Done.", "SIG-SPLIT")))
+			lg := logger.NewLogger(100)
+			run(t, textConversationFrom(scopeSessionA, splitReminderFirstMessage(parentPrompt, "Status: clean")), lg)
+			run(t, textConversationFrom(scopeSessionA, splitReminderFirstMessage(parentPrompt, "Status:\n M main.go"), "Done."), lg)
+			bodies := log.all()
+			if len(bodies) != 2 {
+				t.Fatalf("backend saw %d requests, want 2", len(bodies))
+			}
+			if got := historySignatures(t, bodies[1]); !equalStrings(got, []string{"SIG-SPLIT"}) {
+				t.Fatalf("the turn carries %q, want [SIG-SPLIT]:\n%s", got, bodies[1])
+			}
+		})
+	}
+}
+
+// countFingerprints counts conversationFingerprint calls until the test ends.
+func countFingerprints(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	var n atomic.Int64
+	onConversationFingerprint = func() { n.Add(1) }
+	t.Cleanup(func() { onConversationFingerprint = nil })
+	return &n
+}
+
+// Building the request and capturing its response share one fingerprint: it
+// is computed once per request, also when the request is resent without its
+// reasoning or to another identity.
+func TestFingerprintIsComputedOncePerRequest(t *testing.T) {
+	first := claudeCodeFirstMessage(parentPrompt, "Current branch: main")
+	for name, run := range handlerRuns {
+		t.Run(name+"/first turn", func(t *testing.T) {
+			reasoningHandlerSetup(t, scriptedBackend(&bodyLog{}, nil, textAnswer("Done.", "SIG-1")))
+			calls := countFingerprints(t)
+			run(t, textConversationFrom(scopeSessionA, first), logger.NewLogger(100))
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("fingerprint computed %d times, want 1", got)
+			}
+		})
+		t.Run(name+"/with history", func(t *testing.T) {
+			log := &bodyLog{}
+			reasoningHandlerSetup(t, scriptedBackend(log, nil, textAnswer("Done.", "SIG-1")))
+			lg := logger.NewLogger(100)
+			run(t, textConversationFrom(scopeSessionA, first), lg)
+			calls := countFingerprints(t)
+			run(t, textConversationFrom(scopeSessionA, first, "Done."), lg)
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("fingerprint computed %d times, want 1", got)
+			}
+			if got := historySignatures(t, log.all()[1]); !equalStrings(got, []string{"SIG-1"}) {
+				t.Fatalf("the turn carries %q, want [SIG-1]", got)
+			}
+		})
+		t.Run(name+"/resent without reasoning", func(t *testing.T) {
+			log := &bodyLog{}
+			reject := func(body string) bool { return strings.Contains(body, `"reasoningContent"`) }
+			reasoningHandlerSetup(t, scriptedBackend(log, reject, textAnswer("Done.", "SIG-1")))
+			lg := logger.NewLogger(100)
+			run(t, textConversationFrom(scopeSessionA, first), lg)
+			calls := countFingerprints(t)
+			run(t, textConversationFrom(scopeSessionA, first, "Done."), lg)
+			if got := len(log.all()); got != 3 {
+				t.Fatalf("backend saw %d requests, want 3 (first turn, rejected, resent)", got)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("fingerprint computed %d times, want 1", got)
+			}
+		})
+		t.Run(name+"/identity switch", func(t *testing.T) {
+			log := &bodyLog{}
+			reasoningHandlerSetup(t, func(w http.ResponseWriter, r *http.Request) {
+				log.add(r)
+				if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == primaryToken().AccessToken {
+					w.WriteHeader(http.StatusPaymentRequired)
+					io.WriteString(w, quotaBody)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				w.Write(cwFrame(`{"content":"` + fallbackContent + `"}`))
+			})
+			withIdentities(t, map[string]TokenData{"": primaryToken(), "kiro2": fallbackToken()})
+			cfg := *config.Get()
+			cfg.Auth.FallbackProfiles = []string{"kiro2"}
+			withConfig(t, &cfg)
+			calls := countFingerprints(t)
+			out := run(t, textConversationFrom(scopeSessionA, first, "Done."), logger.NewLogger(100))
+			if !strings.Contains(out, fallbackContent) {
+				t.Fatalf("want the fallback's answer: %s", out)
+			}
+			if got := len(log.all()); got != 2 {
+				t.Fatalf("backend saw %d requests, want one per identity", got)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("fingerprint computed %d times, want 1", got)
+			}
+		})
+	}
+}
+
 // After the client compacts a conversation its first message is a summary: the
 // earlier entries are a miss, never another conversation's reasoning.
 func TestCompactedFirstMessageMissesInsteadOfAttaching(t *testing.T) {
@@ -151,6 +269,11 @@ func TestConversationFingerprint(t *testing.T) {
 	}
 	if sub == parentA {
 		t.Fatal("a subagent's first message has its parent's fingerprint")
+	}
+	splitA := conversationFingerprint(user(splitReminderFirstMessage(parentPrompt, "Status: clean")))
+	splitB := conversationFingerprint(user(splitReminderFirstMessage(parentPrompt, "Status:\n M main.go")))
+	if splitA != parentA || splitB != parentA {
+		t.Fatalf("a reminder split across blocks was not removed: %q, %q, want %q", splitA, splitB, parentA)
 	}
 
 	split := conversationFingerprint(user([]any{
