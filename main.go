@@ -5051,7 +5051,15 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			eventCount++
 			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
 			if delayMs > 0 {
-				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+				// The pause ends when the client leaves; nothing more is sent
+				// and the read loop ends through the client-gone path.
+				pause := time.NewTimer(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+				select {
+				case <-pause.C:
+				case <-ctx.Done():
+					pause.Stop()
+					return
+				}
 			}
 		}
 	}
