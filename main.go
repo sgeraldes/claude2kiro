@@ -1717,7 +1717,10 @@ func compactToolDescription(desc string, maxChars int) string {
 	return desc[:cut]
 }
 
-// extractImagesFromContent extracts images from Anthropic message content
+// extractImagesFromContent extracts the images of an Anthropic message: its
+// top-level image blocks, then the image blocks inside the content arrays of
+// its tool_result blocks, each in order. The backend takes images only on the
+// current message (history user messages have no images field).
 func extractImagesFromContent(content any) []ImageBlock {
 	var images []ImageBlock
 
@@ -1727,54 +1730,74 @@ func extractImagesFromContent(content any) []ImageBlock {
 	}
 
 	for _, block := range contentBlocks {
+		if img, ok := imageBlockFrom(block); ok {
+			images = append(images, img)
+		}
+	}
+	for _, block := range contentBlocks {
 		blockMap, ok := block.(map[string]any)
-		if !ok {
+		if !ok || blockMap["type"] != "tool_result" {
 			continue
 		}
-
-		blockType, _ := blockMap["type"].(string)
-		if blockType != "image" {
-			continue
+		items, _ := blockMap["content"].([]any)
+		for _, item := range items {
+			if img, ok := imageBlockFrom(item); ok {
+				images = append(images, img)
+			}
 		}
-
-		source, ok := blockMap["source"].(map[string]any)
-		if !ok {
-			continue
-		}
-
-		sourceType, _ := source["type"].(string)
-		if sourceType != "base64" {
-			continue
-		}
-
-		mediaType, _ := source["media_type"].(string)
-		data, _ := source["data"].(string)
-
-		if data == "" {
-			continue
-		}
-
-		// Convert media type to format (e.g., "image/png" -> "png")
-		format := "png" // default
-		switch mediaType {
-		case "image/png":
-			format = "png"
-		case "image/jpeg", "image/jpg":
-			format = "jpeg"
-		case "image/gif":
-			format = "gif"
-		case "image/webp":
-			format = "webp"
-		}
-
-		imgBlock := ImageBlock{
-			Format: format,
-		}
-		imgBlock.Source.Bytes = data
-		images = append(images, imgBlock)
 	}
 
 	return images
+}
+
+// imageBlockFrom converts one Anthropic base64 image block. Any other block,
+// and an image without data, yields false.
+func imageBlockFrom(block any) (ImageBlock, bool) {
+	blockMap, ok := block.(map[string]any)
+	if !ok {
+		return ImageBlock{}, false
+	}
+
+	blockType, _ := blockMap["type"].(string)
+	if blockType != "image" {
+		return ImageBlock{}, false
+	}
+
+	source, ok := blockMap["source"].(map[string]any)
+	if !ok {
+		return ImageBlock{}, false
+	}
+
+	sourceType, _ := source["type"].(string)
+	if sourceType != "base64" {
+		return ImageBlock{}, false
+	}
+
+	mediaType, _ := source["media_type"].(string)
+	data, _ := source["data"].(string)
+
+	if data == "" {
+		return ImageBlock{}, false
+	}
+
+	// Convert media type to format (e.g., "image/png" -> "png")
+	format := "png" // default
+	switch mediaType {
+	case "image/png":
+		format = "png"
+	case "image/jpeg", "image/jpg":
+		format = "jpeg"
+	case "image/gif":
+		format = "gif"
+	case "image/webp":
+		format = "webp"
+	}
+
+	imgBlock := ImageBlock{
+		Format: format,
+	}
+	imgBlock.Source.Bytes = data
+	return imgBlock, true
 }
 
 // resolveSchemaRefs resolves $ref references by inlining definitions from $defs.

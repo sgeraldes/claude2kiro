@@ -343,6 +343,13 @@ benchmarks prove the trade-off is safe.
   `content` and no structured results are sent. The request log reports
   `contentChars` (the `content` field) and `toolResultChars` (current tool results)
   separately.
+- **Images inside a tool result.** A `tool_result` whose `content` array holds an
+  `image` block (a screenshot tool, for example) has its text items sent in
+  `toolResults` and its base64 images sent in the current message's `images`,
+  after the message's own top-level images, in order. Only the current message
+  carries images: history user messages have no `images` field in the request
+  format, so images of earlier turns, top-level or inside a tool result, are
+  not sent.
 - **Native effort passthrough.** Claude Code `output_config.effort`, or `thinking`
   of type `enabled` or `adaptive` (which get the default effort), is translated to Kiro's
   `additionalModelRequestFields.output_config.effort` for models that advertise an
