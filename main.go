@@ -4864,9 +4864,10 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	for {
 		payload, err := parser.ReadFramePayload(body)
 		if err != nil {
-			// A stream that ends inside a frame, or on a frame with impossible
-			// lengths, ends the response with what was already forwarded.
-			if err != io.EOF && err != io.ErrUnexpectedEOF && !errors.Is(err, parser.ErrInvalidFrame) {
+			// Only io.EOF on a frame boundary is a finished response. A stream
+			// that ends inside a frame, a frame with impossible lengths or a
+			// transport error means the backend did not finish the answer.
+			if err != io.EOF {
 				readErr = err
 			}
 			break
@@ -4896,7 +4897,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			return responseText.String()
 		}
 		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events: %v", cwReq.ConversationState.ConversationId[:8], eventCount, readErr))
-		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
+		// No content_block_stop, message_delta or message_stop: the client must
+		// see an unfinished answer as an error (overloaded, so it retries).
+		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
 		return ""
 	}
 

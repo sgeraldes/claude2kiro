@@ -178,6 +178,55 @@ func TestStreamCancelsTheBackendWhenTheClientDisconnects(t *testing.T) {
 	}
 }
 
+// assertStreamFailed checks that a response the backend did not finish reaches
+// the client as a retryable error and never as a finished answer.
+func assertStreamFailed(t *testing.T, body string) {
+	t.Helper()
+	if !strings.Contains(body, "event: error\n") || !strings.Contains(body, `"overloaded_error"`) {
+		t.Fatalf("want an overloaded_error event; body:\n%s", body)
+	}
+	for _, unwanted := range []string{"event: message_stop", "event: message_delta", "event: content_block_stop"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("a failed stream must not send %q; body:\n%s", unwanted, body)
+		}
+	}
+}
+
+// A backend stream that ends inside a frame is a failed response, not a
+// finished one: the client must not run a tool with half its input.
+func TestStreamEndingInsideAFrameIsAnError(t *testing.T) {
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(cwFrame(`{"content":"FIRST"}`))
+		second := cwFrame(`{"content":"SECOND HALF NEVER ARRIVES"}`)
+		w.Write(second[:len(second)/2])
+	})
+
+	rec := newLiveRecorder()
+	handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
+
+	body := rec.String()
+	if !strings.Contains(body, "FIRST") {
+		t.Fatalf("the whole first frame should have been forwarded; body:\n%s", body)
+	}
+	assertStreamFailed(t, body)
+}
+
+// A frame whose length fields cannot be right is a failed response too.
+func TestStreamWithAnImpossibleFrameIsAnError(t *testing.T) {
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(cwFrame(`{"content":"FIRST"}`))
+		// total length 4 is shorter than the 12-byte minimum frame.
+		w.Write([]byte{0, 0, 0, 4, 0, 0, 0, 0, 1, 2, 3, 4})
+	})
+
+	rec := newLiveRecorder()
+	handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
+
+	assertStreamFailed(t, rec.String())
+}
+
 func TestNonStreamCancelsTheBackendWhenTheClientDisconnects(t *testing.T) {
 	arrived := make(chan struct{})
 	cancelled := make(chan struct{})
