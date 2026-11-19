@@ -163,7 +163,7 @@ func TestStreamKeepaliveIntervalZeroSendsNoSilencePings(t *testing.T) {
 }
 
 // A client that goes away stops the backend request instead of leaving it
-// running, paying credits and holding a concurrency slot.
+// running and holding a concurrency slot.
 func TestStreamCancelsTheBackendWhenTheClientDisconnects(t *testing.T) {
 	arrived := make(chan struct{})
 	cancelled := make(chan struct{})
