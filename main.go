@@ -1461,8 +1461,8 @@ func buildAdditionalModelRequestFields(kiroModel string, anthropicReq AnthropicR
 }
 
 // resolveThinking translates the client's thinking request into the thinking
-// field a model accepting accepted (its schema's thinking.type values) takes.
-// The backend's default for a request without the field is adaptive thinking
+// field to send to a model whose schema lists accepted as its thinking.type
+// values. The backend's default for a request without the field is adaptive thinking
 // on, which a client that sent no thinking field (claude2kiro run sets
 // CLAUDE_CODE_DISABLE_THINKING) did not ask for. So with mode client, no
 // thinking or "disabled" becomes {"type":"disabled"} when the schema allows
