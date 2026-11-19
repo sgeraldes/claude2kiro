@@ -633,12 +633,36 @@ func kiroConcurrencyLimit() int {
 
 // acquire blocks until fewer than the current limit are in flight.
 func (l *kiroLimiter) acquire() {
+	l.acquireCtx(context.Background())
+}
+
+// acquireCtx blocks until fewer than the current limit are in flight and
+// takes a slot, or until ctx is done, in which case it takes no slot and
+// returns false. A waiter whose client left stops waiting at once instead of
+// holding its place in the queue.
+func (l *kiroLimiter) acquireCtx(ctx context.Context) bool {
+	// sync.Cond cannot be cancelled, so wake every waiter when ctx ends. The
+	// broadcast takes the lock: a waiter is either still before its ctx check
+	// (and sees the error) or already parked in Wait (and is woken).
+	stop := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer stop()
+
 	l.mu.Lock()
-	for l.active >= kiroConcurrencyLimit() {
+	defer l.mu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		if l.active < kiroConcurrencyLimit() {
+			l.active++
+			return true
+		}
 		l.cond.Wait()
 	}
-	l.active++
-	l.mu.Unlock()
 }
 
 // release frees a slot and wakes any waiters (the limit may have risen).
@@ -1328,7 +1352,9 @@ var nativeEffortEnums = map[string][]string{
 
 // effortLevelsFor returns the reasoning effort levels kiroModel accepts. It
 // reads them from the live model catalog, which publishes them per model, and
-// only uses the static table when the catalog does not know the model.
+// only uses the static table when the catalog does not know the model. The
+// live catalog is authoritative: a model it lists without an effort schema gets
+// no effort, even when the static table has an entry for it.
 func effortLevelsFor(kiroModel string) []string {
 	if levels, known := modelCatalog.EffortLevels(kiroModel); known {
 		return levels
@@ -4567,7 +4593,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 // handleStreamRequestCtx answers a streaming request. Events are forwarded as
 // the backend produces them, the client gets a ping whenever the stream has
-// been silent for streamKeepaliveInterval, and ctx (the client's request
+// been silent for network.stream_keepalive_interval, and ctx (the client's request
 // context) cancels the backend request when the client goes away.
 func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	// Set SSE headers
@@ -4584,7 +4610,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	// From here on every write goes through the keepalive writer, which also
 	// pings the client while the backend is silent.
-	keepalive := newKeepaliveWriter(w, rawFlusher, streamKeepaliveInterval)
+	keepalive := newKeepaliveWriter(w, rawFlusher, config.Get().Network.StreamKeepaliveInterval)
 	defer keepalive.stop()
 	w = keepalive
 	var flusher http.Flusher = keepalive
@@ -4648,10 +4674,6 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
 	queuedAt := time.Now()
-	kiroSema.acquire()
-	defer kiroSema.release()
-	queueWait := time.Since(queuedAt)
-	sentAt := time.Now()
 
 	// clientGone reports a client that disconnected; nothing is sent to it and
 	// the backend request, bound to ctx, is already cancelled.
@@ -4663,9 +4685,15 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			stage, cwReq.ConversationState.ConversationId[:8], time.Since(queuedAt).Round(time.Millisecond)))
 		return true
 	}
-	if clientGone("while queued") {
+	if !kiroSema.acquireCtx(ctx) {
+		// The client left while the request waited for a slot; it never took
+		// one and the backend never saw it.
+		clientGone("while queued")
 		return ""
 	}
+	defer kiroSema.release()
+	queueWait := time.Since(queuedAt)
+	sentAt := time.Now()
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response
@@ -4711,7 +4739,16 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			proxyReq.Header.Set("Accept", "text/event-stream")
 			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
 			if !skipBackoff {
-				time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
+				// Exponential backoff with jitter, cut short when the client leaves.
+				backoff := time.NewTimer(retryBackoff(attempt))
+				select {
+				case <-backoff.C:
+				case <-ctx.Done():
+					backoff.Stop()
+				}
+				if clientGone("during the retry backoff") {
+					return ""
+				}
 			}
 			skipBackoff = false
 		}
@@ -4955,9 +4992,10 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	for {
 		payload, err := parser.ReadFramePayload(body)
 		if err != nil {
-			// A stream that ends inside a frame, or on a frame with impossible
-			// lengths, ends the response with what was already forwarded.
-			if err != io.EOF && err != io.ErrUnexpectedEOF && !errors.Is(err, parser.ErrInvalidFrame) {
+			// Only io.EOF on a frame boundary is a finished response. A stream
+			// that ends inside a frame, a frame with impossible lengths or a
+			// transport error means the backend did not finish the answer.
+			if err != io.EOF {
 				readErr = err
 			}
 			break
@@ -4987,7 +5025,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			return responseText.String()
 		}
 		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events: %v", cwReq.ConversationState.ConversationId[:8], eventCount, readErr))
-		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
+		// No content_block_stop, message_delta or message_stop: the client must
+		// see an unfinished answer as an error (overloaded, so it retries).
+		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
 		return ""
 	}
 

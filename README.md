@@ -351,7 +351,7 @@ The proxy keeps no session data: it reads the auth token from disk on every requ
 
 ### Streaming
 
-Streaming responses are forwarded as Kiro produces them. While Kiro is silent (it can take minutes before the first byte on a long step) the proxy sends a `ping` every 15 seconds, so the client does not give up and resend the request. If the client disconnects, the proxy cancels the request to Kiro, which stops it from consuming credits and frees its concurrency slot. Details in [docs/PROTOCOL_TRANSLATION.md](docs/PROTOCOL_TRANSLATION.md).
+Streaming responses are forwarded as Kiro produces them. While Kiro is silent (it can take minutes before the first byte on a long step) the proxy sends a `ping` every `network.stream_keepalive_interval` (default 15s, `0` turns the pings off; editable in the settings screen), so the client does not give up and resend the request. If the client disconnects, the proxy cancels the request to Kiro and frees its concurrency slot. Details in [docs/PROTOCOL_TRANSLATION.md](docs/PROTOCOL_TRANSLATION.md).
 
 ## License
 

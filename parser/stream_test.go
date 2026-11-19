@@ -146,6 +146,65 @@ func TestStreamTranslator_TextAfterToolOpensANewBlock(t *testing.T) {
 	}
 }
 
+// Text that arrives while a tool block is open goes to its own block and does
+// not close the tool: every later input fragment still reaches the client with
+// the tool's index.
+func TestStreamTranslator_TextInsideAToolKeepsTheToolInput(t *testing.T) {
+	tr := NewStreamTranslator()
+	events := translateAll(t, tr,
+		`{"name":"Bash","toolUseId":"t1"}`,
+		`{"content":"Thinking."}`,
+		`{"name":"Bash","toolUseId":"t1","input":"{\"cmd\":"}`,
+		`{"name":"Bash","toolUseId":"t1","input":"\"ls\"}"}`,
+		`{"name":"Bash","toolUseId":"t1","stop":true}`,
+	)
+
+	want := []string{
+		"content_block_start", // tool, index 0
+		"content_block_start", // text, index 1
+		"content_block_delta", // text
+		"content_block_delta", // tool input
+		"content_block_delta", // tool input
+		"content_block_stop",  // tool, by its stop frame
+		"content_block_stop",  // text, by Finish
+	}
+	if got := eventTypes(events); !equalStrings(got, want) {
+		t.Fatalf("event sequence = %v, want %v", got, want)
+	}
+	if got := indexes(t, events); !equalInts(got, []int{0, 1, 1, 0, 0, 0, 1}) {
+		t.Fatalf("indexes = %v", got)
+	}
+
+	var input string
+	for _, e := range events {
+		delta, ok := dataField(t, e, "delta").(map[string]any)
+		if !ok || delta["type"] != "input_json_delta" {
+			continue
+		}
+		if idx := dataField(t, e, "index"); idx != 0 {
+			t.Fatalf("tool input sent with index %v, want 0", idx)
+		}
+		input += delta["partial_json"].(string)
+	}
+	if input != `{"cmd":"ls"}` {
+		t.Fatalf("tool input = %q, want every fragment", input)
+	}
+	if tr.StopReason() != "tool_use" {
+		t.Fatalf("stop reason = %q, want tool_use", tr.StopReason())
+	}
+}
+
+// Input for a tool after its own stop frame cannot belong to the closed block
+// and is dropped.
+func TestStreamTranslator_InputAfterAToolStopIsDropped(t *testing.T) {
+	tr := NewStreamTranslator()
+	tr.Translate([]byte(`{"name":"Bash","toolUseId":"t1"}`))
+	tr.Translate([]byte(`{"name":"Bash","toolUseId":"t1","stop":true}`))
+	if got := tr.Translate([]byte(`{"name":"Bash","toolUseId":"t1","input":"{}"}`)); len(got) != 0 {
+		t.Fatalf("events = %v, want none for a stopped tool", eventTypes(got))
+	}
+}
+
 func TestStreamTranslator_FinishClosesAToolTheBackendLeftOpen(t *testing.T) {
 	tr := NewStreamTranslator()
 	events := translateAll(t, tr,

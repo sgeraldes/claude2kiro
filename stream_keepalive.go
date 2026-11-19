@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-// streamKeepaliveInterval is how long a streaming response may stay silent
-// before the proxy sends the client a ping. The backend can spend minutes
-// before its first byte; a client that hears nothing for that long gives up
-// and resends the whole request while the first one is still running.
-var streamKeepaliveInterval = 15 * time.Second
+// How long a streaming response may stay silent before the proxy pings the
+// client is network.stream_keepalive_interval (default 15s, 0 = no pings). The
+// backend can spend minutes before its first byte; a client that hears nothing
+// for that long gives up and resends the whole request while the first one is
+// still running.
 
 const sseKeepalivePing = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
 
@@ -24,8 +24,9 @@ type keepaliveWriter struct {
 	flusher   http.Flusher
 	lastWrite time.Time
 
-	done chan struct{}
-	wg   sync.WaitGroup
+	done     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 func newKeepaliveWriter(w http.ResponseWriter, flusher http.Flusher, interval time.Duration) *keepaliveWriter {
@@ -59,9 +60,9 @@ func (k *keepaliveWriter) Flush() {
 }
 
 // stop ends the ping goroutine and waits for it, so nothing is written to the
-// response after the handler returns.
+// response after the handler returns. Calling it again does nothing.
 func (k *keepaliveWriter) stop() {
-	close(k.done)
+	k.stopOnce.Do(func() { close(k.done) })
 	k.wg.Wait()
 }
 
