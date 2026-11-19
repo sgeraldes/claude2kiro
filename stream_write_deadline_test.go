@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"os"
@@ -95,6 +96,40 @@ func TestKeepaliveWriterStopReturnsWhenAPingWriteStalls(t *testing.T) {
 	}
 	if _, err := k.Write([]byte("x")); err == nil {
 		t.Fatal("a write after the client is gone must fail")
+	}
+}
+
+// A non-streaming answer written to a client that stopped reading ends at the
+// same per-write deadline instead of blocking the handler forever, and the
+// deadline is cleared again afterwards.
+func TestNonStreamWriteEndsWhenTheClientStopsReading(t *testing.T) {
+	withStreamWriteTimeout(t, 50*time.Millisecond)
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write(cwFrame(`{"content":"ANSWER"}`))
+	})
+
+	sw := newStalledWriter(t)
+	lg := logger.NewLogger(50)
+	done := make(chan struct{})
+	go func() {
+		handleNonStreamRequestCtx(context.Background(), sw, testRequest(), lg, "sess", "req")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the non-stream handler blocked on a client that stopped reading")
+	}
+	sw.mu.Lock()
+	deadline := sw.deadline
+	sw.mu.Unlock()
+	if !deadline.IsZero() {
+		t.Fatalf("the write deadline is still armed (%v); a later request on the connection would hit it", deadline)
+	}
+	if !loggedLine(lg, logger.LogTypeErr, "Non-stream", "write") {
+		t.Fatalf("no error line for the failed write; entries: %+v", lg.GetEntries())
 	}
 }
 

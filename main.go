@@ -7757,8 +7757,31 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 
 	// Send response
 	w.Header().Set("Content-Type", "application/json")
-	jsonStr.NewEncoder(w).Encode(anthropicResp)
+	if err := writeNonStreamJSON(w, anthropicResp); err != nil && lg != nil {
+		lg.LogError(fmt.Sprintf("Non-stream response write failed [%s:%s]: %v", sessionID, requestID, err))
+	}
 	return http.StatusOK
+}
+
+// writeNonStreamJSON writes a non-streaming answer under the per-write
+// deadline streaming uses (streamWriteTimeout), so a client that stops reading
+// without closing cannot hold the handler forever. It flushes before clearing
+// the deadline, so the whole answer is written under it and no deadline stays
+// armed for a later request on the same connection. A writer without
+// deadlines answers http.ErrNotSupported, which is ignored.
+func writeNonStreamJSON(w http.ResponseWriter, v any) error {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	if err := jsonStr.NewEncoder(w).Encode(v); err != nil {
+		return err
+	}
+	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
 }
 
 // nonStreamContentBlocks builds the content of a non-streaming answer from the
