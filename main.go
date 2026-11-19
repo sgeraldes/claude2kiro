@@ -212,8 +212,8 @@ type HistoryAssistantMessage struct {
 		ReasoningContent *ReasoningContent `json:"reasoningContent,omitempty"`
 	} `json:"assistantResponseMessage"`
 
-	// turnKeys are the reasoning store keys of this turn: its tool use ids,
-	// then its text. Not sent.
+	// turnKeys are the reasoning store keys of this turn: its tool use ids or,
+	// without one, its text (reasoningScope.keys). Not sent.
 	turnKeys []string
 }
 
@@ -2176,7 +2176,8 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	// conversationId and reuses it across turns while still sending prior turns in
 	// history. Users can disable this for the older proxy behavior of one fresh
 	// random UUID per request.
-	if _, sessionKey := extractSessionID(anthropicReq.Metadata); cfg.Advanced.StableConversationID && sessionKey != "" {
+	_, sessionKey := extractSessionID(anthropicReq.Metadata)
+	if cfg.Advanced.StableConversationID && sessionKey != "" {
 		cwReq.ConversationState.ConversationId = stableConversationID(sessionKey)
 	} else {
 		cwReq.ConversationState.ConversationId = generateUUID()
@@ -2321,6 +2322,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		}
 
 		// All messages except the last one (the last is the current message).
+		// assistantTurn is the position of the next assistant message among
+		// the request's assistant messages: part of its reasoning store key.
+		assistantTurn := 0
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			msg := anthropicReq.Messages[i]
 
@@ -2338,7 +2342,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				} else {
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
-				assistantMsg.turnKeys = reasoningTurnKeys(toolUses, getMessageContent(msg.Content))
+				scope := reasoningScope{session: sessionKey, turn: assistantTurn}
+				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), getMessageContent(msg.Content))
+				assistantTurn++
 				emit("assistant", assistantMsg)
 				continue
 			}
@@ -5114,7 +5120,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	if translator.Emitted() {
 		forward(translator.Finish())
-		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId,
+		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, responseScope(anthropicReq),
 			translator.Reasoning(), translator.ToolUseIDs(), translator.Text())
 
 		if cfg.Advanced.ComparisonMode {
@@ -7645,7 +7651,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	}
 
 	events, summary := parser.ParseEventsWithSummary(cwRespBody)
-	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId,
+	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, responseScope(anthropicReq),
 		summary.Reasoning, summary.ToolUseIDs, summary.Text)
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))

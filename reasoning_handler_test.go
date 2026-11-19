@@ -176,7 +176,7 @@ func TestRejectedSignatureIsResentOnceWithoutReasoning(t *testing.T) {
 			if strings.Contains(bodies[2], "reasoningContent") {
 				t.Fatalf("the resend still carries reasoning:\n%s", bodies[2])
 			}
-			if _, ok := reasoningStore.Get(getKiroModelID(reasoningTestModel), reasoning.ToolKey("tu_e2e")); ok {
+			if _, ok := reasoningStore.Get(getKiroModelID(reasoningTestModel), reasoning.ToolKey("", "tu_e2e")); ok {
 				t.Fatal("the rejected reasoning must be evicted")
 			}
 			if !loggedLine(lg, logger.LogTypeInf, "THINKING_SIGNATURE_INVALID", "without") {
@@ -266,9 +266,10 @@ func TestParallelRequestsOfOneSessionGetTheirOwnReasoning(t *testing.T) {
 	})
 	kiroModel := getKiroModelID(reasoningTestModel)
 	const n = 8
+	const session = "ce40736e-1347-467a-9cce-181e245edd92"
 	for i := 0; i < n; i++ {
 		id := "tu_par" + string(rune('a'+i))
-		rememberResponse(t, kiroModel, toolAnswer("plan "+id, "SIG-"+id, id)...)
+		rememberResponseIn(t, kiroModel, reasoningScope{session: session}, toolAnswer("plan "+id, "SIG-"+id, id)...)
 	}
 
 	var wg sync.WaitGroup
@@ -277,7 +278,7 @@ func TestParallelRequestsOfOneSessionGetTheirOwnReasoning(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			req := toolTurnRequest(reasoningTestModel, "tu_par"+string(rune('a'+i)))
-			req.Metadata = map[string]any{"user_id": `{"session_id":"ce40736e-1347-467a-9cce-181e245edd92"}`}
+			req.Metadata = map[string]any{"user_id": `{"session_id":"` + session + `"}`}
 			if i%2 == 0 {
 				runStream(t, req, logger.NewLogger(50))
 			} else {

@@ -212,18 +212,43 @@ text or a tool call starts a new block that replaces the earlier one. A block
 goes back only when it has text with a signature, or redacted content; unsigned
 reasoning is dropped. When a block has both, the text and signature are sent.
 
-After a successful response the proxy stores the block in memory under each
-`toolUseId` the response emitted, or, when it emitted no tool call, under a
-SHA-256 hash of its assistant text. The entry records the Kiro model id of the
-request (`auto` for `auto`). The store is shared by all sessions, bounded to
-128 MiB in total and evicts the least recently used entries first. It is not
-written to disk: after a restart the next turn simply carries no reasoning and
-the model thinks again.
+After a successful response the proxy stores the block in memory. Every key
+is scoped to the client session, the full session id Claude Code sends in
+`metadata.user_id` (the one the stable `conversationId` is derived from):
+
+- A response that emitted tool calls is stored under session plus each
+  `toolUseId`, and a history turn with tool calls is looked up by those keys
+  only, never by its text.
+- A response with no tool call is stored under a SHA-256 hash of session, the
+  turn's position and its assistant text. The position is the number of
+  assistant messages in the request that produced the response; in a later
+  request it is the turn's index among that request's assistant messages. Both
+  count the client's `messages`, not the history sent to the backend, so a
+  history mode that drops entries does not shift them. Two turns of one
+  session that said the same thing therefore each get their own reasoning.
+- A request with no session id (a client that sends no `metadata`) uses
+  unscoped tool keys only (tool use ids are unique). Its text-only turns are
+  neither stored nor looked up, so two clients without a session never share
+  reasoning.
+
+A response whose reasoning is not stored (unsigned, too large, or the feature
+off) removes whatever an earlier response left under the same keys, so a turn
+can only get reasoning that its own response produced. After the client
+compacts a conversation the positions restart and the summarised turns are
+gone: their entries are simply not found (a miss), and a new turn at a reused
+position replaces the old entry when its response arrives. One residual case
+remains: two conversations that share one session id (for example a subagent,
+if the client sends it under the parent's id) and produce identical text at the same position
+overwrite each other's entry, and the later one wins for both.
+
+The entry records the Kiro model id of the request (`auto` for `auto`). The
+store holds all sessions together, bounded to 128 MiB in total, and evicts the
+least recently used entries first. It is not written to disk: after a restart
+the next turn simply carries no reasoning and the model thinks again.
 
 When the proxy builds a request, it looks up each assistant turn of the history
-(by its first tool use id with an entry, else by the hash of its text) and
-attaches `reasoningContent` only when the entry's model id equals the current
-request's Kiro model id. It attaches newest turns first and stops at the first
+by the keys above and attaches `reasoningContent` only when the entry's model
+id equals the current request's Kiro model id. It attaches newest turns first and stops at the first
 turn whose reasoning would take the request past
 `advanced.reasoning_history_max_bytes` (default 4194304, 4 MiB; text plus
 signature or redacted bytes). `0` turns the feature off: nothing is kept and
@@ -234,7 +259,8 @@ was signed with. A turn with no entry has no `reasoningContent` key at all.
 
 If the backend answers 400 with reason `THINKING_SIGNATURE_INVALID` to a request
 that carries reasoning, the proxy resends it once with every `reasoningContent`
-removed, forgets the turns it had attached and logs one info line starting with
+removed, forgets the turns it had attached (only that request's entries:
+the keys are scoped to its session) and logs one info line starting with
 `THINKING_SIGNATURE_INVALID`. The resend does not count as a retry. A request
 that carries no reasoning and still gets that reason is not resent; the client
 gets a non-retryable error.

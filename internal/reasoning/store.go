@@ -10,6 +10,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -29,12 +31,23 @@ type Entry struct {
 // bound and the per-request cap count.
 func (e Entry) Size() int { return len(e.Text) + len(e.Signature) + len(e.Redacted) }
 
-// ToolKey is the key of the turn that emitted the tool call toolUseID.
-func ToolKey(toolUseID string) string { return "tool:" + toolUseID }
+// ToolKey is the key of the turn that emitted the tool call toolUseID in the
+// client session session. A request without a session gets the unscoped key
+// (session ""): tool use ids are unique on their own.
+func ToolKey(session, toolUseID string) string {
+	if session == "" {
+		return "tool:" + toolUseID
+	}
+	return "tool:" + session + "\x00" + toolUseID
+}
 
-// TextKey is the key of a turn without tool calls, from its assistant text.
-func TextKey(text string) string {
-	sum := sha256.Sum256([]byte(text))
+// TextKey is the key of a turn without tool calls: a hash of the client
+// session, the turn's position among the conversation's assistant turns, and
+// its text without leading and trailing whitespace. Without the session and
+// the position, two conversations (or two turns of one) that said the same
+// thing would share reasoning.
+func TextKey(session string, turn int, text string) string {
+	sum := sha256.Sum256([]byte(session + "\x00" + strconv.Itoa(turn) + "\x00" + strings.TrimSpace(text)))
 	return "text:" + hex.EncodeToString(sum[:])
 }
 
@@ -59,9 +72,10 @@ func NewStore(maxBytes int) *Store {
 }
 
 // Put stores e under every key, replacing any entry stored under one of them.
-// An entry larger than the whole bound is not stored.
+// An entry larger than the whole bound is not stored, but still replaces: the
+// entries under its keys are removed.
 func (s *Store) Put(e Entry, keys ...string) {
-	if len(keys) == 0 || e.Size() > s.maxBytes {
+	if len(keys) == 0 {
 		return
 	}
 	s.mu.Lock()
@@ -70,6 +84,9 @@ func (s *Store) Put(e Entry, keys ...string) {
 		if el, ok := s.byKey[k]; ok {
 			s.remove(el)
 		}
+	}
+	if e.Size() > s.maxBytes {
+		return
 	}
 	el := s.order.PushFront(&item{keys: append([]string(nil), keys...), entry: e})
 	for _, k := range keys {

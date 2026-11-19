@@ -39,37 +39,70 @@ type reasoningAttachment struct {
 	keys  []string // the store keys of those turns, to evict them if rejected
 }
 
-// reasoningTurnKeys are the store keys of an assistant turn: one per tool use
-// id, then the hash of its text. Lookups try them in that order.
-func reasoningTurnKeys(toolUses []HistoryToolUse, text string) []string {
-	var keys []string
+// reasoningScope places an assistant turn: the client session it belongs to
+// and the turn's position among the conversation's assistant messages.
+type reasoningScope struct {
+	session string // extractSessionID's full id; "" when the client sent none
+	turn    int
+}
+
+// responseScope is the scope of the turn a response to req produces: req's
+// session, and the position after req's own assistant messages. The position
+// counts req.Messages, never the history sent to the backend, so a history
+// mode that drops turns does not move it.
+func responseScope(req AnthropicRequest) reasoningScope {
+	_, session := extractSessionID(req.Metadata)
+	scope := reasoningScope{session: session}
+	for _, m := range req.Messages {
+		if m.Role == "assistant" {
+			scope.turn++
+		}
+	}
+	return scope
+}
+
+// keys are the store keys of a turn in this scope. A turn with tool calls is
+// keyed by its tool use ids only. A turn without one is keyed by its text and
+// position, and only within a session: without a session there is nothing to
+// keep two conversations' identical texts apart, so such a turn has no key.
+func (s reasoningScope) keys(toolUseIDs []string, text string) []string {
+	if len(toolUseIDs) > 0 {
+		keys := make([]string, 0, len(toolUseIDs))
+		for _, id := range toolUseIDs {
+			keys = append(keys, reasoning.ToolKey(s.session, id))
+		}
+		return keys
+	}
+	if s.session == "" || strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return []string{reasoning.TextKey(s.session, s.turn, text)}
+}
+
+// historyToolUseIDs are the ids of a history turn's tool calls.
+func historyToolUseIDs(toolUses []HistoryToolUse) []string {
+	ids := make([]string, 0, len(toolUses))
 	for _, tu := range toolUses {
-		keys = append(keys, reasoning.ToolKey(tu.ToolUseId))
+		ids = append(ids, tu.ToolUseId)
 	}
-	if t := strings.TrimSpace(text); t != "" {
-		keys = append(keys, reasoning.TextKey(t))
-	}
-	return keys
+	return ids
 }
 
 // rememberReasoning keeps the reasoning of a successful response produced by
-// kiroModel: under each tool use id the response emitted or, when it emitted
-// none, under the hash of its text. Unsigned reasoning is not kept, and
-// nothing is kept while advanced.reasoning_history_max_bytes is 0.
-func rememberReasoning(kiroModel string, block parser.ReasoningBlock, toolUseIDs []string, text string) {
-	if !block.Forwardable() || config.Get().Advanced.ReasoningHistoryMaxBytes <= 0 {
+// kiroModel for the turn at scope: under each tool use id the response
+// emitted or, when it emitted none, under its text (see reasoningScope.keys).
+// Unsigned reasoning is not kept, and nothing is kept while
+// advanced.reasoning_history_max_bytes is 0. A turn whose reasoning is not
+// kept also forgets what an earlier turn left under the same keys, so a later
+// lookup can never find reasoning this turn did not produce.
+func rememberReasoning(kiroModel string, scope reasoningScope, block parser.ReasoningBlock, toolUseIDs []string, text string) {
+	keys := scope.keys(toolUseIDs, text)
+	if len(keys) == 0 {
 		return
 	}
-	var keys []string
-	for _, id := range toolUseIDs {
-		keys = append(keys, reasoning.ToolKey(id))
-	}
-	if len(keys) == 0 {
-		t := strings.TrimSpace(text)
-		if t == "" {
-			return
-		}
-		keys = []string{reasoning.TextKey(t)}
+	if !block.Forwardable() || config.Get().Advanced.ReasoningHistoryMaxBytes <= 0 {
+		reasoningStore.Evict(keys...)
+		return
 	}
 	reasoningStore.Put(reasoning.Entry{
 		Model:     kiroModel,
@@ -81,7 +114,9 @@ func rememberReasoning(kiroModel string, block parser.ReasoningBlock, toolUseIDs
 
 // attachReasoning sets reasoningContent on the history's assistant turns that
 // have stored reasoning of kiroModel, newest first, and stops before the
-// attached bytes would exceed maxBytes. maxBytes 0 attaches nothing.
+// attached bytes would exceed maxBytes. maxBytes 0 attaches nothing. Each
+// turn is looked up by the keys buildCodeWhispererRequest gave it
+// (reasoningScope.keys), the same keys rememberReasoning stored under.
 func attachReasoning(history []any, kiroModel string, maxBytes int) reasoningAttachment {
 	var att reasoningAttachment
 	if maxBytes <= 0 {
