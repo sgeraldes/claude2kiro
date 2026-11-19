@@ -54,6 +54,8 @@ func TestConcurrentSubagents_DistinctConversationIds(t *testing.T) {
 	// The handler reads the active identity's token itself; give it one in an
 	// isolated home so the test does not depend on the machine's Kiro login.
 	withIdentities(t, map[string]TokenData{"": primaryToken()})
+	// A cold catalog would send ListAvailableModels to the fake backend too.
+	withOfflineCatalog(t)
 
 	cfg := *config.Get()
 	cfg.Advanced.StableConversationID = true
