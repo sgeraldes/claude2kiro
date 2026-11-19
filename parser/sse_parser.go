@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sgeraldes/claude2kiro/internal/debug"
 )
@@ -56,6 +57,50 @@ type assistantResponseEvent struct {
 	Name      string  `json:"name"`
 	ToolUseId string  `json:"toolUseId"`
 	Stop      bool    `json:"stop"`
+	// Reasoning is the text of a reasoningContentEvent ({"text":"..."}). It
+	// is counted, never forwarded to the client.
+	Reasoning string `json:"text,omitempty"`
+	// StopReason is the backend's reason for ending the response, sent in a
+	// frame of its own ({"stopReason":"TOOL_USE"}).
+	StopReason string `json:"stopReason,omitempty"`
+}
+
+// reasoningChars is the number of reasoning characters a frame carries. A
+// frame with assistant content or a tool is not a reasoning frame.
+func (e assistantResponseEvent) reasoningChars() int {
+	if e.Content != "" || e.ToolUseId != "" {
+		return 0
+	}
+	return utf8.RuneCountInString(e.Reasoning)
+}
+
+// backendStopReasons maps the backend's stopReason values to the Anthropic
+// stop_reason.
+var backendStopReasons = map[string]string{
+	"END_TURN":      "end_turn",
+	"TOOL_USE":      "tool_use",
+	"MAX_TOKENS":    "max_tokens",
+	"STOP_SEQUENCE": "stop_sequence",
+}
+
+// AnthropicStopReason maps the backend's stopReason to the Anthropic
+// stop_reason. An absent or unknown value falls back to tool_use when the
+// response used a tool, else end_turn.
+func AnthropicStopReason(backend string, sawTool bool) string {
+	if mapped, ok := backendStopReasons[strings.ToUpper(strings.TrimSpace(backend))]; ok {
+		return mapped
+	}
+	if sawTool {
+		return "tool_use"
+	}
+	return "end_turn"
+}
+
+// ResponseSummary is what a response says besides its content blocks.
+type ResponseSummary struct {
+	StopReason        string // Anthropic stop_reason for the response
+	BackendStopReason string // stopReason as the backend sent it; "" when it sent none
+	ReasoningChars    int    // characters of reasoning text the backend sent
 }
 
 type SSEEvent struct {
@@ -126,8 +171,20 @@ func ParseMeteringEvents(resp []byte) []MeteringEvent {
 	return events
 }
 
+// ParseEvents translates a whole CodeWhisperer response into Anthropic SSE
+// events. See ParseEventsWithSummary.
 func ParseEvents(resp []byte) []SSEEvent {
+	events, _ := ParseEventsWithSummary(resp)
+	return events
+}
+
+// ParseEventsWithSummary translates a whole CodeWhisperer response into
+// Anthropic SSE events and also reports the stop reason and how much reasoning
+// the backend produced. Reasoning, signature, context-usage and metering
+// frames produce no events.
+func ParseEventsWithSummary(resp []byte) ([]SSEEvent, ResponseSummary) {
 	events := []SSEEvent{}
+	var summary ResponseSummary
 
 	// Debug info collection
 	var debugInfo *ParseDebugInfo
@@ -228,6 +285,10 @@ func ParseEvents(resp []byte) []SSEEvent {
 			if evt.ToolUseId != "" && evt.Name != "" {
 				hasToolUse = true
 			}
+			summary.ReasoningChars += evt.reasoningChars()
+			if evt.StopReason != "" {
+				summary.BackendStopReason = evt.StopReason
+			}
 		} else {
 			// Debug: capture parse error
 			if frameDebug != nil {
@@ -241,23 +302,20 @@ func ParseEvents(resp []byte) []SSEEvent {
 		}
 	}
 
-	// Add a single message_delta at the end for ALL responses
-	// - Tool responses get stop_reason: "tool_use"
-	// - Text-only responses get stop_reason: "end_turn"
+	// Add a single message_delta at the end for every response with content.
+	// It carries the backend's stop reason; without one, tool responses get
+	// "tool_use" and text-only responses "end_turn".
 	// Note: hasTextContent is used above to adjust tool indices, ensuring tools start at index 1
 	// when there's text content at index 0
+	summary.StopReason = AnthropicStopReason(summary.BackendStopReason, hasToolUse)
 	if len(events) > 0 {
 		_ = hasTextContent // Used for index adjustment above
-		stopReason := "end_turn"
-		if hasToolUse {
-			stopReason = "tool_use"
-		}
 		events = append(events, SSEEvent{
 			Event: "message_delta",
 			Data: map[string]any{
 				"type": "message_delta",
 				"delta": map[string]any{
-					"stop_reason":   stopReason,
+					"stop_reason":   summary.StopReason,
 					"stop_sequence": nil,
 				},
 				"usage": map[string]any{"output_tokens": 0},
@@ -273,7 +331,7 @@ func ParseEvents(resp []byte) []SSEEvent {
 		writeDebugFile(debugInfo)
 	}
 
-	return events
+	return events, summary
 }
 
 func convertAssistantEventToSSEWithIndex(evt assistantResponseEvent, toolIndices map[string]int, nextToolIndex *int) SSEEvent {

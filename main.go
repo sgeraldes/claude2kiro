@@ -4541,6 +4541,26 @@ func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Dur
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
 // capturedEvents: optional pointer to slice for capturing SSE events (for comparison mode)
+// outputLimitNote is the answer the client gets when the backend stopped at
+// its output limit (stopReason MAX_TOKENS) before producing any content.
+const outputLimitNote = "[Kiro stopped at the output limit before producing an answer]"
+
+// backendStopReasonLabel is how the backend's stopReason appears in log
+// lines: as sent, or "none" when it sent none.
+func backendStopReasonLabel(reason string) string {
+	if reason == "" {
+		return "none"
+	}
+	return reason
+}
+
+// outputLimitLogLine is the error line logged when the backend stopped at
+// its output limit without producing content.
+func outputLimitLogLine(backendStopReason string, reasoningChars, responseBytes int) string {
+	return fmt.Sprintf("Kiro stopped at the output limit before producing an answer: stopReason=%s reasoningChars=%d (%d bytes response)",
+		backendStopReasonLabel(backendStopReason), reasoningChars, responseBytes)
+}
+
 func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	return handleStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID, capturedEvents)
 }
@@ -4982,9 +5002,10 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events, preview=%q (%d bytes), tools=%d",
 				eventCount, textPreview, rawResp.Len(), toolBlockCount))
 		} else {
-			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s",
+			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s stopReason=%s reasoningChars=%d",
 				eventCount, hasTextContent, toolBlockCount > 0, toolBlockCount,
-				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond)))
+				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond),
+				backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars()))
 		}
 
 		sendSSEEvent(w, flusher, "message_delta", map[string]any{
@@ -4993,9 +5014,33 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			"usage": map[string]any{"output_tokens": outputChars / 4},
 		}, capturedEvents)
 		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+	} else if translator.StopReason() == "max_tokens" {
+		// The model spent its whole output budget (on reasoning) before it
+		// wrote anything. Say so in a normal message instead of an error.
+		lg.LogError(outputLimitLogLine(translator.BackendStopReason(), translator.ReasoningChars(), rawResp.Len()))
+		startMessage(len(cwReqBody) / 4)
+		sendSSEEvent(w, flusher, "content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": outputLimitNote},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "max_tokens", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 0},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+		responseText.WriteString(outputLimitNote)
 	} else {
 		// No events parsed - send an empty response to prevent Claude Code from hanging
-		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", rawResp.Len()))
+		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response (stopReason=%s reasoningChars=%d)",
+			rawResp.Len(), backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars()))
 		lg.LogError("Sending empty response due to no parsed events")
 		startMessage(0)
 		contentBlockStart := map[string]any{
@@ -7460,7 +7505,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		os.WriteFile(filepath.Join(debugDir, "last-cw-response.bin"), cwRespBody, 0600)
 	}
 
-	events := parser.ParseEvents(cwRespBody)
+	events, summary := parser.ParseEventsWithSummary(cwRespBody)
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
 	}
@@ -7520,6 +7565,12 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		}
 	}
 
+	if lg != nil {
+		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d [%s:%s]",
+			len(events), textContent != "", toolName != "",
+			backendStopReasonLabel(summary.BackendStopReason), summary.ReasoningChars, sessionID, requestID))
+	}
+
 	// Build content blocks
 	if strings.TrimSpace(textContent) != "" {
 		contexts = append(contexts, map[string]any{
@@ -7538,12 +7589,21 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		})
 	}
 
+	if len(contexts) == 0 && summary.StopReason == "max_tokens" {
+		// The model spent its whole output budget (on reasoning) before it
+		// wrote anything. Say so in a normal message instead of nothing.
+		if lg != nil {
+			lg.LogError(outputLimitLogLine(summary.BackendStopReason, summary.ReasoningChars, len(cwRespBody)))
+		}
+		contexts = append(contexts, map[string]any{"type": "text", "text": outputLimitNote})
+	}
+
 	// Build Anthropic response
 	anthropicResp := map[string]any{
 		"content":       contexts,
 		"model":         anthropicReq.Model,
 		"role":          "assistant",
-		"stop_reason":   "end_turn",
+		"stop_reason":   summary.StopReason,
 		"stop_sequence": nil,
 		"type":          "message",
 		"usage": map[string]any{

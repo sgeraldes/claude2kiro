@@ -54,6 +54,9 @@ type StreamTranslator struct {
 	openTools map[string]bool
 	sawTool   bool
 	emitted   bool
+
+	backendStop    string // stopReason as the backend sent it
+	reasoningChars int    // characters of reasoning text, never forwarded
 }
 
 func NewStreamTranslator() *StreamTranslator {
@@ -61,11 +64,17 @@ func NewStreamTranslator() *StreamTranslator {
 }
 
 // Translate returns the events one frame payload produces. Frames that carry
-// no assistant content (metering, unparseable payloads) produce none.
+// no assistant content (reasoning, signature, stop reason, context usage,
+// metering, unparseable payloads) produce none; the stop reason and the size
+// of the reasoning are recorded.
 func (t *StreamTranslator) Translate(payload []byte) []SSEEvent {
 	var evt assistantResponseEvent
 	if err := json.Unmarshal(payload, &evt); err != nil {
 		return nil
+	}
+	t.reasoningChars += evt.reasoningChars()
+	if evt.StopReason != "" {
+		t.backendStop = evt.StopReason
 	}
 
 	var out []SSEEvent
@@ -135,13 +144,18 @@ func (t *StreamTranslator) Finish() []SSEEvent {
 	return append(t.closeText(), t.closeTools()...)
 }
 
-// StopReason is the Anthropic stop_reason for the response translated so far.
+// StopReason is the Anthropic stop_reason for the response translated so far:
+// the backend's stopReason when it sent a known one, else tool_use when a tool
+// was used and end_turn otherwise.
 func (t *StreamTranslator) StopReason() string {
-	if t.sawTool {
-		return "tool_use"
-	}
-	return "end_turn"
+	return AnthropicStopReason(t.backendStop, t.sawTool)
 }
+
+// BackendStopReason is the stopReason the backend sent, "" when none.
+func (t *StreamTranslator) BackendStopReason() string { return t.backendStop }
+
+// ReasoningChars is the number of reasoning characters the backend sent.
+func (t *StreamTranslator) ReasoningChars() int { return t.reasoningChars }
 
 // Emitted reports whether any frame produced an event.
 func (t *StreamTranslator) Emitted() bool { return t.emitted }
