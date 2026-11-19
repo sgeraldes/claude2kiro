@@ -206,3 +206,48 @@ func TestThinkingModeSettingDefaultsToClientAndApplies(t *testing.T) {
 		t.Fatalf("applied thinking mode = %q, want backend", m.config.Advanced.ThinkingMode)
 	}
 }
+
+// max_concurrent_requests accepts any value from 1 up, like config.yaml: the
+// screen neither caps it nor claims a range it does not enforce.
+func TestMaxConcurrentRequestsSettingHasNoUpperBound(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	var conc *Setting
+	for i := range m.settings[TabNetwork] {
+		if m.settings[TabNetwork][i].Key == "network.max_concurrent_requests" {
+			conc = &m.settings[TabNetwork][i]
+			break
+		}
+	}
+	if conc == nil {
+		t.Fatal("network.max_concurrent_requests setting not found")
+	}
+	if got := clampNumber(*conc, 40); got != 40 {
+		t.Fatalf("clampNumber(40) = %d, want 40 (no upper bound)", got)
+	}
+	if got := clampNumber(*conc, 0); got != 1 {
+		t.Fatalf("clampNumber(0) = %d, want the minimum 1", got)
+	}
+	if strings.Contains(conc.ExtendedHelp.DetailedDesc, "32") {
+		t.Fatalf("help still claims an upper bound: %q", conc.ExtendedHelp.DetailedDesc)
+	}
+
+	m.applySetting(Setting{Key: "network.max_concurrent_requests", Value: "40"})
+	if m.config.Network.MaxConcurrentReqs != 40 {
+		t.Fatalf("applied limit = %d, want 40", m.config.Network.MaxConcurrentReqs)
+	}
+}
+
+// A bounded number setting is still clamped on both sides.
+func TestClampNumberKeepsABoundedRange(t *testing.T) {
+	s := Setting{Type: TypeNumber, Min: 1, Max: 200}
+	if got := clampNumber(s, 500); got != 200 {
+		t.Fatalf("clampNumber(500) = %d, want 200", got)
+	}
+	if got := clampNumber(s, -3); got != 1 {
+		t.Fatalf("clampNumber(-3) = %d, want 1", got)
+	}
+}

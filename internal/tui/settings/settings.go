@@ -550,14 +550,13 @@ func (m *Model) loadSettings() {
 			Description: "Parallel requests to the Kiro backend",
 			Type:        TypeNumber,
 			Value:       fmt.Sprintf("%d", m.config.Network.MaxConcurrentReqs),
-			Min:         1,
-			Max:         32,
+			Min:         1, // no Max: like config.yaml, any value from 1 up
 			Step:        1,
 			ExtendedHelp: ExtendedHelp{
 				DefaultValue:     "4",
 				RecommendedValue: "4",
 				Sensitive:        false,
-				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Range: 1-32.",
+				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Any value from 1 up.",
 			},
 		},
 		{
@@ -1220,15 +1219,8 @@ func (m Model) handleEditing(msg tea.Msg) (Model, tea.Cmd) {
 					m.textInput.Blur()
 					return m, nil
 				} else {
-					// Clamp to range
 					if s.Min != 0 || s.Max != 0 {
-						if v < s.Min {
-							v = s.Min
-						}
-						if v > s.Max {
-							v = s.Max
-						}
-						newValue = fmt.Sprintf("%d", v)
+						newValue = fmt.Sprintf("%d", clampNumber(*s, v))
 					}
 				}
 			}
@@ -1762,8 +1754,11 @@ func (m Model) renderHelpPanel(width, height int) string {
 		lines = append(lines, hintStyle.Render("Options: "+strings.Join(s.Options, ", ")))
 	case TypeNumber:
 		hint := "Press Enter to edit, Up/Down to adjust ±1"
-		if s.Min != 0 || s.Max != 0 {
+		switch {
+		case s.Max != 0:
 			hint += fmt.Sprintf("\nRange: %d - %d", s.Min, s.Max)
+		case s.Min != 0:
+			hint += fmt.Sprintf("\nMinimum: %d", s.Min)
 		}
 		lines = append(lines, hintStyle.Render(hint))
 	case TypeText:
@@ -1906,4 +1901,15 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("esc", "back"),
 		),
 	}
+}
+
+// clampNumber keeps v within the setting's range. Max 0 means no upper bound.
+func clampNumber(s Setting, v int) int {
+	if v < s.Min {
+		v = s.Min
+	}
+	if s.Max != 0 && v > s.Max {
+		v = s.Max
+	}
+	return v
 }

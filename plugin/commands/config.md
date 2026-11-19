@@ -27,7 +27,7 @@ Available settings and their defaults:
 | skip-perms | advanced.skip_permissions | true | Pass --dangerously-skip-permissions to claude |
 | comparison | advanced.comparison_mode | false | Debug: send to both Anthropic and Kiro |
 | direct | advanced.anthropic_direct | false | Bypass: send only to Anthropic |
-| concurrency | network.max_concurrent_requests | 4 | Parallel requests to the Kiro backend (1-32) |
+| concurrency | network.max_concurrent_requests | 4 | Parallel requests to the Kiro backend (1 or more) |
 | max-tools | network.max_tools_per_request | 85 | Max tools sent per request (Kiro limit) |
 
 Steps:
