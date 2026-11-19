@@ -168,6 +168,16 @@ benchmarks prove the trade-off is safe.
   entries + cachePoint entries) are capped at the tool-count limit
   (`network.max_tools_per_request`, default 85) so cachePoints cannot push the array past
   the backend's ~90-tool / ~260KB body limit.
+- **Each tool result is sent once.** A `tool_result` block travels only in
+  `userInputMessageContext.toolResults`. The user message `content` holds that
+  message's own text blocks, and is the empty string when the message has only tool
+  results, which Kiro accepts. This applies to the current message and to every history
+  entry. Before, the result text was also copied into `content`, so a large file read
+  was ingested twice; in one captured request 99,159 of about 340,000 bytes were such
+  copies. `tool_mode: none_text` is unchanged: there the results are plain text in
+  `content` and no structured results are sent. The request log reports
+  `contentChars` (the `content` field) and `toolResultChars` (current tool results)
+  separately.
 - **Native effort passthrough.** Claude Code `output_config.effort` or enabled
   `thinking` is translated to Kiro's
   `additionalModelRequestFields.output_config.effort` for models that advertise an

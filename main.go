@@ -305,7 +305,11 @@ func sanitizeHistoryContent(content string) string {
 	return content
 }
 
-// getMessageContent extracts text content from a message
+// getMessageContent extracts the text blocks of a message. tool_result blocks
+// are skipped: their text travels once, in userInputMessageContext.toolResults
+// (getMessageToolResults). Repeating it here doubled the ingested tokens of
+// every tool-heavy turn. A message holding only tool results yields "", which
+// Kiro accepts when toolResults is present.
 func getMessageContent(content any) string {
 	switch v := content.(type) {
 	case string:
@@ -316,29 +320,11 @@ func getMessageContent(content any) string {
 	case []any:
 		var texts []string
 		hasToolUse := false
-		hasToolResult := false
 		for _, block := range v {
 			if m, ok := block.(map[string]any); ok {
 				// Get the block type
 				blockType, _ := m["type"].(string)
 				switch blockType {
-				case "tool_result":
-					hasToolResult = true
-					// Tool result content can be a string or an array of content blocks
-					if contentStr, ok := m["content"].(string); ok {
-						texts = append(texts, contentStr)
-					} else if contentArr, ok := m["content"].([]any); ok {
-						// Content is an array of blocks - extract text from each
-						for _, innerBlock := range contentArr {
-							if innerMap, ok := innerBlock.(map[string]any); ok {
-								if innerType, _ := innerMap["type"].(string); innerType == "text" {
-									if textVal, ok := innerMap["text"].(string); ok {
-										texts = append(texts, textVal)
-									}
-								}
-							}
-						}
-					}
 				case "text":
 					if textVal, ok := m["text"].(string); ok {
 						texts = append(texts, textVal)
@@ -350,7 +336,6 @@ func getMessageContent(content any) string {
 				}
 			}
 		}
-		_ = hasToolResult // Used for debugging if needed
 		if len(texts) == 0 {
 			if hasToolUse {
 				// Tool-only message - return empty content
@@ -1849,8 +1834,17 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		convID = convID[:8]
 	}
 
+	// contentChars counts the content field only; tool result text is sent once,
+	// in toolResults, and is counted separately.
+	toolResultChars := 0
+	for _, result := range context.ToolResults {
+		for _, c := range result.Content {
+			toolResultChars += len(c.Text)
+		}
+	}
+
 	return fmt.Sprintf(
-		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v",
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v",
 		convID,
 		current.ModelId,
 		reqBytes,
@@ -1859,6 +1853,7 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		len(context.Tools),
 		len(context.ToolResults),
 		len(current.Content),
+		toolResultChars,
 		historyMode,
 		toolMode,
 		advanced.AggressiveCachePoints,
