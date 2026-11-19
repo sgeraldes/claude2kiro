@@ -1359,7 +1359,9 @@ var nativeEffortEnums = map[string][]string{
 
 // effortLevelsFor returns the reasoning effort levels kiroModel accepts. It
 // reads them from the live model catalog, which publishes them per model, and
-// only uses the static table when the catalog does not know the model.
+// only uses the static table when the catalog does not know the model. The
+// live catalog is authoritative: a model it lists without an effort schema gets
+// no effort, even when the static table has an entry for it.
 func effortLevelsFor(kiroModel string) []string {
 	if levels, known := modelCatalog.EffortLevels(kiroModel); known {
 		return levels
