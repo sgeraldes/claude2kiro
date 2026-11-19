@@ -337,6 +337,40 @@ func Set(cfg *Config) {
 	currentMu.Lock()
 	current = cfg
 	currentMu.Unlock()
+
+	changeMu.Lock()
+	fns := make([]func(), 0, len(changeFns))
+	for _, fn := range changeFns {
+		fns = append(fns, fn)
+	}
+	changeMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// Change listeners, called after every Set. A reader that parks on a value from
+// the config (the concurrency limiter's waiters) registers one so a live change
+// reaches it at once instead of at its next unrelated wake-up.
+var (
+	changeMu   sync.Mutex
+	changeNext int
+	changeFns  = map[int]func(){}
+)
+
+// OnChange registers fn to run after every Set, outside the config lock, and
+// returns a function that removes it.
+func OnChange(fn func()) (remove func()) {
+	changeMu.Lock()
+	id := changeNext
+	changeNext++
+	changeFns[id] = fn
+	changeMu.Unlock()
+	return func() {
+		changeMu.Lock()
+		delete(changeFns, id)
+		changeMu.Unlock()
+	}
 }
 
 // Reload reloads configuration from file

@@ -660,6 +660,15 @@ func (l *kiroLimiter) acquireCtx(ctx context.Context) bool {
 		l.mu.Unlock()
 	})
 	defer stop()
+	// The waiters re-read the limit only when woken, so a live change of
+	// max_concurrent_requests (settings screen, dashboard: both go through
+	// config.Set) wakes them too; a raised limit admits them at once.
+	removeListener := config.OnChange(func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer removeListener()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()

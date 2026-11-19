@@ -115,6 +115,43 @@ func TestKiroLimiterDoneContextTakesNoSlot(t *testing.T) {
 	}
 }
 
+// Raising the limit live admits a request already parked at the old limit,
+// without waiting for some other request to finish.
+func TestKiroLimiterRaiseLimitWakesWaiter(t *testing.T) {
+	prev := config.Get()
+	cfg := *prev
+	cfg.Network.MaxConcurrentReqs = 1
+	config.Set(&cfg)
+	t.Cleanup(func() { config.Set(prev) })
+
+	l := newKiroLimiter()
+	if !l.acquireCtx(context.Background()) {
+		t.Fatal("the first acquire must get the free slot")
+	}
+	defer l.release()
+
+	admitted := make(chan bool, 1)
+	go func() { admitted <- l.acquireCtx(context.Background()) }()
+	select {
+	case <-admitted:
+		t.Fatal("the second acquire should wait at limit=1")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	raised := cfg
+	raised.Network.MaxConcurrentReqs = 2
+	config.Set(&raised)
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("the waiter must take the new slot")
+		}
+		l.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("raising the limit did not admit the parked waiter")
+	}
+}
+
 // TestKiroLimiterLowerLimitLive verifies that lowering the limit while requests
 // are in flight makes new acquires wait until the in-flight count drains below
 // the new (smaller) limit — the throttle-under-load path.

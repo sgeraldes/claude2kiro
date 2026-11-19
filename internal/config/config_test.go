@@ -117,3 +117,22 @@ func TestAuthBlockIsOmittedWhenEmpty(t *testing.T) {
 		t.Fatalf("an empty auth block must not be written:\n%s", data)
 	}
 }
+
+// A listener runs on every Set until it is removed.
+func TestOnChangeRunsOnSetUntilRemoved(t *testing.T) {
+	prev := Get()
+	t.Cleanup(func() { Set(prev) })
+
+	calls := 0
+	remove := OnChange(func() { calls++ })
+	next := *prev
+	Set(&next)
+	if calls != 1 {
+		t.Fatalf("calls after one Set = %d, want 1", calls)
+	}
+	remove()
+	Set(&next)
+	if calls != 1 {
+		t.Fatalf("calls after removal = %d, want still 1", calls)
+	}
+}
