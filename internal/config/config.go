@@ -76,11 +76,12 @@ type DisplayConfig struct {
 
 // NetworkConfig holds network-related settings
 type NetworkConfig struct {
-	HTTPTimeout           time.Duration `yaml:"http_timeout"`
-	TokenRefreshThreshold time.Duration `yaml:"token_refresh_threshold"`
-	StreamingDelayMax     time.Duration `yaml:"streaming_delay_max"`
-	MaxConcurrentReqs     int           `yaml:"max_concurrent_requests"` // Max parallel requests to Kiro backend
-	MaxToolsPerRequest    int           `yaml:"max_tools_per_request"`   // Max tools sent per request (Kiro limit)
+	HTTPTimeout             time.Duration `yaml:"http_timeout"`
+	TokenRefreshThreshold   time.Duration `yaml:"token_refresh_threshold"`
+	StreamingDelayMax       time.Duration `yaml:"streaming_delay_max"`
+	MaxConcurrentReqs       int           `yaml:"max_concurrent_requests"`   // Max parallel requests to Kiro backend
+	MaxToolsPerRequest      int           `yaml:"max_tools_per_request"`     // Max tools sent per request (Kiro limit)
+	StreamKeepaliveInterval time.Duration `yaml:"stream_keepalive_interval"` // Ping a streaming client after this much silence (0 = no pings)
 }
 
 // AdvancedConfig holds advanced/API settings
@@ -159,11 +160,12 @@ func Default() *Config {
 			TruncateBase64:     true,      // Replace base64 blobs with placeholders
 		},
 		Network: NetworkConfig{
-			HTTPTimeout:           30 * time.Second,
-			TokenRefreshThreshold: 5 * time.Minute,
-			StreamingDelayMax:     0,  // No artificial delay - Claude Code handles rendering pacing
-			MaxConcurrentReqs:     4,  // Max parallel requests to Kiro backend
-			MaxToolsPerRequest:    85, // Kiro rejects requests with ~95+ tools
+			HTTPTimeout:             30 * time.Second,
+			TokenRefreshThreshold:   5 * time.Minute,
+			StreamingDelayMax:       0,                // No artificial delay - Claude Code handles rendering pacing
+			MaxConcurrentReqs:       4,                // Max parallel requests to Kiro backend
+			MaxToolsPerRequest:      85,               // Kiro rejects requests with ~95+ tools
+			StreamKeepaliveInterval: 15 * time.Second, // Keeps a client from giving up while Kiro is silent
 		},
 		Advanced: AdvancedConfig{
 			CodeWhispererEndpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",

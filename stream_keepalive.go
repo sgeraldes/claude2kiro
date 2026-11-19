@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-// streamKeepaliveInterval is how long a streaming response may stay silent
-// before the proxy sends the client a ping. The backend can spend minutes
-// before its first byte; a client that hears nothing for that long gives up
-// and resends the whole request while the first one is still running.
-var streamKeepaliveInterval = 15 * time.Second
+// How long a streaming response may stay silent before the proxy pings the
+// client is network.stream_keepalive_interval (default 15s, 0 = no pings). The
+// backend can spend minutes before its first byte; a client that hears nothing
+// for that long gives up and resends the whole request while the first one is
+// still running.
 
 const sseKeepalivePing = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
 

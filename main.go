@@ -4502,7 +4502,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 // handleStreamRequestCtx answers a streaming request. Events are forwarded as
 // the backend produces them, the client gets a ping whenever the stream has
-// been silent for streamKeepaliveInterval, and ctx (the client's request
+// been silent for network.stream_keepalive_interval, and ctx (the client's request
 // context) cancels the backend request when the client goes away.
 func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	// Set SSE headers
@@ -4519,7 +4519,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 	// From here on every write goes through the keepalive writer, which also
 	// pings the client while the backend is silent.
-	keepalive := newKeepaliveWriter(w, rawFlusher, streamKeepaliveInterval)
+	keepalive := newKeepaliveWriter(w, rawFlusher, config.Get().Network.StreamKeepaliveInterval)
 	defer keepalive.stop()
 	w = keepalive
 	var flusher http.Flusher = keepalive

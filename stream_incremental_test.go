@@ -50,11 +50,13 @@ func waitForBody(t *testing.T, rec *liveRecorder, want string) {
 	t.Fatalf("the client never received %q; body so far:\n%s", want, rec.String())
 }
 
+// withKeepaliveInterval sets network.stream_keepalive_interval on top of the
+// current config, so call it after streamTestSetup.
 func withKeepaliveInterval(t *testing.T, d time.Duration) {
 	t.Helper()
-	orig := streamKeepaliveInterval
-	streamKeepaliveInterval = d
-	t.Cleanup(func() { streamKeepaliveInterval = orig })
+	cfg := *config.Get()
+	cfg.Network.StreamKeepaliveInterval = d
+	withConfig(t, &cfg)
 }
 
 func streamTestSetup(t *testing.T, backend http.HandlerFunc) {
@@ -113,12 +115,12 @@ func TestStreamForwardsEventsBeforeTheBackendFinishes(t *testing.T) {
 
 // While the backend says nothing, the client keeps receiving pings.
 func TestStreamSendsPingsWhileTheBackendIsSilent(t *testing.T) {
-	withKeepaliveInterval(t, 20*time.Millisecond)
 	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 		w.Write(cwFrame(`{"content":"LATE"}`))
 	})
+	withKeepaliveInterval(t, 20*time.Millisecond)
 
 	rec := newLiveRecorder()
 	handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
@@ -135,6 +137,28 @@ func TestStreamSendsPingsWhileTheBackendIsSilent(t *testing.T) {
 		if len(lines) != 2 || !strings.HasPrefix(lines[0], "event: ") || !strings.HasPrefix(lines[1], "data: ") {
 			t.Fatalf("malformed SSE frame %q in body:\n%s", frame, body)
 		}
+	}
+}
+
+// stream_keepalive_interval 0 turns the silence pings off: the only ping is
+// the one that follows message_start.
+func TestStreamKeepaliveIntervalZeroSendsNoSilencePings(t *testing.T) {
+	streamTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		w.Write(cwFrame(`{"content":"LATE"}`))
+	})
+	withKeepaliveInterval(t, 0)
+
+	rec := newLiveRecorder()
+	handleStreamRequestWithLogger(rec, testRequest(), logger.NewLogger(50), "sess", "req", nil)
+
+	body := rec.String()
+	if !strings.HasPrefix(body, "event: message_start\n") {
+		t.Fatalf("with pings off the body must open with message_start:\n%s", body)
+	}
+	if n := strings.Count(body, "event: ping\n"); n != 1 {
+		t.Fatalf("pings = %d, want only the one after message_start:\n%s", n, body)
 	}
 }
 

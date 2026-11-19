@@ -136,7 +136,7 @@ A streaming request (`"stream": true`) is forwarded frame by frame. `parser.Read
 
 - Blocks get their index in arrival order. A text block is closed before a tool block starts, and text that arrives after a tool opens a new block.
 - `message_start` goes out with the first content frame. `message_delta` and `message_stop` close the response when the backend stream ends.
-- While the stream is silent the proxy sends a `ping` event every 15 seconds, including the time before the backend's first byte. Without it, a client that hears nothing for minutes gives up and resends the whole request while the first one is still running.
+- While the stream is silent the proxy sends a `ping` event every `network.stream_keepalive_interval` (default 15s, `0` turns the pings off), including the time before the backend's first byte. The value is read when a request starts, so a change in the settings screen applies to the next request. Without the pings, a client that hears nothing for minutes gives up and resends the whole request while the first one is still running.
 - When the client disconnects, the backend request is cancelled (streaming and non-streaming). It stops consuming credits and frees its slot in `max_concurrent_requests`.
 - The log line `Parser: N events, ... queueWait=… firstEvent=…` shows how long the request waited for a concurrency slot and how long the backend took to produce its first content.
 
