@@ -206,7 +206,14 @@ type HistoryAssistantMessage struct {
 	AssistantResponseMessage struct {
 		Content  string `json:"content"`
 		ToolUses []any  `json:"toolUses"`
+		// ReasoningContent is the model's own reasoning for this turn, kept
+		// by the proxy and given back (see reasoning_history.go).
+		ReasoningContent *ReasoningContent `json:"reasoningContent,omitempty"`
 	} `json:"assistantResponseMessage"`
+
+	// turnKeys are the reasoning store keys of this turn: its tool use ids,
+	// then its text. Not sent.
+	turnKeys []string
 }
 
 // AnthropicRequest represents the Anthropic API request structure
@@ -569,6 +576,9 @@ type CodeWhispererRequest struct {
 	} `json:"conversationState"`
 	ProfileArn                   string                        `json:"profileArn,omitempty"`
 	AdditionalModelRequestFields *AdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
+
+	// reasoning is what attachReasoning put in the history. Not sent.
+	reasoning reasoningAttachment
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
@@ -1950,7 +1960,7 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 	}
 
 	return fmt.Sprintf(
-		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v",
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d",
 		convID,
 		current.ModelId,
 		reqBytes,
@@ -1963,6 +1973,8 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		historyMode,
 		toolMode,
 		advanced.AggressiveCachePoints,
+		cwReq.reasoning.turns,
+		cwReq.reasoning.bytes,
 	)
 }
 
@@ -2312,6 +2324,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				} else {
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
+				assistantMsg.turnKeys = reasoningTurnKeys(toolUses, getMessageContent(msg.Content))
 				emit("assistant", assistantMsg)
 				continue
 			}
@@ -2336,6 +2349,13 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		cfgCopy.HistoryMode = historyMode
 		systemPrefix := 2 * len(anthropicReq.System) // user+assistant pair per system message
 		cwReq.ConversationState.History = applyHistoryModeWithToolResultProtection(history, cfgCopy, currentToolResults, systemPrefix)
+
+		// Give the backend its own reasoning back on the turns that remain.
+		// In none_text mode the history holds tool calls as text, not what the
+		// reasoning was signed with, so nothing is attached there.
+		if toolMode != "none_text" {
+			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes)
+		}
 	}
 
 	return cwReq

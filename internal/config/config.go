@@ -107,8 +107,16 @@ type AdvancedConfig struct {
 	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
 	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
 	ThinkingMode          string `yaml:"thinking_mode"`           // Who decides the model's thinking: client (translate the client's thinking field, default) or backend (send none, the backend default applies)
-	Profile               string `yaml:"profile"`                 // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+	// ReasoningHistoryMaxBytes caps the reasoning the proxy gives back to the
+	// backend in one request's history, newest turns first (default 4 MiB). 0
+	// turns the feature off: no reasoning is kept or sent back.
+	ReasoningHistoryMaxBytes int    `yaml:"reasoning_history_max_bytes"`
+	Profile                  string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
 }
+
+// DefaultReasoningHistoryMaxBytes is the default of
+// AdvancedConfig.ReasoningHistoryMaxBytes, 4 MiB.
+const DefaultReasoningHistoryMaxBytes = 4 << 20
 
 // Values of AdvancedConfig.ThinkingMode.
 const (
@@ -201,6 +209,8 @@ func Default() *Config {
 			ToolCompactMaxChars:   1024,
 			AggressiveCachePoints: false,
 			ThinkingMode:          ThinkingModeClient,
+
+			ReasoningHistoryMaxBytes: DefaultReasoningHistoryMaxBytes,
 		},
 	}
 }

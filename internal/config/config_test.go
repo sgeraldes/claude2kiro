@@ -54,6 +54,26 @@ func TestThinkingModeDefaultsToClientAndFallsBackToIt(t *testing.T) {
 	}
 }
 
+func TestReasoningHistoryMaxBytesDefaultsTo4MiBAndZeroStaysZero(t *testing.T) {
+	if got := Default().Advanced.ReasoningHistoryMaxBytes; got != 4194304 {
+		t.Fatalf("reasoning_history_max_bytes default = %d, want 4194304", got)
+	}
+	cfg := Default()
+	if err := yaml.Unmarshal([]byte("advanced:\n  stable_conversation_id: true\n"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Advanced.ReasoningHistoryMaxBytes; got != 4194304 {
+		t.Fatalf("a config without the key read as %d, want the default", got)
+	}
+	cfg = Default()
+	if err := yaml.Unmarshal([]byte("advanced:\n  reasoning_history_max_bytes: 0\n"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Advanced.ReasoningHistoryMaxBytes; got != 0 {
+		t.Fatalf("reasoning_history_max_bytes 0 read as %d, want 0 (feature off)", got)
+	}
+}
+
 func TestAuthFallbackProfilesParseAndDefaultEmpty(t *testing.T) {
 	if got := Default().Auth.FallbackProfiles; len(got) != 0 {
 		t.Fatalf("default fallback profiles must be empty, got %v", got)

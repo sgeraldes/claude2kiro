@@ -154,6 +154,33 @@ func TestRequestDietSettingsDefaultConservativeAndApply(t *testing.T) {
 	}
 }
 
+func TestReasoningHistoryMaxBytesSettingDefaultsAndApplies(t *testing.T) {
+	orig := config.Get()
+	config.Set(config.Default())
+	t.Cleanup(func() { config.Set(orig) })
+
+	m := New(120, 40, false)
+	s := findAdvancedSetting(m, "advanced.reasoning_history_max_bytes")
+	if s == nil {
+		t.Fatal("advanced.reasoning_history_max_bytes setting not found")
+	}
+	if s.Type != TypeNumber {
+		t.Fatalf("setting type = %v, want TypeNumber", s.Type)
+	}
+	if s.Value != "4194304" || s.ExtendedHelp.DefaultValue != "4194304" {
+		t.Fatalf("value = %q default = %q, want 4194304", s.Value, s.ExtendedHelp.DefaultValue)
+	}
+
+	m.applySetting(Setting{Key: "advanced.reasoning_history_max_bytes", Value: "0"})
+	if m.config.Advanced.ReasoningHistoryMaxBytes != 0 {
+		t.Fatalf("applied value = %d, want 0", m.config.Advanced.ReasoningHistoryMaxBytes)
+	}
+	m.applySetting(Setting{Key: "advanced.reasoning_history_max_bytes", Value: "-5"})
+	if m.config.Advanced.ReasoningHistoryMaxBytes != 0 {
+		t.Fatalf("a negative value must be ignored, got %d", m.config.Advanced.ReasoningHistoryMaxBytes)
+	}
+}
+
 func TestThinkingModeSettingDefaultsToClientAndApplies(t *testing.T) {
 	orig := config.Get()
 	config.Set(config.Default())

@@ -808,6 +808,21 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "client sends Kiro the thinking the client asked for: off when the client sent no thinking field (claude2kiro run turns it off), adaptive when it asked for thinking. A model whose catalog entry cannot turn thinking off keeps the backend default. backend never sends a thinking field, so Kiro applies its default, which is adaptive thinking on: slower and more credits per request.",
 			},
 		},
+		{
+			Key:         "advanced.reasoning_history_max_bytes",
+			Label:       "Reasoning History Bytes",
+			Description: "Max reasoning bytes given back per request",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.ReasoningHistoryMaxBytes),
+			Min:         0,
+			Max:         128 << 20,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     strconv.Itoa(config.DefaultReasoningHistoryMaxBytes),
+				RecommendedValue: strconv.Itoa(config.DefaultReasoningHistoryMaxBytes),
+				Sensitive:        false,
+				DetailedDesc:     "The proxy keeps the model's reasoning (in memory, lost on restart) and gives it back to Kiro in the history of later turns, as the Kiro IDE does, so the model does not plan every step again. This caps the reasoning bytes one request carries, newest turns first. 0 turns the feature off. Range: 0-134217728.",
+			},
+		},
 	}
 }
 
@@ -968,6 +983,10 @@ func (m *Model) applySetting(s Setting) {
 		m.config.Advanced.AggressiveCachePoints = stringToBool(s.Value)
 	case "advanced.thinking_mode":
 		m.config.Advanced.ThinkingMode = s.Value
+	case "advanced.reasoning_history_max_bytes":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.ReasoningHistoryMaxBytes = v
+		}
 	}
 }
 
