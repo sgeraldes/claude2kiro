@@ -172,7 +172,7 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro login` | Open the browser-based login flow |
 | `claude2kiro read` | Show saved token information |
 | `claude2kiro refresh` | Refresh the current token |
-| `claude2kiro export` | Print environment variables for manual proxy usage |
+| `claude2kiro export [--show-token]` | Print environment variables for manual proxy usage (see below) |
 | `claude2kiro claude` | Configure Claude Code globally |
 | `claude2kiro run [args...]` | Start proxy and launch Claude Code (installs Claude Code if missing) |
 | `claude2kiro remote [args...]` | Launch Claude Code against an already-running proxy |
@@ -182,6 +182,20 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro update` | Download the latest release |
 | `claude2kiro doctor [--json] [--offline]` | Read-only health report (see [Troubleshooting](#claude2kiro-doctor)) |
 | `claude2kiro logout` | Remove saved credentials |
+
+### `claude2kiro export`
+
+Prints the variables that point a shell at a running proxy. The API key it prints is the
+proxy key `claude2kiro`: the proxy signs each request with your Kiro token itself and does
+not read the client's key, so your access token never needs to be on screen or in shell
+history. On Linux and macOS the output can go straight to `eval`:
+
+```bash
+eval "$(claude2kiro export)"
+```
+
+`claude2kiro export --show-token` prints the Kiro access token as the API key instead, for
+tools that want the real token. Treat that output as a secret.
 
 ## Update flow
 
