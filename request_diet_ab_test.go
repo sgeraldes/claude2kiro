@@ -45,6 +45,7 @@ func TestRequestDietControlledABReplay(t *testing.T) {
 	metrics := make(map[string]requestDietReplayMetrics, len(profiles))
 	for _, profile := range profiles {
 		cfg := config.Default()
+		// Explicit, so a change to the default cannot move the 85 and 43 expectations.
 		cfg.Network.MaxToolsPerRequest = 85
 		cfg.Advanced.HistoryMode = profile.historyMode
 		cfg.Advanced.HistoryRecentTurns = profile.recentTurns

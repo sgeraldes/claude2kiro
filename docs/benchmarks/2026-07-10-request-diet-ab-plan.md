@@ -42,7 +42,7 @@ The test restores the global config when it ends. Run it with:
 & "C:/Program Files/Go/bin/go.exe" test . -run TestRequestDietControlledABReplay -v -count=1
 ```
 
-On 2026-11-20 (v1.11.0) it logged: control 240,747 bytes and 59 history entries; candidate 132,543 bytes (45% less) and 37 entries; aggressive cache points 141,627 bytes with 43 tool definitions and 42 cache points.
+On 2026-11-20 (v1.11.0) it logged: control 240,747 bytes and 59 history entries; candidate 132,543 bytes (44.9% less) and 37 entries; aggressive cache points 141,627 bytes with 43 tool definitions and 42 cache points.
 
 The replay proves translation correctness and wire size only. It says nothing about credits, latency, tool choice or answer quality.
 
