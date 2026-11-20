@@ -52,6 +52,10 @@ claude2kiro login idc d5
 claude2kiro login idc my-company
 ```
 
+GitHub and Google use Kiro's device authorization: the terminal prints a short code and an
+`app.kiro.dev` link, you approve the code in the browser, and the login finishes on its own
+(no local callback port is involved).
+
 `--no-browser` prints the sign-in URL instead of opening the default browser, so a second
 identity can be signed in from a private window while the default browser holds the first
 one's session. Set `CLAUDE2KIRO_PROFILE=<name>` to keep that identity's token, login
@@ -72,6 +76,10 @@ It:
 - prepares the Claude Code environment
 - installs or refreshes the local plugin
 - launches Claude Code using your Kiro-backed access
+
+Arguments after `run` go to Claude Code unchanged, so `claude2kiro run --resume <session-id>`
+resumes a previous Claude Code session. The resume-first spelling
+`claude2kiro --resume <session-id> run [claude args...]` is accepted too and means the same.
 
 <p align="center">
   <img src="images/claude-code-using-proxy-light.png" alt="Claude Code running through Claude2Kiro" width="900" />

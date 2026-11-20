@@ -74,21 +74,6 @@ type TokenData struct {
 	LoginID string `json:"loginId,omitempty"`
 }
 
-// CreateTokenRequest represents the request to exchange auth code for tokens
-type CreateTokenRequest struct {
-	Code         string `json:"code"`
-	CodeVerifier string `json:"code_verifier"`
-	RedirectUri  string `json:"redirect_uri"`
-}
-
-// CreateTokenResponse represents the response from token exchange (Kiro social auth uses camelCase)
-type CreateTokenResponse struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ProfileArn   string `json:"profileArn,omitempty"`
-	ExpiresIn    int    `json:"expiresIn"`
-}
-
 // SSO OIDC types for Identity Center authentication
 
 // SSOClientRegistration represents cached client registration
@@ -2443,6 +2428,13 @@ func main() {
 	// set changes (fires on the first fetch and on every subsequent change).
 	modelCatalog.SetOnChange(updateModelsDoc)
 
+	var err error
+	os.Args, err = normalizeRunInvocation(os.Args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	if len(os.Args) < 2 {
 		// No arguments - launch TUI
 		runTUI()
@@ -2648,6 +2640,45 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+// normalizeRunInvocation accepts resume-first syntax while keeping the
+// established command-first form intact:
+//
+//	claude2kiro --resume <session-id> run [claude args...]
+//	claude2kiro --resume=<session-id> run [claude args...]
+//
+// Internally it becomes `claude2kiro run --resume <session-id> ...`, so the
+// existing run path forwards the Claude flags unchanged.
+func normalizeRunInvocation(args []string) ([]string, error) {
+	if len(args) < 2 {
+		return args, nil
+	}
+	usage := fmt.Errorf("usage: claude2kiro --resume <session-id> run [claude args...]")
+	var session string
+	var rest []string
+	switch {
+	case args[1] == "--resume":
+		if len(args) < 4 || args[3] != "run" {
+			return nil, usage
+		}
+		session, rest = args[2], args[4:]
+	case strings.HasPrefix(args[1], "--resume="):
+		if len(args) < 3 || args[2] != "run" {
+			return nil, usage
+		}
+		session, rest = strings.TrimPrefix(args[1], "--resume="), args[3:]
+	default:
+		return args, nil
+	}
+	if session == "" {
+		return nil, usage
+	}
+
+	normalized := make([]string, 0, len(rest)+4)
+	normalized = append(normalized, args[0], "run", "--resume", session)
+	normalized = append(normalized, rest...)
+	return normalized, nil
 }
 
 // ensureClaudeConfig seeds ~/.claude.json so Claude Code works through the
@@ -3851,6 +3882,8 @@ func printUsage() {
 	fmt.Println("  claude2kiro export         - Export environment variables")
 	fmt.Println("  claude2kiro disable        - Remove Claude2Kiro Claude Code/Desktop integrations")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
+	fmt.Println("    Args go to Claude Code: 'run --resume <session-id>' resumes a session;")
+	fmt.Println("    'claude2kiro --resume <session-id> run [args...]' means the same")
 	fmt.Println("  claude2kiro desktop             - Ensure proxy is up + launch Claude Desktop (Windows)")
 	fmt.Println("  claude2kiro remote [args...]     - Connect to running proxy (start TUI first)")
 	fmt.Println("  claude2kiro update              - Self-update to latest GitHub release")
@@ -6119,167 +6152,191 @@ func joinInts(ns []int) string {
 	return strings.Join(parts, ", ")
 }
 
-// loginSocial performs browser-based OAuth login with GitHub or Google
+type socialDeviceAuthorization struct {
+	DeviceCode              string `json:"deviceCode"`
+	ExpiresInMilliseconds   int    `json:"expiresInMilliseconds"`
+	IntervalInMilliseconds  int    `json:"intervalInMilliseconds"`
+	UserCode                string `json:"userCode"`
+	VerificationURI         string `json:"verificationUri"`
+	VerificationURIComplete string `json:"verificationUriComplete"`
+}
+
+type socialDevicePollResponse struct {
+	AccessToken      string `json:"accessToken"`
+	RefreshToken     string `json:"refreshToken"`
+	ProfileArn       string `json:"profileArn"`
+	IdentityProvider string `json:"identityProvider"`
+	Status           string `json:"status"`
+	ExpiresIn        int    `json:"expiresIn"`
+}
+
+// deviceStatusError is a non-200 answer from the device authorization service.
+type deviceStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *deviceStatusError) Error() string {
+	return fmt.Sprintf("request failed (status %d): %s", e.Status, e.Body)
+}
+
+func postSocialDeviceJSON(ctx context.Context, client *http.Client, endpoint string, payload any, result any) error {
+	body, err := jsonStr.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", kiroide.UserAgent())
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &deviceStatusError{Status: resp.StatusCode, Body: string(responseBody)}
+	}
+	if err := jsonStr.Unmarshal(responseBody, result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+func startSocialDeviceAuthorization(client *http.Client, endpoint, provider string) (socialDeviceAuthorization, error) {
+	var auth socialDeviceAuthorization
+	err := postSocialDeviceJSON(context.Background(), client, endpoint+"/oauth/device/authorization", map[string]string{
+		"clientId":      "kiro-cli",
+		"loginProvider": provider,
+	}, &auth)
+	if err != nil {
+		return auth, err
+	}
+	if auth.DeviceCode == "" || auth.UserCode == "" || auth.VerificationURIComplete == "" {
+		return auth, fmt.Errorf("device authorization response is incomplete")
+	}
+	return auth, nil
+}
+
+func pollSocialDeviceAuthorization(ctx context.Context, client *http.Client, endpoint, deviceCode string) (socialDevicePollResponse, error) {
+	var poll socialDevicePollResponse
+	err := postSocialDeviceJSON(ctx, client, endpoint+"/oauth/device/poll", map[string]string{
+		"clientId":   "kiro-cli",
+		"deviceCode": deviceCode,
+	}, &poll)
+	return poll, err
+}
+
+// loginSocial uses Kiro's device authorization flow. Unlike the legacy PKCE
+// portal, it does not depend on a localhost redirect URI accepted by the web
+// application and is the supported fallback exposed by kiro-cli.
 func loginSocial(provider string) {
 	fmt.Printf("Starting login with %s...\n", provider)
-
-	// Generate PKCE values
-	codeVerifier, codeChallenge, err := generatePKCE()
+	client := &http.Client{Timeout: 30 * time.Second}
+	auth, err := startSocialDeviceAuthorization(client, kiroAuthEndpoint, provider)
 	if err != nil {
-		fmt.Printf("Failed to generate PKCE: %v\n", err)
+		fmt.Printf("Failed to start device authorization: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Generate state for CSRF protection
-	state, err := generateState()
-	if err != nil {
-		fmt.Printf("Failed to generate state: %v\n", err)
-		os.Exit(1)
+	fmt.Printf("Authorization code: %s\n", auth.UserCode)
+	if !noBrowser {
+		fmt.Printf("Opening the browser. If it doesn't open, visit:\n%s\n\n", auth.VerificationURIComplete)
 	}
-
-	// Find available port and start local callback server
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		fmt.Printf("Failed to start callback server: %v\n", err)
-		os.Exit(1)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectUri := fmt.Sprintf("http://127.0.0.1:%d/oauth/callback", port)
-
-	fmt.Printf("Callback server started on port %d\n", port)
-
-	// Channel to receive the auth code
-	authCodeChan := make(chan string, 1)
-	errChan := make(chan error, 1)
-	// The first terminal result wins; a stray or repeated callback after it
-	// must not block its handler (Shutdown waits for handlers) nor the login.
-	outcome := &loginOutcome{}
-	fail := loginFailer(outcome, errChan)
-	deliver := loginDeliverer(outcome, authCodeChan)
-
-	// Create HTTP server for callback with local mux (avoid polluting DefaultServeMux)
-	mux := http.NewServeMux()
-	server := &http.Server{Handler: mux}
-	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
-		// Validate state
-		receivedState := r.URL.Query().Get("state")
-		if receivedState != state {
-			fail(fmt.Errorf("state mismatch: expected %s, got %s", state, receivedState))
-			http.Error(w, "Invalid state parameter", http.StatusBadRequest)
-			return
-		}
-
-		// Check for error
-		if errParam := r.URL.Query().Get("error"); errParam != "" {
-			errDesc := r.URL.Query().Get("error_description")
-			fail(fmt.Errorf("OAuth error: %s - %s", errParam, errDesc))
-			http.Error(w, fmt.Sprintf("Authentication failed: %s", errDesc), http.StatusBadRequest)
-			return
-		}
-
-		// Get auth code
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			fail(fmt.Errorf("no authorization code received"))
-			http.Error(w, "No authorization code received", http.StatusBadRequest)
-			return
-		}
-
-		// Send success response to browser
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`
-			<!DOCTYPE html>
-			<html>
-			<head>
-				<meta charset="UTF-8">
-				<title>Login Successful</title>
-				<style>
-					body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-						   display: flex; justify-content: center; align-items: center;
-						   height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-					.container { text-align: center; background: white; padding: 40px 60px;
-								 border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
-					h1 { color: #333; margin-bottom: 10px; }
-					p { color: #666; }
-				</style>
-			</head>
-			<body>
-				<div class="container">
-					<h1>✓ Login Successful!</h1>
-					<p>You can close this window and return to the terminal.</p>
-				</div>
-			</body>
-			</html>
-		`))
-
-		deliver(code)
-	})
-
-	// Start server in goroutine
-	go func() {
-		if err := server.Serve(listener); err != http.ErrServerClosed {
-			fail(fmt.Errorf("callback server error: %v", err))
-		}
-	}()
-
-	// Build login URL
-	loginUrl := fmt.Sprintf("%s/login?idp=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=%s",
-		kiroAuthEndpoint,
-		provider,
-		url.QueryEscape(redirectUri),
-		codeChallenge,
-		state,
-	)
-
-	fmt.Println("Opening browser for authentication...")
-	fmt.Printf("If the browser doesn't open, please visit:\n%s\n\n", loginUrl)
-
-	if err := openBrowser(loginUrl); err != nil {
+	if err := openBrowser(auth.VerificationURIComplete); err != nil {
 		fmt.Printf("Failed to open browser: %v\n", err)
 		fmt.Println("Please open the URL above manually.")
 	}
-
 	fmt.Println("Waiting for authentication...")
 
-	// Wait for auth code or error with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	interval := time.Duration(auth.IntervalInMilliseconds) * time.Millisecond
+	if interval < time.Second {
+		interval = 5 * time.Second
+	}
+	timeout := time.Duration(auth.ExpiresInMilliseconds) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	select {
-	case code := <-authCodeChan:
-		// Shutdown server
-		shutdownLoginServer(server)
-
-		fmt.Println("Authorization code received, exchanging for tokens...")
-
-		// Exchange code for tokens
-		token, err := exchangeCodeForTokens(code, codeVerifier, redirectUri, provider)
-		if err != nil {
-			fmt.Printf("Failed to exchange code for tokens: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Save token to file
-		if err := saveToken(token); err != nil {
-			fmt.Printf("Failed to save token: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Println("\n✓ Login successful!")
-		fmt.Printf("Provider: %s\n", provider)
-		fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
-		fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
-
-	case err := <-errChan:
-		shutdownLoginServer(server)
+	token, err := awaitSocialDeviceToken(ctx, client, kiroAuthEndpoint, auth.DeviceCode, provider, interval)
+	if err != nil {
 		fmt.Printf("Authentication failed: %v\n", err)
 		os.Exit(1)
-
-	case <-ctx.Done():
-		shutdownLoginServer(server)
-		fmt.Println("Authentication timed out. Please try again.")
+	}
+	if err := saveToken(token); err != nil {
+		fmt.Printf("Failed to save token: %v\n", err)
 		os.Exit(1)
+	}
+	fmt.Println("\n✓ Login successful!")
+	fmt.Printf("Provider: %s\n", provider)
+	fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
+	fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
+}
+
+// deviceSlowDownStep is how much longer the device flow waits between polls
+// each time the server answers slow_down (RFC 8628 section 3.5: 5 seconds).
+var deviceSlowDownStep = 5 * time.Second
+
+// awaitSocialDeviceToken polls the device authorization until the user
+// approves it in the browser, the server ends it, or ctx expires. Each
+// slow_down lengthens the interval for the rest of the wait. A 5xx or a
+// network failure is retried until ctx expires; a 4xx ends the wait.
+func awaitSocialDeviceToken(ctx context.Context, client *http.Client, endpoint, deviceCode, provider string, interval time.Duration) (*TokenData, error) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("authentication timed out, please try again")
+		case <-timer.C:
+		}
+		poll, err := pollSocialDeviceAuthorization(ctx, client, endpoint, deviceCode)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("authentication timed out, please try again")
+			}
+			var statusErr *deviceStatusError
+			if errors.As(err, &statusErr) && statusErr.Status < 500 {
+				// the service ended the flow (expired, denied, bad code)
+				return nil, err
+			}
+			// a 5xx or a network failure: the code is still valid, keep waiting
+			fmt.Printf("Poll failed, retrying: %v\n", err)
+			timer.Reset(interval)
+			continue
+		}
+		switch poll.Status {
+		case "authorization_pending":
+			timer.Reset(interval)
+			continue
+		case "slow_down":
+			interval += deviceSlowDownStep
+			timer.Reset(interval)
+			continue
+		}
+		if poll.AccessToken == "" || poll.RefreshToken == "" {
+			return nil, fmt.Errorf("device authorization ended with status %q", poll.Status)
+		}
+		expiresIn := poll.ExpiresIn
+		if expiresIn <= 0 {
+			expiresIn = 3600
+		}
+		return &TokenData{
+			AccessToken:  poll.AccessToken,
+			RefreshToken: poll.RefreshToken,
+			ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339),
+			AuthMethod:   "social",
+			Provider:     provider,
+			ProfileArn:   poll.ProfileArn,
+		}, nil
 	}
 }
 
@@ -6629,66 +6686,6 @@ func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg 
 		ClientIdHash: clientIdHash,
 		Region:       region,
 		StartUrl:     startUrl,
-	}
-
-	return token, nil
-}
-
-// exchangeCodeForTokens exchanges the authorization code for access tokens (social auth)
-func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*TokenData, error) {
-	tokenUrl := fmt.Sprintf("%s/oauth/token", kiroAuthEndpoint)
-
-	reqBody := CreateTokenRequest{
-		Code:         code,
-		CodeVerifier: codeVerifier,
-		RedirectUri:  redirectUri,
-	}
-
-	reqJson, err := jsonStr.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
-	}
-
-	req, err := http.NewRequest("POST", tokenUrl, bytes.NewBuffer(reqJson))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	// Set headers to match Kiro IDE
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", kiroide.UserAgent())
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp CreateTokenResponse
-	if err := jsonStr.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	// Calculate expiration time
-	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-
-	token := &TokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		ExpiresAt:    expiresAt.Format(time.RFC3339),
-		AuthMethod:   "social",
-		Provider:     provider,
-		ProfileArn:   tokenResp.ProfileArn,
 	}
 
 	return token, nil
