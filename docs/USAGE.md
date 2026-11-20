@@ -240,29 +240,40 @@ The reasoning given back changes cost too. On a second turn of that step with
 and the model planned again; with it, 44.5 s and 1.36 credits. Details in
 [PROTOCOL_TRANSLATION.md](PROTOCOL_TRANSLATION.md).
 
-### Kiro's 240-second limit on silent responses
+### Interrupted responses (Kiro's 240-second limit)
 
-Kiro ends a response it has sent nothing on for about 240 seconds. It also
-sends a tool call's input only once the model has finished writing it, so a
-large file written in one `Write` call can take longer than that and never
-arrive. What the proxy does when that happens:
+Kiro ends a response it has sent nothing on for about 240 seconds, and it sends
+a tool call's input only once the model has finished writing it, so a large file
+written in one `Write` call can take longer than that and never arrive. A tool
+call can also stop at the model's output limit (`MAX_TOKENS`). The proxy handles
+both the way Kiro's own client does:
 
-1. Nothing reached Claude Code yet: the proxy sends the same request once more
-   (a cut request is not charged). Logged as `[WRN] Idle cut ... path 1`.
-2. A tool call was open: the proxy closes it with the input that arrived (for a
-   `Write`, often only `file_path`) and ends the answer as a tool call. Claude Code
-   runs it, the call fails validation, and Claude Code sends back an error tool
-   result. On its way to Kiro, that tool result gets a short note from the proxy
-   saying the call was cut because its input took more than 240 seconds, and to
-   split the work into smaller pieces. Logged as `[WRN] Idle cut ... path 2`.
-3. Anything else: a streaming answer fails as retryable (Claude Code resends it
-   once, without streaming), and a non-streaming request that is cut again gets
-   a `400` that says what happened. Logged as `[ERR] Idle cut ... path 3`.
+- It holds every tool call until the response has ended (text streams as it
+  arrives), so Claude Code never receives an incomplete tool call.
+- Interrupted before any tool call started: it sends the same request again
+  after about half a second (a cut request is not charged). If text already
+  reached Claude Code, it asks Kiro to continue from that text instead. Logged as
+  `[WRN] Interrupted response ... path 1` (same request) or `path 2`.
+- Interrupted inside a tool call, or stopped at the output limit inside one: it
+  answers that call with a failed tool result saying the call was not executed
+  and how to split the work (`Write` for the first part, at most about 50 lines,
+  then several small `Edit` calls), asks Kiro again in the same conversation and
+  streams the new answer to Claude Code as the rest of the same message. Logged
+  as `[WRN] Interrupted response ... path 2`.
+- At most 3 recoveries per response. After that, or with the switch off, the
+  response fails with an error that says what happened. Logged as
+  `[ERR] Interrupted response ... path 3`.
+
+The failed call and its tool result go to Kiro only: Claude Code never receives
+them and they are not in its transcript. So that Kiro sees a consistent
+conversation, the proxy keeps that exchange in memory (per conversation, at most
+256 responses, six hours, lost on restart) and puts it back into the history of
+every later request, before the message Claude Code recorded for that response.
 
 | Setting | Values | Effect |
 |---|---|---|
-| `advanced.idle_cut_note` | bool (default true) | Path 2 and its note. The note is added only to what the proxy sends to Kiro: Claude Code never receives it and its transcript keeps the tool result Claude Code wrote. The same note goes on that tool result in the history of later requests. Remembered in memory for six hours, lost on restart. `false`: such a cut takes path 3 instead. |
-| `network.backend_idle_cut_after` | duration (default `230s`) | Backend silence after which a broken response counts as Kiro's idle cut. |
+| `advanced.interrupted_tool_recovery` | bool (default true) | The recovery above. `false`: an interrupted response fails as an error (retryable when streaming). |
+| `network.backend_idle_cut_after` | duration (default `230s`) | Backend silence after which a broken response is reported as Kiro's idle cut in the log and the error. |
 
 The live web dashboard (`claude2kiro credits --web`) charts credit history,
 burn rate, and projected runout from samples recorded every 15 minutes while
