@@ -76,9 +76,17 @@ type heldTool struct {
 }
 
 // interruptedResultText is the tool result the proxy answers an interrupted
-// tool call with. truncated is a MAX_TOKENS stop; the cut tool is the one
-// still open, any other call of the attempt was complete but not executed.
-func interruptedResultText(t *heldTool, truncated bool) string {
+// tool call with. truncated is a MAX_TOKENS stop; idleCut is Kiro's idle cut.
+// The cut tool is the one still open, any other call of the attempt was
+// complete but not executed.
+//
+// Kiro's client gives the split guidance to a file write only after 2,000
+// argument characters arrived. Kiro holds a Write's content back until it is
+// complete, so after an idle cut only the file_path has arrived (128
+// characters, measured live on 2026-11-20), and with the generic text the
+// model sent the same whole-file Write again. A file write cut by the idle
+// limit therefore gets the guidance whatever arrived of it.
+func interruptedResultText(t *heldTool, truncated, idleCut bool) string {
 	if t.complete {
 		return interruptedGenericResult
 	}
@@ -88,13 +96,18 @@ func interruptedResultText(t *heldTool, truncated bool) string {
 			"so retrying this call with the same input will be truncated again. " + splitWriteGuidance
 	}
 	chars := t.input.Len()
-	if fileWriteTools[t.name] && chars >= 2000 {
+	if fileWriteTools[t.name] && (chars >= 2000 || idleCut) {
 		path := "the file"
 		var in map[string]any
 		if json.Unmarshal([]byte(t.input.String()+jsonCompletionSuffix(t.input.String())), &in) == nil {
 			if p, ok := in["file_path"].(string); ok && p != "" {
 				path = p
 			}
+		}
+		if chars < 2000 {
+			return fmt.Sprintf("The connection was interrupted while this tool call was still producing its content for %s: "+
+				"the backend closes a response after about 240 seconds without output, and the input of this call took longer than that to produce. "+
+				"This interrupted call did not write anything. %s", path, splitWriteGuidance)
 		}
 		return fmt.Sprintf("The connection was interrupted while this tool call was still streaming its content for %s; about %d argument characters had arrived. "+
 			"This interrupted call did not write anything. %s", path, chars, splitWriteGuidance)
@@ -240,7 +253,7 @@ func (b *blockEmitter) endAttempt() (string, []*heldTool) {
 // text and tool calls, inputs completed into valid JSON) and the user turn
 // that answers it: a failed tool result per tool call, or the request to
 // continue when the attempt had no tool call.
-func recoveryTurns(text string, tools []*heldTool, truncated bool) []AnthropicRequestMessage {
+func recoveryTurns(text string, tools []*heldTool, truncated, idleCut bool) []AnthropicRequestMessage {
 	var assistant []any
 	if strings.TrimSpace(text) != "" {
 		assistant = append(assistant, map[string]any{"type": "text", "text": text})
@@ -256,7 +269,7 @@ func recoveryTurns(text string, tools []*heldTool, truncated bool) []AnthropicRe
 		}
 		assistant = append(assistant, map[string]any{"type": "tool_use", "id": t.id, "name": t.name, "input": input})
 		user = append(user, map[string]any{"type": "tool_result", "tool_use_id": t.id, "is_error": true,
-			"content": interruptedResultText(t, truncated)})
+			"content": interruptedResultText(t, truncated, idleCut)})
 	}
 	if len(tools) == 0 {
 		user = append(user, map[string]any{"type": "text", "text": continueAfterInterruption})

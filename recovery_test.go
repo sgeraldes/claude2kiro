@@ -281,7 +281,7 @@ func TestStreamCutInAToolCallIsAnsweredAndAskedAgain(t *testing.T) {
 	second := decodeCW(t, log.all()[1])
 	assertWellFormed(t, second)
 	results := second.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults
-	if len(results) != 1 || results[0].ToolUseID != "tu_big" || results[0].Status != "error" || !strings.Contains(results[0].Content[0].Text, "NOT executed") {
+	if len(results) != 1 || results[0].ToolUseID != "tu_big" || results[0].Status != "error" || !strings.Contains(results[0].Content[0].Text, "did not write anything") {
 		t.Fatalf("want one failed result for tu_big, got %+v", results)
 	}
 	if w := linesOf(lg, logger.LogTypeWrn); !strings.Contains(w, "path 2") || !strings.Contains(w, "tu_big") {
@@ -304,7 +304,7 @@ func TestStreamCutInAToolCallIsAnsweredAndAskedAgain(t *testing.T) {
 	third := decodeCW(t, log.all()[2])
 	assertWellFormed(t, third)
 	raw, _ := json.Marshal(third.ConversationState.History)
-	if !strings.Contains(string(raw), "tu_big") || !strings.Contains(log.all()[2], "NOT executed") {
+	if !strings.Contains(string(raw), "tu_big") || !strings.Contains(log.all()[2], "did not write anything") {
 		t.Fatalf("the hidden exchange is missing from the next request's history:\n%s", raw)
 	}
 	if strings.Count(string(raw), "Here is the plan.") != 1 {
@@ -319,16 +319,16 @@ func TestStreamCutInAToolCallIsAnsweredAndAskedAgain(t *testing.T) {
 func TestInterruptedLargeWriteGetsTheSplitGuidance(t *testing.T) {
 	tool := &heldTool{id: "tu_big", name: "Write"}
 	tool.input.WriteString(`{"file_path": "G:\\out\\big.html", "content": "` + strings.Repeat("x", 2500))
-	text := interruptedResultText(tool, false)
+	text := interruptedResultText(tool, false, false)
 	for _, want := range []string{`G:\out\big.html`, "did not write anything", "at most about 50 lines", "Edit"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("result text lacks %q: %s", want, text)
 		}
 	}
-	if small := interruptedResultText(&heldTool{name: "Write"}, false); small != interruptedGenericResult {
+	if small := interruptedResultText(&heldTool{name: "Write"}, false, false); small != interruptedGenericResult {
 		t.Fatalf("a small cut call gets the generic text, got %s", small)
 	}
-	if trunc := interruptedResultText(&heldTool{name: "Bash"}, true); !strings.Contains(trunc, "output token limit") {
+	if trunc := interruptedResultText(&heldTool{name: "Bash"}, true, false); !strings.Contains(trunc, "output token limit") {
 		t.Fatalf("a truncated call gets the truncation text, got %s", trunc)
 	}
 }
@@ -495,5 +495,24 @@ func TestRecoveredStoreExpiresAndIsBounded(t *testing.T) {
 	now = now.Add(2 * time.Hour)
 	if _, ok := s.get([]string{"c"}); ok {
 		t.Fatal("an expired entry must be forgotten")
+	}
+}
+
+// Measured live on 2026-11-20: Kiro holds a Write's content back, so an idle
+// cut leaves only its file_path (128 characters) and Kiro's 2,000-character
+// rule gave the generic text; the model sent the same whole-file Write again.
+// A file write cut by the idle limit gets the split guidance whatever arrived
+// of it.
+func TestIdleCutFileWriteGetsTheSplitGuidanceWithLittleInput(t *testing.T) {
+	tool := &heldTool{id: "tu_big", name: "Write"}
+	tool.input.WriteString(`{"file_path": "G:\\out\\big.html"`)
+	text := interruptedResultText(tool, false, true)
+	for _, want := range []string{`G:\out\big.html`, "240 seconds", "did not write anything", "at most about 50 lines", "Edit"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("result text lacks %q: %s", want, text)
+		}
+	}
+	if other := interruptedResultText(&heldTool{name: "Bash"}, false, true); other != interruptedGenericResult {
+		t.Fatalf("a tool that is not a file write keeps the generic text, got %s", other)
 	}
 }

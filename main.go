@@ -5202,7 +5202,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			}
 		} else {
 			// Path 2: answer the interrupted attempt and ask for the rest.
-			turns := recoveryTurns(text, tools, kind == interruptTruncated)
+			turns := recoveryTurns(text, tools, kind == interruptTruncated, isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter))
 			hidden.Turns = append(hidden.Turns, turns...)
 			if strings.TrimSpace(text) != "" {
 				hidden.LeadTexts = append(hidden.LeadTexts, text)
@@ -7907,7 +7907,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 				return statusClientClosedRequest
 			}
 		} else {
-			turns := recoveryTurns(text, tools, kind == interruptTruncated)
+			turns := recoveryTurns(text, tools, kind == interruptTruncated, isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter))
 			hidden.Turns = append(hidden.Turns, turns...)
 			if strings.TrimSpace(text) != "" {
 				hidden.LeadTexts = append(hidden.LeadTexts, text)
