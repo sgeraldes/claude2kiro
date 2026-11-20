@@ -2646,20 +2646,38 @@ func main() {
 // established command-first form intact:
 //
 //	claude2kiro --resume <session-id> run [claude args...]
+//	claude2kiro --resume=<session-id> run [claude args...]
 //
 // Internally it becomes `claude2kiro run --resume <session-id> ...`, so the
 // existing run path forwards the Claude flags unchanged.
 func normalizeRunInvocation(args []string) ([]string, error) {
-	if len(args) < 2 || args[1] != "--resume" {
+	if len(args) < 2 {
 		return args, nil
 	}
-	if len(args) < 4 || args[2] == "" || args[3] != "run" {
-		return nil, fmt.Errorf("usage: claude2kiro --resume <session-id> run [claude args...]")
+	usage := fmt.Errorf("usage: claude2kiro --resume <session-id> run [claude args...]")
+	var session string
+	var rest []string
+	switch {
+	case args[1] == "--resume":
+		if len(args) < 4 || args[3] != "run" {
+			return nil, usage
+		}
+		session, rest = args[2], args[4:]
+	case strings.HasPrefix(args[1], "--resume="):
+		if len(args) < 3 || args[2] != "run" {
+			return nil, usage
+		}
+		session, rest = strings.TrimPrefix(args[1], "--resume="), args[3:]
+	default:
+		return args, nil
+	}
+	if session == "" {
+		return nil, usage
 	}
 
-	normalized := make([]string, 0, len(args))
-	normalized = append(normalized, args[0], "run", "--resume", args[2])
-	normalized = append(normalized, args[4:]...)
+	normalized := make([]string, 0, len(rest)+4)
+	normalized = append(normalized, args[0], "run", "--resume", session)
+	normalized = append(normalized, rest...)
 	return normalized, nil
 }
 
@@ -3864,6 +3882,8 @@ func printUsage() {
 	fmt.Println("  claude2kiro export         - Export environment variables")
 	fmt.Println("  claude2kiro disable        - Remove Claude2Kiro Claude Code/Desktop integrations")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
+	fmt.Println("    Args go to Claude Code: 'run --resume <session-id>' resumes a session;")
+	fmt.Println("    'claude2kiro --resume <session-id> run [args...]' means the same")
 	fmt.Println("  claude2kiro desktop             - Ensure proxy is up + launch Claude Desktop (Windows)")
 	fmt.Println("  claude2kiro remote [args...]     - Connect to running proxy (start TUI first)")
 	fmt.Println("  claude2kiro update              - Self-update to latest GitHub release")
@@ -6150,12 +6170,22 @@ type socialDevicePollResponse struct {
 	ExpiresIn        int    `json:"expiresIn"`
 }
 
-func postSocialDeviceJSON(client *http.Client, endpoint string, payload any, result any) error {
+// deviceStatusError is a non-200 answer from the device authorization service.
+type deviceStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *deviceStatusError) Error() string {
+	return fmt.Sprintf("request failed (status %d): %s", e.Status, e.Body)
+}
+
+func postSocialDeviceJSON(ctx context.Context, client *http.Client, endpoint string, payload any, result any) error {
 	body, err := jsonStr.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -6171,7 +6201,7 @@ func postSocialDeviceJSON(client *http.Client, endpoint string, payload any, res
 		return fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("request failed (status %d): %s", resp.StatusCode, string(responseBody))
+		return &deviceStatusError{Status: resp.StatusCode, Body: string(responseBody)}
 	}
 	if err := jsonStr.Unmarshal(responseBody, result); err != nil {
 		return fmt.Errorf("decode response: %w", err)
@@ -6181,7 +6211,7 @@ func postSocialDeviceJSON(client *http.Client, endpoint string, payload any, res
 
 func startSocialDeviceAuthorization(client *http.Client, endpoint, provider string) (socialDeviceAuthorization, error) {
 	var auth socialDeviceAuthorization
-	err := postSocialDeviceJSON(client, endpoint+"/oauth/device/authorization", map[string]string{
+	err := postSocialDeviceJSON(context.Background(), client, endpoint+"/oauth/device/authorization", map[string]string{
 		"clientId":      "kiro-cli",
 		"loginProvider": provider,
 	}, &auth)
@@ -6194,9 +6224,9 @@ func startSocialDeviceAuthorization(client *http.Client, endpoint, provider stri
 	return auth, nil
 }
 
-func pollSocialDeviceAuthorization(client *http.Client, endpoint, deviceCode string) (socialDevicePollResponse, error) {
+func pollSocialDeviceAuthorization(ctx context.Context, client *http.Client, endpoint, deviceCode string) (socialDevicePollResponse, error) {
 	var poll socialDevicePollResponse
-	err := postSocialDeviceJSON(client, endpoint+"/oauth/device/poll", map[string]string{
+	err := postSocialDeviceJSON(ctx, client, endpoint+"/oauth/device/poll", map[string]string{
 		"clientId":   "kiro-cli",
 		"deviceCode": deviceCode,
 	}, &poll)
@@ -6257,7 +6287,8 @@ var deviceSlowDownStep = 5 * time.Second
 
 // awaitSocialDeviceToken polls the device authorization until the user
 // approves it in the browser, the server ends it, or ctx expires. Each
-// slow_down lengthens the interval for the rest of the wait.
+// slow_down lengthens the interval for the rest of the wait. A 5xx or a
+// network failure is retried until ctx expires; a 4xx ends the wait.
 func awaitSocialDeviceToken(ctx context.Context, client *http.Client, endpoint, deviceCode, provider string, interval time.Duration) (*TokenData, error) {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -6267,9 +6298,20 @@ func awaitSocialDeviceToken(ctx context.Context, client *http.Client, endpoint, 
 			return nil, fmt.Errorf("authentication timed out, please try again")
 		case <-timer.C:
 		}
-		poll, err := pollSocialDeviceAuthorization(client, endpoint, deviceCode)
+		poll, err := pollSocialDeviceAuthorization(ctx, client, endpoint, deviceCode)
 		if err != nil {
-			return nil, err
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("authentication timed out, please try again")
+			}
+			var statusErr *deviceStatusError
+			if errors.As(err, &statusErr) && statusErr.Status < 500 {
+				// the service ended the flow (expired, denied, bad code)
+				return nil, err
+			}
+			// a 5xx or a network failure: the code is still valid, keep waiting
+			fmt.Printf("Poll failed, retrying: %v\n", err)
+			timer.Reset(interval)
+			continue
 		}
 		switch poll.Status {
 		case "authorization_pending":

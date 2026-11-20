@@ -16,6 +16,20 @@ func TestNormalizeRunInvocationResumeFirst(t *testing.T) {
 	}
 }
 
+func TestNormalizeRunInvocationResumeFirstEqualsForm(t *testing.T) {
+	got, err := normalizeRunInvocation([]string{"claude2kiro", "--resume=session-123", "run", "--model", "sonnet"})
+	if err != nil {
+		t.Fatalf("normalize invocation: %v", err)
+	}
+	want := []string{"claude2kiro", "run", "--resume", "session-123", "--model", "sonnet"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized args = %#v, want %#v", got, want)
+	}
+	if _, err := normalizeRunInvocation([]string{"claude2kiro", "--resume=", "run"}); err == nil {
+		t.Fatal("expected an empty --resume= session id to fail")
+	}
+}
+
 func TestNormalizeRunInvocationLeavesCommandFirstFormAlone(t *testing.T) {
 	want := []string{"claude2kiro", "run", "--resume", "session-123"}
 	got, err := normalizeRunInvocation(want)

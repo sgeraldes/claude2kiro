@@ -104,6 +104,88 @@ func TestAwaitSocialDeviceTokenTimesOut(t *testing.T) {
 	}
 }
 
+// A 5xx or a dropped connection in the middle of the wait does not end the
+// login: the next poll can still succeed.
+func TestAwaitSocialDeviceTokenSurvivesTransientErrors(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		switch n {
+		case 1:
+			http.Error(w, `{"message":"internal"}`, http.StatusServiceUnavailable)
+		case 2:
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("no hijacker")
+			}
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+		default:
+			_, _ = w.Write([]byte(`{"accessToken":"fake-access","refreshToken":"fake-refresh","status":"COMPLETE"}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	token, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Google", 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("awaitSocialDeviceToken: %v", err)
+	}
+	if token.AccessToken != "fake-access" {
+		t.Fatalf("token = %+v", token)
+	}
+}
+
+// A 4xx is the server ending the flow (expired or denied code): no retry.
+func TestAwaitSocialDeviceTokenStopsOnClientError(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		http.Error(w, `{"message":"expired"}`, http.StatusBadRequest)
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Google", 10*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("err = %v, want the 400", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("polled %d times after a 400, want 1", calls)
+	}
+}
+
+// A poll in flight when the wait expires is cancelled with it.
+func TestAwaitSocialDeviceTokenCancelsInFlightPoll(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); server.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Google", 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("want an error once the wait expired")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("returned after %v, want the in-flight poll cancelled with the wait", d)
+	}
+}
+
 func TestAwaitSocialDeviceTokenDefaultsExpiry(t *testing.T) {
 	server, _ := pollServer(t, `{"accessToken":"fake-access","refreshToken":"fake-refresh","status":"COMPLETE"}`)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -163,7 +245,7 @@ func TestSocialDeviceAuthorizationAndPolling(t *testing.T) {
 	if auth.DeviceCode != "device-1" || auth.UserCode != "ABCD-EFGH" {
 		t.Fatalf("unexpected authorization response: %+v", auth)
 	}
-	poll, err := pollSocialDeviceAuthorization(server.Client(), server.URL, auth.DeviceCode)
+	poll, err := pollSocialDeviceAuthorization(context.Background(), server.Client(), server.URL, auth.DeviceCode)
 	if err != nil {
 		t.Fatalf("poll device authorization: %v", err)
 	}
