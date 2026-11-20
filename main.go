@@ -583,6 +583,9 @@ type CodeWhispererRequest struct {
 	// scope is responseScope of the request this was built from: where the
 	// response's reasoning is stored. Not sent.
 	scope reasoningScope
+	// idleCutNotes counts the tool results that got the idle cut note
+	// (idle_cut_note.go).
+	idleCutNotes int
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
@@ -2022,7 +2025,7 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 	}
 
 	return fmt.Sprintf(
-		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d",
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d idleCutNotes=%d",
 		convID,
 		current.ModelId,
 		reqBytes,
@@ -2037,6 +2040,7 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		advanced.AggressiveCachePoints,
 		cwReq.reasoning.turns,
 		cwReq.reasoning.bytes,
+		cwReq.idleCutNotes,
 	)
 }
 
@@ -2429,6 +2433,13 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		if toolMode != "none_text" {
 			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes, cfg.Advanced.ReasoningHistoryMaxBlocks)
 		}
+	}
+
+	// Tell the model which of its tool calls an idle cut broke, on the tool
+	// results it gets back (idle_cut_note.go). In none_text mode the tool
+	// results travel as text and get no note.
+	if cfg.Advanced.IdleCutNote && toolMode != "none_text" {
+		cwReq.idleCutNotes = addIdleCutNotes(&cwReq)
 	}
 
 	return cwReq
@@ -4798,7 +4809,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	}
 	defer kiroSema.release()
 	queueWait := time.Since(queuedAt)
-	sentAt := time.Now()
+	var sentAt time.Time // when the attempt that answered was sent
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response
@@ -4860,6 +4871,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		}
 
 		sent++
+		sentAt = time.Now()
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
 		if lastErr != nil {
 			if clientGone("before the backend answered") {
@@ -5054,15 +5066,15 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		sendErrorEvent(w, flusher, "CodeWhisperer request error after retries", lastErr)
 		return ""
 	}
-	defer resp.Body.Close()
+	// resp changes when an idle cut is resent; close whichever is current.
+	defer func() { resp.Body.Close() }()
 
 	// Forward the response as it arrives: each backend frame is translated and
 	// sent before the next one is read. The raw bytes are kept for metering and
 	// the debug dump.
 	var rawResp bytes.Buffer
-	backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
-	body := io.TeeReader(backendBody, &rawResp)
 	translator := parser.NewStreamTranslator()
+	var toolCalls openToolCalls // the tool calls forwarded and not yet closed
 	toolNames := buildToolNameMap(anthropicReq.Tools)
 	var responseText strings.Builder
 
@@ -5113,6 +5125,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 					toolBlockCount++
 				}
 			}
+			toolCalls.observe(e)
 			eventCount++
 			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
 			if delayMs > 0 {
@@ -5130,23 +5143,72 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	}
 
 	var readErr error
-	for {
-		payload, err := parser.ReadFramePayload(body)
-		if err != nil {
-			// Only io.EOF on a frame boundary is a finished response. A stream
-			// that ends inside a frame, a frame with impossible lengths or a
-			// transport error means the backend did not finish the answer.
-			if err != io.EOF {
-				readErr = err
+	var silence time.Duration // how long the backend had been silent when the read failed
+	idleCut := false
+	for cutResends := 0; ; cutResends++ {
+		backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+		body := io.TeeReader(backendBody, &rawResp)
+		readErr = nil
+		for {
+			payload, err := parser.ReadFramePayload(body)
+			if err != nil {
+				// Only io.EOF on a frame boundary is a finished response. A stream
+				// that ends inside a frame, a frame with impossible lengths or a
+				// transport error means the backend did not finish the answer.
+				if err != io.EOF {
+					readErr = err
+				}
+				break
 			}
+			events := translator.Translate(payload)
+			if len(events) == 0 {
+				continue
+			}
+			startMessage(len(cwReqBody) / 4) // approximate from the CodeWhisperer request size
+			forward(events)
+		}
+		if readErr == nil || ctx.Err() != nil {
 			break
 		}
-		events := translator.Translate(payload)
-		if len(events) == 0 {
-			continue
+		silence = backendBody.silence()
+		idleCut = isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter)
+		if !idleCut || started || cutResends > 0 {
+			break
 		}
-		startMessage(len(cwReqBody) / 4) // approximate from the CodeWhisperer request size
-		forward(events)
+		// Path 1 (backend_idle_cut.go): Kiro's idle cut before anything
+		// reached the client. Send the same request once more; the
+		// keepalive writer keeps pinging the client meanwhile.
+		lg.LogWarn(fmt.Sprintf("Idle cut convId=%s, backend silent %s, %s since sent, nothing forwarded yet - path 1: resending the same request (attempt %d of 1)",
+			cwReq.ConversationState.ConversationId[:8], silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), cutResends+1))
+		resp.Body.Close()
+		resendReq, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
+		if err != nil {
+			sendErrorEvent(w, flusher, "Failed to create retry request", err)
+			return ""
+		}
+		resendReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
+		resendReq.Header.Set("Content-Type", "application/json")
+		resendReq.Header.Set("Accept", "text/event-stream")
+		resendReq.Header.Set("User-Agent", kiroide.UserAgent())
+		sentAt = time.Now()
+		next, err := proxyHttpClient.Do(resendReq)
+		if err != nil {
+			if clientGone("before the resend was answered") {
+				return ""
+			}
+			lg.LogError(fmt.Sprintf("Idle cut resend convId=%s failed: %v", cwReq.ConversationState.ConversationId[:8], err))
+			sendErrorEvent(w, flusher, "CodeWhisperer request error on the resend after an idle cut", err)
+			return ""
+		}
+		resp = next
+		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			lg.LogError(fmt.Sprintf("Idle cut resend convId=%s answered status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(errBody)))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error on the resend after an idle cut (status %d): %s", resp.StatusCode, string(errBody)))
+			return ""
+		}
+		translator = parser.NewStreamTranslator() // the cut attempt forwarded nothing
+		rawResp.Reset()
 	}
 
 	// Debug: Save raw response for analysis
@@ -5165,17 +5227,36 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		if clientGone("mid-response") {
 			return responseText.String()
 		}
-		silence := backendBody.silence()
-		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events, %s since sent, backend silent %s: %v",
-			cwReq.ConversationState.ConversationId[:8], eventCount, time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
-		if isBackendIdleCut(readErr, silence) {
-			// Kiro's idle cut (see backend_idle_cut.go). Still retryable:
-			// Claude Code resends it once as a non-streaming request, and a
-			// cut of that one is answered as final.
-			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: Kiro closed the response after %s without sending anything: %v",
+		convID := cwReq.ConversationState.ConversationId[:8]
+		if idleCut && cfg.Advanced.IdleCutNote && toolCalls.anyOpen() {
+			// Path 2 (backend_idle_cut.go): a tool call was open. Close it
+			// with valid JSON from what arrived and end the message as a
+			// tool call; the note goes out with its tool result.
+			completions, ids := toolCalls.completions()
+			forward(completions)
+			forward(translator.Finish())
+			idleCutCalls.Add(cwReq.scope.storeScope(), ids...)
+			lg.LogWarn(fmt.Sprintf("Idle cut convId=%s, backend silent %s, %s since sent, after %d events - path 2: closed tool call(s) %s with the input that arrived; the note goes out with their tool results: %v",
+				convID, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount, strings.Join(ids, ","), readErr))
+			sendSSEEvent(w, flusher, "message_delta", map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": "tool_use", "stop_sequence": nil},
+				"usage": map[string]any{"output_tokens": outputChars / 4},
+			}, capturedEvents)
+			sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+			return responseText.String()
+		}
+		if idleCut {
+			// Path 3: no tool call open (or the note is off). Retryable:
+			// Claude Code resends it as a non-streaming request.
+			lg.LogError(fmt.Sprintf("Idle cut convId=%s, backend silent %s, %s since sent, after %d events - path 3: failing the response as retryable: %v",
+				convID, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount, readErr))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: Kiro closed the response after it had sent nothing for %s: %v",
 				silence.Round(time.Second), readErr))
 			return ""
 		}
+		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events, %s since sent, backend silent %s: %v",
+			convID, eventCount, time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
 		// No content_block_stop, message_delta or message_stop: the client must
 		// see an unfinished answer as an error (overloaded, so it retries).
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
@@ -7544,6 +7625,11 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 			lg.LogError(msg)
 		}
 	}
+	logWarn := func(msg string) {
+		if lg != nil {
+			lg.LogWarn(msg)
+		}
+	}
 	// adopt rebuilds the outgoing request for another identity's token.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
@@ -7578,7 +7664,9 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	// changing under the request cannot keep it going
 	const bearerRetriesPerIdentity = 3
 	bearerRetries := 0
-	reasoningStripped := false // the request was resent once without its reasoning
+	reasoningStripped := false      // the request was resent once without its reasoning
+	cutResent := false              // the request was resent once after an idle cut
+	var cutEvents []parser.SSEEvent // the repaired answer of a request cut twice in a tool call (path 2)
 	var sentAt time.Time
 	for {
 		sentAt = time.Now()
@@ -7602,16 +7690,39 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		}
 		if err != nil {
 			// The backend cut the answer (for example an HTTP/2 RST_STREAM).
-			// Say so in the log and to the client as an Anthropic error.
 			silence := backendBody.silence()
-			logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s after %d bytes, %s since sent, backend silent %s: %v",
-				cwReq.ConversationState.ConversationId[:8], len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
-			if isBackendIdleCut(err, silence) {
-				// Kiro's idle cut (see backend_idle_cut.go). A 400 is an error
-				// Claude Code does not resend.
-				return writeNonStreamError(w, lg, http.StatusBadRequest, "invalid_request_error",
-					backendIdleCutMessage(silence, lastToolCallName(cwRespBody)))
+			convID := cwReq.ConversationState.ConversationId[:8]
+			if isBackendIdleCut(err, silence, cfg.Network.BackendIdleCutAfter) {
+				// Kiro's idle cut (see backend_idle_cut.go). Nothing went
+				// to the client yet.
+				if !cutResent {
+					// Path 1: send the same request once more.
+					cutResent = true
+					logWarn(fmt.Sprintf("Idle cut (non-stream) convId=%s, backend silent %s, %s since sent, %d bytes - path 1: resending the same request (attempt 1 of 1)",
+						convID, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), len(cwRespBody)))
+					if err := adopt(token, ident); err != nil {
+						return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error", fmt.Sprintf("Failed to rebuild request: %v", err))
+					}
+					continue
+				}
+				events, ids, lastTool := cutToolAnswer(cwRespBody)
+				if cfg.Advanced.IdleCutNote && len(ids) > 0 {
+					// Path 2: answer with the open tool call(s) closed on
+					// the input that arrived; the note goes out with their
+					// tool results.
+					idleCutCalls.Add(cwReq.scope.storeScope(), ids...)
+					logWarn(fmt.Sprintf("Idle cut (non-stream) convId=%s, backend silent %s, %s since sent, on the resend - path 2: closed tool call(s) %s with the input that arrived; the note goes out with their tool results: %v",
+						convID, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), strings.Join(ids, ","), err))
+					cutEvents = events
+					break
+				}
+				// Path 3: a 400, which Claude Code does not resend.
+				logError(fmt.Sprintf("Idle cut (non-stream) convId=%s, backend silent %s, %s since sent, on the resend - path 3: answering 400 invalid_request_error: %v",
+					convID, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), err))
+				return writeNonStreamError(w, lg, http.StatusBadRequest, "invalid_request_error", backendIdleCutMessage(silence, lastTool))
 			}
+			logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s after %d bytes, %s since sent, backend silent %s: %v",
+				convID, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
 			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
 				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", err))
 		}
@@ -7729,8 +7840,15 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	}
 
 	events, summary := parser.ParseEventsWithSummary(cwRespBody)
-	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
-		summary.Reasoning, summary.ToolUseIDs, summary.Text)
+	if cutEvents != nil {
+		// Path 2: the answer is the cut response with its tool calls closed;
+		// its reasoning is incomplete and not kept.
+		events = cutEvents
+		summary.StopReason = "tool_use"
+	} else {
+		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
+			summary.Reasoning, summary.ToolUseIDs, summary.Text)
+	}
 	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
 	}

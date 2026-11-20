@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sgeraldes/claude2kiro/internal/tui/logger"
 )
@@ -66,82 +65,5 @@ func TestNonStreamReadFailureIsLoggedAndAnErrorEnvelope(t *testing.T) {
 	}
 	if !strings.Contains(logged, "read failed") || !strings.Contains(logged, "convId=") {
 		t.Fatalf("want an [ERR] line naming the convId and the read failure, got:\n%s", logged)
-	}
-}
-
-// withBackendIdleCutAfter shortens the silence after which a reset stream is
-// taken for Kiro's idle cut.
-func withBackendIdleCutAfter(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := backendIdleCutAfter
-	backendIdleCutAfter = d
-	t.Cleanup(func() { backendIdleCutAfter = old })
-}
-
-// toolStartThenSilentCut sends the start of a Write tool call, stays silent for
-// silence, then drops the connection: what Kiro does when the model takes
-// longer than its idle limit to write a tool input it holds back.
-func toolStartThenSilentCut(silence time.Duration) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusOK)
-		w.Write(cwFrame(`{"name":"Write","toolUseId":"tu_big","input":"{\"file_path\": \"big.html\""}`))
-		w.(http.Flusher).Flush()
-		time.Sleep(silence)
-		conn, _, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			panic(err)
-		}
-		conn.Close()
-	}
-}
-
-func errorLines(lg *logger.Logger) string {
-	var logged string
-	for _, e := range lg.GetEntries() {
-		if e.Type == logger.LogTypeErr {
-			logged += e.Body + "\n"
-		}
-	}
-	return logged
-}
-
-// A stream cut by the idle limit stays retryable: one resend (Claude Code falls
-// back to a non-streaming request) is allowed, and the log says how long the
-// backend was silent.
-func TestStreamIdleCutStaysRetryable(t *testing.T) {
-	withBackendIdleCutAfter(t, 100*time.Millisecond)
-	streamTestSetup(t, toolStartThenSilentCut(200*time.Millisecond))
-	withKeepaliveInterval(t, 0)
-
-	lg := logger.NewLogger(50)
-	rec := newLiveRecorder()
-	handleStreamRequestWithLogger(rec, testRequest(), lg, "sess", "req", nil)
-
-	assertStreamFailed(t, rec.String())
-	if logged := errorLines(lg); !strings.Contains(logged, "silent") || !strings.Contains(logged, "convId=") {
-		t.Fatalf("want an [ERR] line with the silence and the convId, got: %s", logged)
-	}
-}
-
-// A non-streaming request cut by the idle limit (Claude Code's resend of a cut
-// stream) is answered as final: a 400 invalid_request_error, which Claude Code
-// does not resend, that says what happened and what to ask for instead.
-func TestNonStreamIdleCutIsNotRetryable(t *testing.T) {
-	withBackendIdleCutAfter(t, 100*time.Millisecond)
-	streamTestSetup(t, toolStartThenSilentCut(200*time.Millisecond))
-	lg := logger.NewLogger(50)
-
-	rec := httptest.NewRecorder()
-	handleNonStreamRequest(rec, testRequest(), lg, "sess", "req")
-
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"invalid_request_error"`) {
-		t.Fatalf("want 400 invalid_request_error, got %d %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "Write") || !strings.Contains(rec.Body.String(), "240 s") {
-		t.Fatalf("the message should name the tool call and the limit: %s", rec.Body.String())
-	}
-	if logged := errorLines(lg); !strings.Contains(logged, "silent") {
-		t.Fatalf("want an [ERR] line with the silence, got: %s", logged)
 	}
 }
