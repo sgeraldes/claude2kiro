@@ -5060,7 +5060,8 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	// sent before the next one is read. The raw bytes are kept for metering and
 	// the debug dump.
 	var rawResp bytes.Buffer
-	body := io.TeeReader(resp.Body, &rawResp)
+	backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+	body := io.TeeReader(backendBody, &rawResp)
 	translator := parser.NewStreamTranslator()
 	toolNames := buildToolNameMap(anthropicReq.Tools)
 	var responseText strings.Builder
@@ -5164,7 +5165,17 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		if clientGone("mid-response") {
 			return responseText.String()
 		}
-		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events: %v", cwReq.ConversationState.ConversationId[:8], eventCount, readErr))
+		silence := backendBody.silence()
+		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events, %s since sent, backend silent %s: %v",
+			cwReq.ConversationState.ConversationId[:8], eventCount, time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
+		if isBackendIdleCut(readErr, silence) {
+			// Kiro's idle cut (see backend_idle_cut.go). Still retryable:
+			// Claude Code resends it once as a non-streaming request, and a
+			// cut of that one is answered as final.
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: Kiro closed the response after %s without sending anything: %v",
+				silence.Round(time.Second), readErr))
+			return ""
+		}
 		// No content_block_stop, message_delta or message_stop: the client must
 		// see an unfinished answer as an error (overloaded, so it retries).
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
@@ -7568,7 +7579,9 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	const bearerRetriesPerIdentity = 3
 	bearerRetries := 0
 	reasoningStripped := false // the request was resent once without its reasoning
+	var sentAt time.Time
 	for {
+		sentAt = time.Now()
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -7580,15 +7593,27 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		}
 
 		// Read response
-		cwRespBody, err = io.ReadAll(resp.Body)
+		backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+		cwRespBody, err = io.ReadAll(backendBody)
 		resp.Body.Close()
 		if err != nil && ctx.Err() != nil {
 			logInfo("Client disconnected (non-stream) mid-response — backend request cancelled")
 			return statusClientClosedRequest
 		}
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-			return http.StatusInternalServerError
+			// The backend cut the answer (for example an HTTP/2 RST_STREAM).
+			// Say so in the log and to the client as an Anthropic error.
+			silence := backendBody.silence()
+			logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s after %d bytes, %s since sent, backend silent %s: %v",
+				cwReq.ConversationState.ConversationId[:8], len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
+			if isBackendIdleCut(err, silence) {
+				// Kiro's idle cut (see backend_idle_cut.go). A 400 is an error
+				// Claude Code does not resend.
+				return writeNonStreamError(w, lg, http.StatusBadRequest, "invalid_request_error",
+					backendIdleCutMessage(silence, lastToolCallName(cwRespBody)))
+			}
+			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", err))
 		}
 
 		// A rejected reasoning signature: resend once without any reasoning and
@@ -7766,6 +7791,20 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		lg.LogError(fmt.Sprintf("Non-stream response write failed [%s:%s]: %v", sessionID, requestID, err))
 	}
 	return http.StatusOK
+}
+
+// writeNonStreamError answers a non-streaming request with an Anthropic error
+// envelope and returns the status it wrote.
+func writeNonStreamError(w http.ResponseWriter, lg *logger.Logger, status int, errType, message string) int {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if encErr := json.NewEncoder(w).Encode(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": errType, "message": message},
+	}); encErr != nil && lg != nil {
+		lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
+	}
+	return status
 }
 
 // writeNonStreamJSON writes a non-streaming answer under the per-write
