@@ -2641,6 +2641,8 @@ func main() {
 		printCreditsInfo(info)
 	case "desktop":
 		launchDesktop()
+	case "doctor":
+		runDoctor(os.Args[2:])
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -2832,7 +2834,12 @@ func hasSavedModel() bool {
 // advanced.profile config option: a bare name maps to ~/.claude-profiles/<name>,
 // an absolute path is used as-is. "" when the option is unset.
 func resolveProfileDir() string {
-	name := strings.TrimSpace(config.Get().Advanced.Profile)
+	return resolveProfileDirFor(config.Get())
+}
+
+// resolveProfileDirFor is resolveProfileDir for a given configuration.
+func resolveProfileDirFor(cfg *config.Config) string {
+	name := strings.TrimSpace(cfg.Advanced.Profile)
 	if name == "" {
 		return ""
 	}
@@ -2850,10 +2857,15 @@ func resolveProfileDir() string {
 // $CLAUDE_CONFIG_DIR when set (isolated profile), else the advanced.profile
 // config option when set, else ~/.claude.
 func claudeConfigDir() string {
+	return claudeConfigDirFor(config.Get())
+}
+
+// claudeConfigDirFor is claudeConfigDir for a given configuration.
+func claudeConfigDirFor(cfg *config.Config) string {
 	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
 		return v
 	}
-	if v := resolveProfileDir(); v != "" {
+	if v := resolveProfileDirFor(cfg); v != "" {
 		return v
 	}
 	homeDir, err := os.UserHomeDir()
@@ -2868,10 +2880,15 @@ func claudeConfigDir() string {
 // lives inside that directory; otherwise it sits at ~/.claude.json (NOT inside
 // ~/.claude).
 func claudeStateFile() string {
+	return claudeStateFileFor(config.Get())
+}
+
+// claudeStateFileFor is claudeStateFile for a given configuration.
+func claudeStateFileFor(cfg *config.Config) string {
 	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
 		return filepath.Join(v, ".claude.json")
 	}
-	if v := resolveProfileDir(); v != "" {
+	if v := resolveProfileDirFor(cfg); v != "" {
 		return filepath.Join(v, ".claude.json")
 	}
 	homeDir, err := os.UserHomeDir()
@@ -3859,6 +3876,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro server [port]       - Start Anthropic API proxy server (headless)")
 	fmt.Println("  claude2kiro credits [--web|--all] - Show Kiro credit usage (--web opens live dashboard, --all every identity)")
 	fmt.Println("  claude2kiro models              - List models available via Kiro (live)")
+	fmt.Println("  claude2kiro doctor [--json] [--offline] - Read-only health report (token, catalogue, proxy, Claude Code/Desktop)")
 	fmt.Println("  claude2kiro migrate-logs [date] - Migrate log files to use attachment store")
 	fmt.Println("                                    (date format: 2026-01-02, omit for all)")
 	fmt.Println("")
