@@ -356,3 +356,14 @@ func TestDeltaSessionMapBounded(t *testing.T) {
 		t.Errorf("deltaSessOrder holds %d, want <= %d", order, maxDeltaSessions)
 	}
 }
+
+// A warning written to the log file reads back as a warning.
+func TestWarnLineRoundTrips(t *testing.T) {
+	entry, ok := parsePlainLogLine("[2026-11-20 06:45:27.571] [WRN] Idle cut convId=43fc2462 resent")
+	if !ok || entry.Type != LogTypeWrn || entry.Type.String() != "WRN" {
+		t.Fatalf("parsed %+v ok=%v, want a WRN entry", entry, ok)
+	}
+	if entry.Body != "Idle cut convId=43fc2462 resent" {
+		t.Fatalf("body = %q", entry.Body)
+	}
+}

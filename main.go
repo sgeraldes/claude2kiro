@@ -583,6 +583,9 @@ type CodeWhispererRequest struct {
 	// scope is responseScope of the request this was built from: where the
 	// response's reasoning is stored. Not sent.
 	scope reasoningScope
+	// recoveredTurns counts the recovered exchanges put back into the
+	// history (recovery.go). Not sent.
+	recoveredTurns int
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
@@ -2022,7 +2025,7 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 	}
 
 	return fmt.Sprintf(
-		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d",
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d recoveredTurns=%d",
 		convID,
 		current.ModelId,
 		reqBytes,
@@ -2037,6 +2040,7 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		advanced.AggressiveCachePoints,
 		cwReq.reasoning.turns,
 		cwReq.reasoning.bytes,
+		cwReq.recoveredTurns,
 	)
 }
 
@@ -2427,7 +2431,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		// In none_text mode the history holds tool calls as text, not what the
 		// reasoning was signed with, so nothing is attached there.
 		if toolMode != "none_text" {
-			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes)
+			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes, cfg.Advanced.ReasoningHistoryMaxBlocks)
 		}
 	}
 
@@ -4733,7 +4737,12 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	}
 
 	// Build CodeWhisperer request
+	// Put back what the client never saw of earlier recovered responses
+	// (recovery.go).
+	var recovered int
+	anthropicReq, recovered = withRecoveredTurns(anthropicReq)
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
+	cwReq.recoveredTurns = recovered
 
 	// Keep the stable conversationId concurrency-safe: parallel Task subagents
 	// share the parent session id, so without this they'd all hit the backend on
@@ -4787,7 +4796,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			return false
 		}
 		lg.LogInfo(fmt.Sprintf("Client disconnected %s convId=%s after %s — backend request cancelled",
-			stage, cwReq.ConversationState.ConversationId[:8], time.Since(queuedAt).Round(time.Millisecond)))
+			stage, shortID(cwReq.ConversationState.ConversationId), time.Since(queuedAt).Round(time.Millisecond)))
 		return true
 	}
 	if !kiroSema.acquireCtx(ctx) {
@@ -4798,7 +4807,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	}
 	defer kiroSema.release()
 	queueWait := time.Since(queuedAt)
-	sentAt := time.Now()
+	var sentAt time.Time // when the attempt that answered was sent
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response
@@ -4860,6 +4869,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		}
 
 		sent++
+		sentAt = time.Now()
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
 		if lastErr != nil {
 			if clientGone("before the backend answered") {
@@ -4889,12 +4899,12 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 				if ferr == nil {
 					ferr = fmt.Errorf("identity switches exhausted after %d", switches)
 				}
-				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel(), reason, ferr))
+				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel(), reason, ferr))
 				sendNonRetryableErrorEvent(w, flusher, quotaExhaustedMessage(reason, ferr))
 				return ""
 			}
 			switches++
-			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 			if err := adopt(fallback, next); err != nil {
 				sendErrorEvent(w, flusher, "Failed to serialize request", err)
 				return ""
@@ -4919,7 +4929,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			}
 			cwReqBody = stripped
 			lg.LogInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
-				cwReq.ConversationState.ConversationId[:8], turns, size))
+				shortID(cwReq.ConversationState.ConversationId), turns, size))
 			attempt--
 			skipBackoff = true
 			continue
@@ -4954,7 +4964,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			// an identity switch, not a transient retry, so it costs no attempt.
 			if tok, id, terr := tokenForRequest(); terr == nil {
 				switches++
-				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 				if err := adopt(tok, id); err != nil {
 					sendErrorEvent(w, flusher, "Failed to serialize request", err)
 					return ""
@@ -4968,7 +4978,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			tok, id, moved, rerr := recoverFromInvalidBearer(ident, token, refreshedFor, switches < maxSwitches)
 			if rerr != nil {
 				lastRecoverErr = rerr
-				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], rerr))
+				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", shortID(cwReq.ConversationState.ConversationId), rerr))
 				// Fall through to the terminal 403 handler, which surfaces a
 				// clear "refresh failed, please re-login" to the client.
 			} else {
@@ -4980,9 +4990,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 					switches++
 					attempt--
 					skipBackoff = true
-					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 				} else {
-					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
+					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", shortID(cwReq.ConversationState.ConversationId)))
 				}
 				continue
 			}
@@ -4990,9 +5000,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel && !signatureInvalid)) {
 			if overloaded {
-				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
+				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, shortID(cwReq.ConversationState.ConversationId), attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
-				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
+				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", shortID(cwReq.ConversationState.ConversationId), attempt+1, len(cwReqBody), string(body)))
 			}
 			continue
 		}
@@ -5001,7 +5011,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		if cfg.Advanced.DebugMode {
 			debug.WriteDebugFileWithScrub("cw-FAILED", cwReqBody)
 		}
-		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
+		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", shortID(cwReq.ConversationState.ConversationId), resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 && isInvalidBearerToken(body) {
 			switch {
@@ -5054,13 +5064,20 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		sendErrorEvent(w, flusher, "CodeWhisperer request error after retries", lastErr)
 		return ""
 	}
-	defer resp.Body.Close()
+	// resp changes when an interrupted response is recovered; close whichever
+	// is current.
+	// resp is nil while a recovery request is out, so the body is closed once.
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
 
 	// Forward the response as it arrives: each backend frame is translated and
-	// sent before the next one is read. The raw bytes are kept for metering and
-	// the debug dump.
+	// sent before the next one is read, except tool calls, which are held
+	// until the response ends (recovery.go). The raw bytes are kept for
+	// metering and the debug dump.
 	var rawResp bytes.Buffer
-	body := io.TeeReader(resp.Body, &rawResp)
 	translator := parser.NewStreamTranslator()
 	toolNames := buildToolNameMap(anthropicReq.Tools)
 	var responseText strings.Builder
@@ -5092,87 +5109,188 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		}, capturedEvents)
 		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"}, capturedEvents)
 	}
-	forward := func(events []parser.SSEEvent) {
-		// Restore original tool names (sanitized for CodeWhisperer's 64-char
-		// limit) so Claude Code recognizes its tools.
-		restoreToolNames(events, toolNames)
-		for _, e := range events {
-			if dataMap, ok := e.Data.(map[string]any); ok {
-				if delta, ok := dataMap["delta"].(map[string]any); ok {
-					if text, ok := delta["text"].(string); ok {
-						hasTextContent = true
-						outputChars += len(text)
-						responseText.WriteString(text)
-					}
-					if pj, ok := delta["partial_json"].(string); ok {
-						outputChars += len(pj)
-					}
+	forward := func(e parser.SSEEvent) {
+		if ctx.Err() != nil {
+			return
+		}
+		if dataMap, ok := e.Data.(map[string]any); ok {
+			if delta, ok := dataMap["delta"].(map[string]any); ok {
+				if text, ok := delta["text"].(string); ok {
+					hasTextContent = true
+					outputChars += len(text)
+					responseText.WriteString(text)
 				}
-				if cb, ok := dataMap["content_block"].(map[string]any); ok && cb["type"] == "tool_use" {
-					toolBlockCount++
+				if pj, ok := delta["partial_json"].(string); ok {
+					outputChars += len(pj)
 				}
 			}
-			eventCount++
-			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
-			if delayMs > 0 {
-				// The pause ends when the client leaves; nothing more is sent
-				// and the read loop ends through the client-gone path.
-				pause := time.NewTimer(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
-				select {
-				case <-pause.C:
-				case <-ctx.Done():
-					pause.Stop()
-					return
-				}
+			if cb, ok := dataMap["content_block"].(map[string]any); ok && cb["type"] == "tool_use" {
+				toolBlockCount++
+			}
+		}
+		eventCount++
+		sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
+		if delayMs > 0 {
+			// The pause ends when the client leaves; nothing more is sent
+			// and the read loop ends through the client-gone path.
+			pause := time.NewTimer(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+			select {
+			case <-pause.C:
+			case <-ctx.Done():
+				pause.Stop()
+			}
+		}
+	}
+	emitter := newBlockEmitter(forward)
+	// logMetering logs the credits of the attempt in rawResp; every attempt of
+	// a recovered response is logged, as without streaming.
+	logMetering := func() {
+		if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(rawResp.Bytes())); usageMsg != "" {
+			if cfg.Advanced.ComparisonMode {
+				lg.LogComparison(sessionID, requestID, usageMsg)
+			} else {
+				lg.LogInfo(usageMsg)
 			}
 		}
 	}
 
+	// The request as Kiro saw it; recoveries extend it.
+	currentReq := anthropicReq
+	var hidden recoveredExchange
+	convID := shortID(cwReq.ConversationState.ConversationId)
 	var readErr error
-	for {
-		payload, err := parser.ReadFramePayload(body)
-		if err != nil {
-			// Only io.EOF on a frame boundary is a finished response. A stream
-			// that ends inside a frame, a frame with impossible lengths or a
-			// transport error means the backend did not finish the answer.
-			if err != io.EOF {
-				readErr = err
+	var silence time.Duration // how long the backend had been silent when the read failed
+	for recoveries := 0; ; {
+		backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+		body := io.TeeReader(backendBody, &rawResp)
+		readErr = nil
+		for {
+			payload, err := parser.ReadFramePayload(body)
+			if err != nil {
+				// Only io.EOF on a frame boundary is a finished response. A stream
+				// that ends inside a frame, a frame with impossible lengths or a
+				// transport error means the backend did not finish the answer.
+				if err != io.EOF {
+					readErr = err
+				}
+				break
 			}
+			events := translator.Translate(payload)
+			if len(events) == 0 {
+				continue
+			}
+			startMessage(len(cwReqBody) / 4) // approximate from the CodeWhisperer request size
+			restoreToolNames(events, toolNames)
+			emitter.push(events)
+		}
+		if ctx.Err() != nil {
 			break
 		}
-		events := translator.Translate(payload)
-		if len(events) == 0 {
-			continue
+		silence = backendBody.silence()
+		kind := interruptionKind(readErr, silence, cfg.Network.BackendIdleCutAfter, translator, emitter)
+		if kind == interruptNone {
+			break
 		}
-		startMessage(len(cwReqBody) / 4) // approximate from the CodeWhisperer request size
-		forward(events)
-	}
-
-	// Debug: Save raw response for analysis
-	if cfg.Advanced.DebugMode {
-		debug.WriteDebugFile("cw-response", rawResp.Bytes())
-	}
-	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(rawResp.Bytes())); usageMsg != "" {
-		if cfg.Advanced.ComparisonMode {
-			lg.LogComparison(sessionID, requestID, usageMsg)
+		cause := interruptionCause(kind, readErr, silence, cfg.Network.BackendIdleCutAfter)
+		if !cfg.Advanced.InterruptedToolRecovery || recoveries >= maxRecoveries {
+			// Path 3: recovery is off or used up.
+			why := "recovery is off (advanced.interrupted_tool_recovery)"
+			if cfg.Advanced.InterruptedToolRecovery {
+				why = fmt.Sprintf("%d recoveries in a row already", recoveries)
+			}
+			lg.LogError(fmt.Sprintf("Interrupted response convId=%s (%s), backend silent %s, %s since sent, after %d events - path 3, %s: failing the response: %v",
+				convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount, why, readErr))
+			if kind == interruptTruncated || recoveries >= maxRecoveries || isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter) {
+				// Resending as it is cannot help (an idle cut is cut again):
+				// an error the client does not resend, as without streaming.
+				sendNonRetryableErrorEvent(w, flusher, interruptionErrorMessage(kind, silence, recoveries))
+			} else {
+				sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response was interrupted (%s): %v", cause, readErr))
+			}
+			return ""
+		}
+		recoveries++
+		text, tools := emitter.endAttempt()
+		var what string
+		if kind == interruptResend && strings.TrimSpace(text) == "" {
+			// Path 1: nothing reached the client; send the same request again.
+			what = "resending the same request"
+			if !sleepCtx(ctx, recoveryBackoff()) {
+				break
+			}
 		} else {
-			lg.LogInfo(usageMsg)
+			// Path 2: answer the interrupted attempt and ask for the rest.
+			turns := recoveryTurns(text, tools, kind == interruptTruncated, isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter))
+			hidden.Turns = append(hidden.Turns, turns...)
+			if strings.TrimSpace(text) != "" {
+				hidden.LeadTexts = append(hidden.LeadTexts, text)
+			}
+			currentReq = extendedRequest(currentReq, turns)
+			next, body, err := recoveryRequest(currentReq, token, cwReq.ConversationState.ConversationId)
+			if err != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", err)
+				return ""
+			}
+			cwReq, cwReqBody = next, body
+			what = describeRecovery(tools)
 		}
+		lg.LogWarn(fmt.Sprintf("Interrupted response convId=%s (%s), backend silent %s, %s since sent, after %d events - path %s, recovery %d of %d: %s",
+			convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount,
+			recoveryPath(kind, text), recoveries, maxRecoveries, what))
+		resp.Body.Close()
+		resp = nil
+		logMetering()
+		sentAt = time.Now()
+		next, err := sendRecoveryRequest(ctx, cfg, token, cwReqBody)
+		if err != nil {
+			if clientGone("before the recovery request was answered") {
+				return ""
+			}
+			lg.LogError(fmt.Sprintf("Recovery request convId=%s failed: %v", convID, err))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error on the request that recovers an interrupted response: %v", err))
+			return ""
+		}
+		resp = next
+		translator = parser.NewStreamTranslator()
+		rawResp.Reset()
 	}
 
-	if readErr != nil {
-		if clientGone("mid-response") {
-			return responseText.String()
-		}
-		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events: %v", cwReq.ConversationState.ConversationId[:8], eventCount, readErr))
+	if readErr != nil && ctx.Err() == nil {
+		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events, %s since sent, backend silent %s: %v",
+			convID, eventCount, time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
 		// No content_block_stop, message_delta or message_stop: the client must
 		// see an unfinished answer as an error (overloaded, so it retries).
 		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
 		return ""
 	}
 
-	if translator.Emitted() {
-		forward(translator.Finish())
+	// Debug: Save raw response for analysis
+	if cfg.Advanced.DebugMode {
+		debug.WriteDebugFile("cw-response", rawResp.Bytes())
+	}
+	logMetering()
+
+	if clientGone("mid-response") {
+		return responseText.String()
+	}
+
+	// Close the open blocks and send the held tool calls.
+	emitter.push(func() []parser.SSEEvent {
+		events := translator.Finish()
+		restoreToolNames(events, toolNames)
+		return events
+	}())
+	finalTools := emitter.heldTools()
+	emitter.flushTools()
+	if len(hidden.Turns) > 0 {
+		ids := make([]string, 0, len(finalTools))
+		for _, t := range finalTools {
+			ids = append(ids, t.id)
+		}
+		recoveredTurns.put(recoveryKeys(recoveryScope(anthropicReq), ids, responseText.String()), hidden)
+	}
+
+	if translator.Emitted() || emitter.next > 0 {
 		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
 			translator.Reasoning(), translator.ToolUseIDs(), translator.Text())
 
@@ -7482,7 +7600,12 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	}
 
 	// Build CodeWhisperer request
+	// Put back what the client never saw of earlier recovered responses
+	// (recovery.go).
+	var recovered int
+	anthropicReq, recovered = withRecoveredTurns(anthropicReq)
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
+	cwReq.recoveredTurns = recovered
 
 	// Concurrency-safe stable conversationId (see claimStableConversation). Must
 	// run before marshaling the body below.
@@ -7533,6 +7656,11 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 			lg.LogError(msg)
 		}
 	}
+	logWarn := func(msg string) {
+		if lg != nil {
+			lg.LogWarn(msg)
+		}
+	}
 	// adopt rebuilds the outgoing request for another identity's token.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
@@ -7568,7 +7696,11 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	const bearerRetriesPerIdentity = 3
 	bearerRetries := 0
 	reasoningStripped := false // the request was resent once without its reasoning
+	var readErr error          // the 200 response broke while it was read
+	var silence time.Duration  // how long the backend had been silent then
+	var sentAt time.Time
 	for {
+		sentAt = time.Now()
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -7580,15 +7712,25 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		}
 
 		// Read response
-		cwRespBody, err = io.ReadAll(resp.Body)
+		backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+		cwRespBody, err = io.ReadAll(backendBody)
 		resp.Body.Close()
 		if err != nil && ctx.Err() != nil {
 			logInfo("Client disconnected (non-stream) mid-response — backend request cancelled")
 			return statusClientClosedRequest
 		}
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-			return http.StatusInternalServerError
+			// The backend broke the answer (for example an HTTP/2 RST_STREAM).
+			// A 200 is recovered below (recovery.go); anything else fails.
+			silence = backendBody.silence()
+			if resp.StatusCode == http.StatusOK {
+				readErr = err
+				break
+			}
+			logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s status=%d after %d bytes, %s since sent, backend silent %s: %v",
+				shortID(cwReq.ConversationState.ConversationId), resp.StatusCode, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
+			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", err))
 		}
 
 		// A rejected reasoning signature: resend once without any reasoning and
@@ -7598,7 +7740,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
 			reasoningStore.Evict(cwReq.stripReasoning()...)
 			logInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID (non-stream) convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
-				cwReq.ConversationState.ConversationId[:8], turns, size))
+				shortID(cwReq.ConversationState.ConversationId), turns, size))
 			if err := adopt(token, ident); err != nil {
 				http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
 				return http.StatusInternalServerError
@@ -7703,15 +7845,127 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 		os.WriteFile(filepath.Join(debugDir, "last-cw-response.bin"), cwRespBody, 0600)
 	}
 
-	events, summary := parser.ParseEventsWithSummary(cwRespBody)
+	// Translate the answer attempt by attempt: an interrupted attempt, or one
+	// that stopped at MAX_TOKENS inside a tool call, is recovered the way
+	// Kiro's client does it (recovery.go). Text of every attempt and the tool
+	// calls of the last one make the answer.
+	toolNames := buildToolNameMap(anthropicReq.Tools)
+	var events []parser.SSEEvent
+	emitter := newBlockEmitter(func(e parser.SSEEvent) { events = append(events, e) })
+	currentReq := anthropicReq
+	var hidden recoveredExchange
+	var finalTools []*heldTool
+	var allText strings.Builder
+	convID := shortID(cwReq.ConversationState.ConversationId)
+	for recoveries := 0; ; {
+		if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
+			lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
+		}
+		translator := parser.NewStreamTranslator()
+		frames := bytes.NewReader(cwRespBody)
+		attemptStart := len(events) // the emitter's output before this attempt
+		var attemptEvents []parser.SSEEvent
+		for {
+			payload, ferr := parser.ReadFramePayload(frames)
+			if ferr != nil {
+				if ferr != io.EOF && readErr == nil {
+					readErr = ferr // a body that ends inside a frame did not finish
+				}
+				break
+			}
+			translated := translator.Translate(payload)
+			restoreToolNames(translated, toolNames)
+			attemptEvents = append(attemptEvents, translated...)
+			emitter.push(translated)
+		}
+		kind := interruptionKind(readErr, silence, cfg.Network.BackendIdleCutAfter, translator, emitter)
+		if kind == interruptNone {
+			if readErr != nil {
+				logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s after %d bytes, %s since sent, backend silent %s: %v",
+					convID, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
+				return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+					fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
+			}
+			// The finished attempt keeps its own order (text after a tool
+			// stays after it); earlier attempts gave only their text.
+			finished := translator.Finish()
+			restoreToolNames(finished, toolNames)
+			emitter.push(finished)
+			finalTools = emitter.heldTools()
+			events = append(append(events[:attemptStart], attemptEvents...), finished...)
+			break
+		}
+		cause := interruptionCause(kind, readErr, silence, cfg.Network.BackendIdleCutAfter)
+		if !cfg.Advanced.InterruptedToolRecovery || recoveries >= maxRecoveries {
+			why := "recovery is off (advanced.interrupted_tool_recovery)"
+			if cfg.Advanced.InterruptedToolRecovery {
+				why = fmt.Sprintf("%d recoveries in a row already", recoveries)
+			}
+			logError(fmt.Sprintf("Interrupted response (non-stream) convId=%s (%s), backend silent %s, %s since sent, %d bytes - path 3, %s: failing the response: %v",
+				convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), len(cwRespBody), why, readErr))
+			if kind == interruptTruncated || recoveries >= maxRecoveries || isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter) {
+				// Resending as it is cannot help: a 400, which Claude Code
+				// does not resend.
+				return writeNonStreamError(w, lg, http.StatusBadRequest, "invalid_request_error", interruptionErrorMessage(kind, silence, recoveries))
+			}
+			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
+		}
+		recoveries++
+		text, tools := emitter.endAttempt()
+		allText.WriteString(text)
+		var what string
+		if kind == interruptResend && strings.TrimSpace(text) == "" {
+			what = "resending the same request"
+			if !sleepCtx(ctx, recoveryBackoff()) {
+				return statusClientClosedRequest
+			}
+		} else {
+			turns := recoveryTurns(text, tools, kind == interruptTruncated, isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter))
+			hidden.Turns = append(hidden.Turns, turns...)
+			if strings.TrimSpace(text) != "" {
+				hidden.LeadTexts = append(hidden.LeadTexts, text)
+			}
+			currentReq = extendedRequest(currentReq, turns)
+			next, body, berr := recoveryRequest(currentReq, token, cwReq.ConversationState.ConversationId)
+			if berr != nil {
+				return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error", fmt.Sprintf("Failed to serialize request: %v", berr))
+			}
+			cwReq, cwReqBody = next, body
+			what = describeRecovery(tools)
+		}
+		logWarn(fmt.Sprintf("Interrupted response (non-stream) convId=%s (%s), backend silent %s, %s since sent, %d bytes - path %s, recovery %d of %d: %s",
+			convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), len(cwRespBody),
+			recoveryPath(kind, text), recoveries, maxRecoveries, what))
+		sentAt = time.Now()
+		next, serr := sendRecoveryRequest(ctx, cfg, token, cwReqBody)
+		if serr != nil {
+			if ctx.Err() != nil {
+				return statusClientClosedRequest
+			}
+			logError(fmt.Sprintf("Recovery request (non-stream) convId=%s failed: %v", convID, serr))
+			return writeNonStreamError(w, lg, http.StatusBadGateway, "api_error",
+				fmt.Sprintf("CodeWhisperer Error on the request that recovers an interrupted response: %v", serr))
+		}
+		body := newLastReadReader(next.Body, time.Now())
+		cwRespBody, readErr = io.ReadAll(body)
+		next.Body.Close()
+		silence = body.silence()
+		if readErr != nil && ctx.Err() != nil {
+			return statusClientClosedRequest
+		}
+	}
+	_, summary := parser.ParseEventsWithSummary(cwRespBody)
 	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
 		summary.Reasoning, summary.ToolUseIDs, summary.Text)
-	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
-		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
+	if len(hidden.Turns) > 0 {
+		allText.WriteString(summary.Text)
+		ids := make([]string, 0, len(finalTools))
+		for _, t := range finalTools {
+			ids = append(ids, t.id)
+		}
+		recoveredTurns.put(recoveryKeys(recoveryScope(anthropicReq), ids, allText.String()), hidden)
 	}
-
-	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
-	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
 
 	contexts, toolCount, outputChars, blocksErr := nonStreamContentBlocks(events)
 	if blocksErr != nil {
@@ -7768,6 +8022,20 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	return http.StatusOK
 }
 
+// writeNonStreamError answers a non-streaming request with an Anthropic error
+// envelope and returns the status it wrote.
+func writeNonStreamError(w http.ResponseWriter, lg *logger.Logger, status int, errType, message string) int {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if encErr := json.NewEncoder(w).Encode(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": errType, "message": message},
+	}); encErr != nil && lg != nil {
+		lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
+	}
+	return status
+}
+
 // writeNonStreamJSON writes a non-streaming answer under the per-write
 // deadline streaming uses (streamWriteTimeout), so a client that stops reading
 // without closing cannot hold the handler forever. It flushes before clearing
@@ -7807,6 +8075,10 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 	}
 	var order []pending
 	toolsByIndex := map[any]*toolBlock{}
+	// A text block keeps its own text: an answer recovered after an
+	// interruption has one text block per attempt (recovery.go), and the
+	// history of later requests relies on finding the first one whole.
+	textByIndex := map[any]*strings.Builder{}
 	appendText := func(text string) {
 		outputChars += len(text)
 		if n := len(order); n > 0 && order[n-1].text != nil {
@@ -7826,6 +8098,12 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 		switch event.Event {
 		case "content_block_start":
 			cb, ok := dataMap["content_block"].(map[string]any)
+			if ok && cb["type"] == "text" {
+				b := &strings.Builder{}
+				textByIndex[dataMap["index"]] = b
+				order = append(order, pending{text: b})
+				continue
+			}
 			if !ok || cb["type"] != "tool_use" {
 				continue
 			}
@@ -7837,7 +8115,12 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 				switch delta["type"] {
 				case "text_delta":
 					if text, ok := delta["text"].(string); ok {
-						appendText(text)
+						if b := textByIndex[dataMap["index"]]; b != nil {
+							outputChars += len(text)
+							b.WriteString(text)
+						} else {
+							appendText(text)
+						}
 					}
 				case "input_json_delta":
 					if pj, ok := delta["partial_json"].(string); ok {

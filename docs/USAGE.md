@@ -227,6 +227,7 @@ no-tool suites; `aggressive_cache_points` cut ~34-36% on both suites.
 |---|---|---|
 | `advanced.thinking_mode` | `client` (default), `backend` | `client` sends the thinking the client asked for: off when it sent no `thinking` field (as Claude Code started by `claude2kiro run` does), adaptive when it asked for thinking, and only when the model's catalog schema allows that value. `backend` sends no `thinking` field, so Kiro applies its default, adaptive thinking on. Unknown values count as `client`. |
 | `advanced.reasoning_history_max_bytes` | int (default 4194304) | The proxy keeps the model's signed reasoning in memory and gives it back to Kiro in the history of later turns of the same model, newest turns first, up to this many bytes per request. `0` turns it off. Lost on restart. |
+| `advanced.reasoning_history_max_blocks` | int (default 0) | Caps how many earlier turns carry their reasoning, newest first, on top of the byte cap. `0` means no limit. Meant for measurements (for example `1`, newest only); the default is unchanged. |
 
 Thinking changes speed and cost a lot. On one agent step of 91k input tokens,
 Opus 5.5 with adaptive thinking took 329 s and 8.26 credits; Opus 4.8 with
@@ -238,6 +239,41 @@ The reasoning given back changes cost too. On a second turn of that step with
 `auto`, the request without the earlier reasoning took 290 s and 4.22 credits
 and the model planned again; with it, 44.5 s and 1.36 credits. Details in
 [PROTOCOL_TRANSLATION.md](PROTOCOL_TRANSLATION.md).
+
+### Interrupted responses (Kiro's 240-second limit)
+
+Kiro ends a response it has sent nothing on for about 240 seconds, and it sends
+a tool call's input only once the model has finished writing it, so a large file
+written in one `Write` call can take longer than that and never arrive. A tool
+call can also stop at the model's output limit (`MAX_TOKENS`). The proxy handles
+both the way Kiro's own client does:
+
+- It holds every tool call until the response has ended (text streams as it
+  arrives), so Claude Code never receives an incomplete tool call.
+- Interrupted before any tool call started: it sends the same request again
+  after about half a second (a cut request is not charged). If text already
+  reached Claude Code, it asks Kiro to continue from that text instead. Logged as
+  `[WRN] Interrupted response ... path 1` (same request) or `path 2`.
+- Interrupted inside a tool call, or stopped at the output limit inside one: it
+  answers that call with a failed tool result saying the call was not executed
+  and how to split the work (`Write` for the first part, at most about 50 lines,
+  then several small `Edit` calls), asks Kiro again in the same conversation and
+  streams the new answer to Claude Code as the rest of the same message. Logged
+  as `[WRN] Interrupted response ... path 2`.
+- At most 3 recoveries per response. After that, or with the switch off, the
+  response fails with an error that says what happened. Logged as
+  `[ERR] Interrupted response ... path 3`.
+
+The failed call and its tool result go to Kiro only: Claude Code never receives
+them and they are not in its transcript. So that Kiro sees a consistent
+conversation, the proxy keeps that exchange in memory (per conversation, at most
+256 responses and 16 MiB, six hours, lost on restart) and puts it back into the history of
+every later request, before the message Claude Code recorded for that response.
+
+| Setting | Values | Effect |
+|---|---|---|
+| `advanced.interrupted_tool_recovery` | bool (default true) | The recovery above. `false`: an interrupted response fails as an error. An idle cut or a call cut by the output limit gets an error Claude Code does not resend, since sending it again would end the same way; another broken stream stays retryable. |
+| `network.backend_idle_cut_after` | duration (default `230s`) | Backend silence after which a broken response is reported as Kiro's idle cut in the log and the error. |
 
 The live web dashboard (`claude2kiro credits --web`) charts credit history,
 burn rate, and projected runout from samples recorded every 15 minutes while

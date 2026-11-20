@@ -411,7 +411,7 @@ func (state FilterState) MatchesEntry(entry logger.LogEntry) bool {
 		if !state.ShowInf {
 			return false
 		}
-	case logger.LogTypeErr:
+	case logger.LogTypeErr, logger.LogTypeWrn:
 		if !state.ShowErr {
 			return false
 		}
