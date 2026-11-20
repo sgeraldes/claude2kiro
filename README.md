@@ -352,6 +352,8 @@ The proxy keeps no session data: it reads the auth token from disk on every requ
 
 ### Streaming
 
+Kiro ends a response it has sent nothing on for about 240 seconds, and it holds a tool call's input until the call is complete, so a large file written in one `Write` call can be cut. The proxy sends such a request once more when nothing reached the client yet; when a tool call was open it closes the call with what arrived, and the tool result Claude Code sends back goes to Kiro with a short note telling the model to split the work (`advanced.idle_cut_note`, on by default; Claude Code never sees the note). Details in [docs/USAGE.md](docs/USAGE.md).
+
 Streaming responses are forwarded as Kiro produces them. While Kiro is silent (it can take minutes before the first byte on a long step) the proxy sends a `ping` every `network.stream_keepalive_interval` (default 15s, `0` turns the pings off; editable in the settings screen), so the client does not give up and resend the request. If the client disconnects, the proxy cancels the request to Kiro and frees its concurrency slot. Details in [docs/PROTOCOL_TRANSLATION.md](docs/PROTOCOL_TRANSLATION.md).
 
 ## License

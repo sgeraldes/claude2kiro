@@ -227,6 +227,7 @@ no-tool suites; `aggressive_cache_points` cut ~34-36% on both suites.
 |---|---|---|
 | `advanced.thinking_mode` | `client` (default), `backend` | `client` sends the thinking the client asked for: off when it sent no `thinking` field (as Claude Code started by `claude2kiro run` does), adaptive when it asked for thinking, and only when the model's catalog schema allows that value. `backend` sends no `thinking` field, so Kiro applies its default, adaptive thinking on. Unknown values count as `client`. |
 | `advanced.reasoning_history_max_bytes` | int (default 4194304) | The proxy keeps the model's signed reasoning in memory and gives it back to Kiro in the history of later turns of the same model, newest turns first, up to this many bytes per request. `0` turns it off. Lost on restart. |
+| `advanced.reasoning_history_max_blocks` | int (default 0) | Caps how many earlier turns carry their reasoning, newest first, on top of the byte cap. `0` means no limit. Meant for measurements (for example `1`, newest only); the default is unchanged. |
 
 Thinking changes speed and cost a lot. On one agent step of 91k input tokens,
 Opus 5.5 with adaptive thinking took 329 s and 8.26 credits; Opus 4.8 with
@@ -238,6 +239,30 @@ The reasoning given back changes cost too. On a second turn of that step with
 `auto`, the request without the earlier reasoning took 290 s and 4.22 credits
 and the model planned again; with it, 44.5 s and 1.36 credits. Details in
 [PROTOCOL_TRANSLATION.md](PROTOCOL_TRANSLATION.md).
+
+### Kiro's 240-second limit on silent responses
+
+Kiro ends a response it has sent nothing on for about 240 seconds. It also
+sends a tool call's input only once the model has finished writing it, so a
+large file written in one `Write` call can take longer than that and never
+arrive. What the proxy does when that happens:
+
+1. Nothing reached Claude Code yet: the proxy sends the same request once more
+   (a cut request is not charged). Logged as `[WRN] Idle cut ... path 1`.
+2. A tool call was open: the proxy closes it with the input that arrived (for a
+   `Write`, often only `file_path`) and ends the answer as a tool call. Claude Code
+   runs it, the call fails validation, and Claude Code sends back an error tool
+   result. On its way to Kiro, that tool result gets a short note from the proxy
+   saying the call was cut because its input took more than 240 seconds, and to
+   split the work into smaller pieces. Logged as `[WRN] Idle cut ... path 2`.
+3. Anything else: a streaming answer fails as retryable (Claude Code resends it
+   once, without streaming), and a non-streaming request that is cut again gets
+   a `400` that says what happened. Logged as `[ERR] Idle cut ... path 3`.
+
+| Setting | Values | Effect |
+|---|---|---|
+| `advanced.idle_cut_note` | bool (default true) | Path 2 and its note. The note is added only to what the proxy sends to Kiro: Claude Code never receives it and its transcript keeps the tool result Claude Code wrote. The same note goes on that tool result in the history of later requests. Remembered in memory for six hours, lost on restart. `false`: such a cut takes path 3 instead. |
+| `network.backend_idle_cut_after` | duration (default `230s`) | Backend silence after which a broken response counts as Kiro's idle cut. |
 
 The live web dashboard (`claude2kiro credits --web`) charts credit history,
 burn rate, and projected runout from samples recorded every 15 minutes while
