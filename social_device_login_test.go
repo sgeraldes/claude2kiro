@@ -1,11 +1,126 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+// pollServer answers /oauth/device/poll with the given bodies in order and
+// records when each poll arrived.
+func pollServer(t *testing.T, bodies ...string) (*httptest.Server, func() []time.Time) {
+	t.Helper()
+	var mu sync.Mutex
+	var at []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/device/poll" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		n := len(at)
+		at = append(at, time.Now())
+		mu.Unlock()
+		if n >= len(bodies) {
+			n = len(bodies) - 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(bodies[n]))
+	}))
+	t.Cleanup(server.Close)
+	return server, func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), at...)
+	}
+}
+
+func TestAwaitSocialDeviceTokenKeepsPollingUntilAuthorized(t *testing.T) {
+	old := deviceSlowDownStep
+	deviceSlowDownStep = 150 * time.Millisecond
+	t.Cleanup(func() { deviceSlowDownStep = old })
+
+	server, polls := pollServer(t,
+		`{"accessToken":null,"refreshToken":null,"status":"authorization_pending"}`,
+		`{"accessToken":null,"refreshToken":null,"status":"slow_down"}`,
+		`{"accessToken":null,"refreshToken":null,"status":"slow_down"}`,
+		`{"accessToken":"fake-access","refreshToken":"fake-refresh","profileArn":"arn:aws:codewhisperer:us-east-1:000000000000:profile/FAKE","status":"COMPLETE","expiresIn":1800}`,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	before := time.Now()
+	token, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Google", 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("awaitSocialDeviceToken: %v", err)
+	}
+	if token.AccessToken != "fake-access" || token.RefreshToken != "fake-refresh" {
+		t.Fatalf("token not taken from the poll response: %+v", token)
+	}
+	if token.AuthMethod != "social" || token.Provider != "Google" || !strings.HasSuffix(token.ProfileArn, "profile/FAKE") {
+		t.Fatalf("token metadata = %+v", token)
+	}
+	expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
+	if err != nil {
+		t.Fatalf("ExpiresAt %q: %v", token.ExpiresAt, err)
+	}
+	if d := expiresAt.Sub(before); d < 29*time.Minute || d > 31*time.Minute {
+		t.Fatalf("ExpiresAt is %v after the start, want about 30m from expiresIn", d)
+	}
+
+	at := polls()
+	if len(at) != 4 {
+		t.Fatalf("polled %d times, want 4", len(at))
+	}
+	// Each slow_down adds the step again: the gap after the second one is
+	// at least two steps, not one.
+	if gap := at[3].Sub(at[2]); gap < 2*deviceSlowDownStep {
+		t.Fatalf("gap after the second slow_down = %v, want at least %v", gap, 2*deviceSlowDownStep)
+	}
+}
+
+func TestAwaitSocialDeviceTokenStopsOnTerminalStatus(t *testing.T) {
+	server, _ := pollServer(t, `{"accessToken":null,"refreshToken":null,"status":"expired_token"}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Github", 10*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "expired_token") {
+		t.Fatalf("err = %v, want one naming expired_token", err)
+	}
+}
+
+func TestAwaitSocialDeviceTokenTimesOut(t *testing.T) {
+	server, _ := pollServer(t, `{"accessToken":null,"refreshToken":null,"status":"authorization_pending"}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Google", 10*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+}
+
+func TestAwaitSocialDeviceTokenDefaultsExpiry(t *testing.T) {
+	server, _ := pollServer(t, `{"accessToken":"fake-access","refreshToken":"fake-refresh","status":"COMPLETE"}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	before := time.Now()
+	token, err := awaitSocialDeviceToken(ctx, server.Client(), server.URL, "device-1", "Google", 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("awaitSocialDeviceToken: %v", err)
+	}
+	expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
+	if err != nil {
+		t.Fatalf("ExpiresAt %q: %v", token.ExpiresAt, err)
+	}
+	if d := expiresAt.Sub(before); d < 59*time.Minute || d > 61*time.Minute {
+		t.Fatalf("ExpiresAt is %v after the start, want the one-hour default", d)
+	}
+}
 
 func TestSocialDeviceAuthorizationAndPolling(t *testing.T) {
 	mux := http.NewServeMux()

@@ -74,21 +74,6 @@ type TokenData struct {
 	LoginID string `json:"loginId,omitempty"`
 }
 
-// CreateTokenRequest represents the request to exchange auth code for tokens
-type CreateTokenRequest struct {
-	Code         string `json:"code"`
-	CodeVerifier string `json:"code_verifier"`
-	RedirectUri  string `json:"redirect_uri"`
-}
-
-// CreateTokenResponse represents the response from token exchange (Kiro social auth uses camelCase)
-type CreateTokenResponse struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ProfileArn   string `json:"profileArn,omitempty"`
-	ExpiresIn    int    `json:"expiresIn"`
-}
-
 // SSO OIDC types for Identity Center authentication
 
 // SSOClientRegistration represents cached client registration
@@ -5646,24 +5631,8 @@ func interactiveIdCLogin() *LoginConfig {
 }
 
 const (
-	kiroAuthEndpoint        = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	kiroSocialLoginEndpoint = "https://app.kiro.dev/signin"
+	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
 )
-
-// buildSocialLoginURL builds the browser URL used by the current Kiro CLI.
-// Token exchange still belongs to kiroAuthEndpoint, but the old /login page on
-// that host is no longer the public entry point for Google/GitHub sign-in.
-func buildSocialLoginURL(provider, redirectURI, codeChallenge, state string) string {
-	params := url.Values{
-		"idp":                   {provider},
-		"redirect_uri":          {redirectURI},
-		"code_challenge":        {codeChallenge},
-		"code_challenge_method": {"S256"},
-		"state":                 {state},
-		"redirect_from":         {"kirocli"},
-	}
-	return kiroSocialLoginEndpoint + "?" + params.Encode()
-}
 
 // generatePKCE generates PKCE code verifier and challenge
 func generatePKCE() (verifier string, challenge string, err error) {
@@ -6247,7 +6216,9 @@ func loginSocial(provider string) {
 	}
 
 	fmt.Printf("Authorization code: %s\n", auth.UserCode)
-	fmt.Printf("Open this URL to authenticate:\n%s\n\n", auth.VerificationURIComplete)
+	if !noBrowser {
+		fmt.Printf("Opening the browser. If it doesn't open, visit:\n%s\n\n", auth.VerificationURIComplete)
+	}
 	if err := openBrowser(auth.VerificationURIComplete); err != nil {
 		fmt.Printf("Failed to open browser: %v\n", err)
 		fmt.Println("Please open the URL above manually.")
@@ -6264,212 +6235,66 @@ func loginSocial(provider string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 
+	token, err := awaitSocialDeviceToken(ctx, client, kiroAuthEndpoint, auth.DeviceCode, provider, interval)
+	if err != nil {
+		fmt.Printf("Authentication failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := saveToken(token); err != nil {
+		fmt.Printf("Failed to save token: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\n✓ Login successful!")
+	fmt.Printf("Provider: %s\n", provider)
+	fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
+	fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
+}
+
+// deviceSlowDownStep is how much longer the device flow waits between polls
+// each time the server answers slow_down (RFC 8628 section 3.5: 5 seconds).
+var deviceSlowDownStep = 5 * time.Second
+
+// awaitSocialDeviceToken polls the device authorization until the user
+// approves it in the browser, the server ends it, or ctx expires. Each
+// slow_down lengthens the interval for the rest of the wait.
+func awaitSocialDeviceToken(ctx context.Context, client *http.Client, endpoint, deviceCode, provider string, interval time.Duration) (*TokenData, error) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Authentication timed out. Please try again.")
-			os.Exit(1)
-		case <-ticker.C:
-			poll, err := pollSocialDeviceAuthorization(client, kiroAuthEndpoint, auth.DeviceCode)
-			if err != nil {
-				fmt.Printf("Authentication failed: %v\n", err)
-				os.Exit(1)
-			}
-			switch poll.Status {
-			case "authorization_pending":
-				continue
-			case "slow_down":
-				ticker.Reset(interval + 5*time.Second)
-				continue
-			}
-			if poll.AccessToken == "" || poll.RefreshToken == "" {
-				fmt.Printf("Authentication failed: %s\n", poll.Status)
-				os.Exit(1)
-			}
-			expiresIn := poll.ExpiresIn
-			if expiresIn <= 0 {
-				expiresIn = 3600
-			}
-			token := &TokenData{
-				AccessToken:  poll.AccessToken,
-				RefreshToken: poll.RefreshToken,
-				ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339),
-				AuthMethod:   "social",
-				Provider:     provider,
-				ProfileArn:   poll.ProfileArn,
-			}
-			if err := saveToken(token); err != nil {
-				fmt.Printf("Failed to save token: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("\n✓ Login successful!")
-			fmt.Printf("Provider: %s\n", provider)
-			fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
-			return
+			return nil, fmt.Errorf("authentication timed out, please try again")
+		case <-timer.C:
 		}
-	}
-}
-
-// loginSocialPKCE retains the previous local callback implementation for
-// reference while social login uses the more reliable device flow above.
-func loginSocialPKCE(provider string) {
-	fmt.Printf("Starting login with %s...\n", provider)
-
-	// Generate PKCE values
-	codeVerifier, codeChallenge, err := generatePKCE()
-	if err != nil {
-		fmt.Printf("Failed to generate PKCE: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Generate state for CSRF protection
-	state, err := generateState()
-	if err != nil {
-		fmt.Printf("Failed to generate state: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Find available port and start local callback server
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		fmt.Printf("Failed to start callback server: %v\n", err)
-		os.Exit(1)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectUri := fmt.Sprintf("http://localhost:%d/oauth/callback", port)
-
-	fmt.Printf("Callback server started on port %d\n", port)
-
-	// Channel to receive the auth code
-	authCodeChan := make(chan string, 1)
-	errChan := make(chan error, 1)
-	// The first terminal result wins; a stray or repeated callback after it
-	// must not block its handler (Shutdown waits for handlers) nor the login.
-	outcome := &loginOutcome{}
-	fail := loginFailer(outcome, errChan)
-	deliver := loginDeliverer(outcome, authCodeChan)
-
-	// Create HTTP server for callback with local mux (avoid polluting DefaultServeMux)
-	mux := http.NewServeMux()
-	server := &http.Server{Handler: mux}
-	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
-		// Validate state
-		receivedState := r.URL.Query().Get("state")
-		if receivedState != state {
-			fail(fmt.Errorf("state mismatch: expected %s, got %s", state, receivedState))
-			http.Error(w, "Invalid state parameter", http.StatusBadRequest)
-			return
-		}
-
-		// Check for error
-		if errParam := r.URL.Query().Get("error"); errParam != "" {
-			errDesc := r.URL.Query().Get("error_description")
-			fail(fmt.Errorf("OAuth error: %s - %s", errParam, errDesc))
-			http.Error(w, fmt.Sprintf("Authentication failed: %s", errDesc), http.StatusBadRequest)
-			return
-		}
-
-		// Get auth code
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			fail(fmt.Errorf("no authorization code received"))
-			http.Error(w, "No authorization code received", http.StatusBadRequest)
-			return
-		}
-
-		// Send success response to browser
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`
-			<!DOCTYPE html>
-			<html>
-			<head>
-				<meta charset="UTF-8">
-				<title>Login Successful</title>
-				<style>
-					body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-						   display: flex; justify-content: center; align-items: center;
-						   height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-					.container { text-align: center; background: white; padding: 40px 60px;
-								 border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
-					h1 { color: #333; margin-bottom: 10px; }
-					p { color: #666; }
-				</style>
-			</head>
-			<body>
-				<div class="container">
-					<h1>✓ Login Successful!</h1>
-					<p>You can close this window and return to the terminal.</p>
-				</div>
-			</body>
-			</html>
-		`))
-
-		deliver(code)
-	})
-
-	// Start server in goroutine
-	go func() {
-		if err := server.Serve(listener); err != http.ErrServerClosed {
-			fail(fmt.Errorf("callback server error: %v", err))
-		}
-	}()
-
-	// Kiro moved the browser-facing social login page to app.kiro.dev. The
-	// auth service remains responsible for the subsequent token exchange.
-	loginUrl := buildSocialLoginURL(provider, redirectUri, codeChallenge, state)
-
-	fmt.Println("Opening browser for authentication...")
-	fmt.Printf("If the browser doesn't open, please visit:\n%s\n\n", loginUrl)
-
-	if err := openBrowser(loginUrl); err != nil {
-		fmt.Printf("Failed to open browser: %v\n", err)
-		fmt.Println("Please open the URL above manually.")
-	}
-
-	fmt.Println("Waiting for authentication...")
-
-	// Wait for auth code or error with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	select {
-	case code := <-authCodeChan:
-		// Shutdown server
-		shutdownLoginServer(server)
-
-		fmt.Println("Authorization code received, exchanging for tokens...")
-
-		// Exchange code for tokens
-		token, err := exchangeCodeForTokens(code, codeVerifier, redirectUri, provider)
+		poll, err := pollSocialDeviceAuthorization(client, endpoint, deviceCode)
 		if err != nil {
-			fmt.Printf("Failed to exchange code for tokens: %v\n", err)
-			os.Exit(1)
+			return nil, err
 		}
-
-		// Save token to file
-		if err := saveToken(token); err != nil {
-			fmt.Printf("Failed to save token: %v\n", err)
-			os.Exit(1)
+		switch poll.Status {
+		case "authorization_pending":
+			timer.Reset(interval)
+			continue
+		case "slow_down":
+			interval += deviceSlowDownStep
+			timer.Reset(interval)
+			continue
 		}
-
-		fmt.Println("\n✓ Login successful!")
-		fmt.Printf("Provider: %s\n", provider)
-		fmt.Printf("Token expires at: %s\n", token.ExpiresAt)
-		fmt.Println("\nYou can now run 'claude2kiro server' to start the proxy.")
-
-	case err := <-errChan:
-		shutdownLoginServer(server)
-		fmt.Printf("Authentication failed: %v\n", err)
-		os.Exit(1)
-
-	case <-ctx.Done():
-		shutdownLoginServer(server)
-		fmt.Println("Authentication timed out. Please try again.")
-		os.Exit(1)
+		if poll.AccessToken == "" || poll.RefreshToken == "" {
+			return nil, fmt.Errorf("device authorization ended with status %q", poll.Status)
+		}
+		expiresIn := poll.ExpiresIn
+		if expiresIn <= 0 {
+			expiresIn = 3600
+		}
+		return &TokenData{
+			AccessToken:  poll.AccessToken,
+			RefreshToken: poll.RefreshToken,
+			ExpiresAt:    time.Now().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339),
+			AuthMethod:   "social",
+			Provider:     provider,
+			ProfileArn:   poll.ProfileArn,
+		}, nil
 	}
 }
 
@@ -6819,66 +6644,6 @@ func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg 
 		ClientIdHash: clientIdHash,
 		Region:       region,
 		StartUrl:     startUrl,
-	}
-
-	return token, nil
-}
-
-// exchangeCodeForTokens exchanges the authorization code for access tokens (social auth)
-func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*TokenData, error) {
-	tokenUrl := fmt.Sprintf("%s/oauth/token", kiroAuthEndpoint)
-
-	reqBody := CreateTokenRequest{
-		Code:         code,
-		CodeVerifier: codeVerifier,
-		RedirectUri:  redirectUri,
-	}
-
-	reqJson, err := jsonStr.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
-	}
-
-	req, err := http.NewRequest("POST", tokenUrl, bytes.NewBuffer(reqJson))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	// Set headers to match Kiro IDE
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", kiroide.UserAgent())
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp CreateTokenResponse
-	if err := jsonStr.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	// Calculate expiration time
-	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-
-	token := &TokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		ExpiresAt:    expiresAt.Format(time.RFC3339),
-		AuthMethod:   "social",
-		Provider:     provider,
-		ProfileArn:   tokenResp.ProfileArn,
 	}
 
 	return token, nil
