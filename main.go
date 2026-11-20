@@ -43,6 +43,7 @@ import (
 	creditshist "github.com/sgeraldes/claude2kiro/internal/credits"
 	webdash "github.com/sgeraldes/claude2kiro/internal/dashboard"
 	"github.com/sgeraldes/claude2kiro/internal/debug"
+	"github.com/sgeraldes/claude2kiro/internal/kiroide"
 	"github.com/sgeraldes/claude2kiro/internal/models"
 
 	"github.com/sgeraldes/claude2kiro/internal/profile"
@@ -206,7 +207,14 @@ type HistoryAssistantMessage struct {
 	AssistantResponseMessage struct {
 		Content  string `json:"content"`
 		ToolUses []any  `json:"toolUses"`
+		// ReasoningContent is the model's own reasoning for this turn, kept
+		// by the proxy and given back (see reasoning_history.go).
+		ReasoningContent *ReasoningContent `json:"reasoningContent,omitempty"`
 	} `json:"assistantResponseMessage"`
+
+	// turnKeys are the reasoning store keys of this turn: its tool use ids or,
+	// without one, its text (reasoningScope.keys). Not sent.
+	turnKeys []string
 }
 
 // AnthropicRequest represents the Anthropic API request structure
@@ -305,7 +313,11 @@ func sanitizeHistoryContent(content string) string {
 	return content
 }
 
-// getMessageContent extracts text content from a message
+// getMessageContent extracts the text blocks of a message. tool_result blocks
+// are skipped: their text travels once, in userInputMessageContext.toolResults
+// (getMessageToolResults). Repeating it here doubled the ingested tokens of
+// every tool-heavy turn. A message holding only tool results yields "", which
+// Kiro accepts when toolResults is present.
 func getMessageContent(content any) string {
 	switch v := content.(type) {
 	case string:
@@ -316,29 +328,11 @@ func getMessageContent(content any) string {
 	case []any:
 		var texts []string
 		hasToolUse := false
-		hasToolResult := false
 		for _, block := range v {
 			if m, ok := block.(map[string]any); ok {
 				// Get the block type
 				blockType, _ := m["type"].(string)
 				switch blockType {
-				case "tool_result":
-					hasToolResult = true
-					// Tool result content can be a string or an array of content blocks
-					if contentStr, ok := m["content"].(string); ok {
-						texts = append(texts, contentStr)
-					} else if contentArr, ok := m["content"].([]any); ok {
-						// Content is an array of blocks - extract text from each
-						for _, innerBlock := range contentArr {
-							if innerMap, ok := innerBlock.(map[string]any); ok {
-								if innerType, _ := innerMap["type"].(string); innerType == "text" {
-									if textVal, ok := innerMap["text"].(string); ok {
-										texts = append(texts, textVal)
-									}
-								}
-							}
-						}
-					}
 				case "text":
 					if textVal, ok := m["text"].(string); ok {
 						texts = append(texts, textVal)
@@ -350,7 +344,6 @@ func getMessageContent(content any) string {
 				}
 			}
 		}
-		_ = hasToolResult // Used for debugging if needed
 		if len(texts) == 0 {
 			if hasToolUse {
 				// Tool-only message - return empty content
@@ -584,12 +577,29 @@ type CodeWhispererRequest struct {
 	} `json:"conversationState"`
 	ProfileArn                   string                        `json:"profileArn,omitempty"`
 	AdditionalModelRequestFields *AdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
+
+	// reasoning is what attachReasoning put in the history. Not sent.
+	reasoning reasoningAttachment
+	// scope is responseScope of the request this was built from: where the
+	// response's reasoning is stored. Not sent.
+	scope reasoningScope
+	// recoveredTurns counts the recovered exchanges put back into the
+	// history (recovery.go). Not sent.
+	recoveredTurns int
 }
 
 // AdditionalModelRequestFields carries model-specific options in the current
-// Kiro CLI wire format. Today that is only output_config.effort.
+// Kiro CLI wire format: thinking, output_config.effort and max_tokens. Each
+// model's catalog entry publishes a schema of the keys it accepts and rejects
+// any other key, so a field is only set when that schema declares it.
 type AdditionalModelRequestFields struct {
-	OutputConfig *OutputConfig `json:"output_config,omitempty"`
+	Thinking     *ThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig *OutputConfig   `json:"output_config,omitempty"`
+	MaxTokens    int             `json:"max_tokens,omitempty"`
+}
+
+type ThinkingConfig struct {
+	Type string `json:"type"`
 }
 
 type OutputConfig struct {
@@ -640,12 +650,45 @@ func kiroConcurrencyLimit() int {
 
 // acquire blocks until fewer than the current limit are in flight.
 func (l *kiroLimiter) acquire() {
+	l.acquireCtx(context.Background())
+}
+
+// acquireCtx blocks until fewer than the current limit are in flight and
+// takes a slot, or until ctx is done, in which case it takes no slot and
+// returns false. A waiter whose client left stops waiting at once instead of
+// holding its place in the queue.
+func (l *kiroLimiter) acquireCtx(ctx context.Context) bool {
+	// sync.Cond cannot be cancelled, so wake every waiter when ctx ends. The
+	// broadcast takes the lock: a waiter is either still before its ctx check
+	// (and sees the error) or already parked in Wait (and is woken).
+	stop := context.AfterFunc(ctx, func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer stop()
+	// The waiters re-read the limit only when woken, so a live change of
+	// max_concurrent_requests (settings screen, dashboard: both go through
+	// config.Set) wakes them too; a raised limit admits them at once.
+	removeListener := config.OnChange(func() {
+		l.mu.Lock()
+		l.cond.Broadcast()
+		l.mu.Unlock()
+	})
+	defer removeListener()
+
 	l.mu.Lock()
-	for l.active >= kiroConcurrencyLimit() {
+	defer l.mu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		if l.active < kiroConcurrencyLimit() {
+			l.active++
+			return true
+		}
 		l.cond.Wait()
 	}
-	l.active++
-	l.mu.Unlock()
 }
 
 // release frees a slot and wakes any waiters (the limit may have risen).
@@ -924,7 +967,7 @@ func fetchKiroModels() ([]models.KiroModel, error) {
 		return nil, err
 	}
 	cfg := config.Get()
-	ua := fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS)
+	ua := kiroide.UserAgent()
 	return models.Fetch(
 		cfg.Advanced.CodeWhispererEndpoint,
 		token.AccessToken,
@@ -1321,6 +1364,9 @@ var nativeEffortRank = map[string]int{
 	"max":    4,
 }
 
+// nativeEffortEnums is the offline fallback for effortLevelsFor: the levels of
+// the models known when it was written. The live catalog is the source of
+// truth and covers models released since.
 var nativeEffortEnums = map[string][]string{
 	"claude-opus-4.8":      {"low", "medium", "high", "xhigh", "max"},
 	"claude-opus-4.7":      {"low", "medium", "high", "xhigh", "max"},
@@ -1328,6 +1374,18 @@ var nativeEffortEnums = map[string][]string{
 	"claude-sonnet-4.6":    {"low", "medium", "high", "max"},
 	"claude-opus-4.6-1m":   {"low", "medium", "high", "max"},
 	"claude-sonnet-4.6-1m": {"low", "medium", "high", "max"},
+}
+
+// effortLevelsFor returns the reasoning effort levels kiroModel accepts. It
+// reads them from the live model catalog, which publishes them per model, and
+// only uses the static table when the catalog does not know the model. The
+// live catalog is authoritative: a model it lists without an effort schema gets
+// no effort, even when the static table has an entry for it.
+func effortLevelsFor(kiroModel string) []string {
+	if levels, known := modelCatalog.EffortLevels(kiroModel); known {
+		return levels
+	}
+	return nativeEffortEnums[kiroModel]
 }
 
 func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string {
@@ -1344,8 +1402,8 @@ func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string
 	if _, ok := nativeEffortRank[requested]; !ok {
 		return ""
 	}
-	allowed, ok := nativeEffortEnums[kiroModel]
-	if !ok || len(allowed) == 0 {
+	allowed := effortLevelsFor(kiroModel)
+	if len(allowed) == 0 {
 		return ""
 	}
 	if slices.Contains(allowed, requested) {
@@ -1354,12 +1412,110 @@ func resolveNativeEffort(kiroModel string, anthropicReq AnthropicRequest) string
 	return allowed[len(allowed)-1]
 }
 
+// capEffortWithoutThinking is the effort sent next to disabled thinking. The
+// official Kiro CLI keeps sending the effort then, but lowers xhigh and max to
+// the highest other level the model lists; lower levels pass unchanged. It
+// returns "" when the model lists no other level.
+func capEffortWithoutThinking(effort string, levels []string) string {
+	if effort != "xhigh" && effort != "max" {
+		return effort
+	}
+	capped := ""
+	for _, level := range levels {
+		rank, known := nativeEffortRank[level]
+		if !known || level == "xhigh" || level == "max" {
+			continue
+		}
+		if capped == "" || rank > nativeEffortRank[capped] {
+			capped = level
+		}
+	}
+	return capped
+}
+
 func isThinkingEnabled(anthropicReq AnthropicRequest) bool {
-	if anthropicReq.Thinking != nil && strings.EqualFold(anthropicReq.Thinking.Type, "enabled") {
+	// "adaptive" asks for thinking as much as "enabled" does.
+	if t := anthropicReq.Thinking; t != nil && (strings.EqualFold(t.Type, "enabled") || strings.EqualFold(t.Type, "adaptive")) {
 		return true
 	}
 	model := strings.ToLower(anthropicReq.Model)
 	return strings.Contains(model, "[1m]") || strings.Contains(model, "context-1m")
+}
+
+// buildAdditionalModelRequestFields assembles the model-specific options for
+// kiroModel. It returns nil when there is nothing to send, so the key is left
+// out of the request entirely. Thinking and max_tokens are only sent for a
+// model the catalog holds, and only in the form its schema declares; a model
+// the catalog does not know gets neither.
+func buildAdditionalModelRequestFields(kiroModel string, anthropicReq AnthropicRequest, advanced config.AdvancedConfig) *AdditionalModelRequestFields {
+	var fields AdditionalModelRequestFields
+	if entry, known := modelCatalog.Lookup(kiroModel); known {
+		fields.Thinking = resolveThinking(entry.ThinkingTypes(), anthropicReq, advanced.EffectiveThinkingMode())
+		fields.MaxTokens = resolveMaxTokens(entry, anthropicReq.MaxTokens)
+	}
+	effort := resolveNativeEffort(kiroModel, anthropicReq)
+	if effort != "" && fields.Thinking != nil && fields.Thinking.Type == "disabled" {
+		effort = capEffortWithoutThinking(effort, effortLevelsFor(kiroModel))
+	}
+	if effort != "" {
+		fields.OutputConfig = &OutputConfig{Effort: effort}
+	}
+	if fields.Thinking == nil && fields.OutputConfig == nil && fields.MaxTokens == 0 {
+		return nil
+	}
+	return &fields
+}
+
+// resolveThinking translates the client's thinking request into the thinking
+// field to send to a model whose schema lists accepted as its thinking.type
+// values. The backend's default for a request without the field is adaptive thinking
+// on, which a client that sent no thinking field (claude2kiro run sets
+// CLAUDE_CODE_DISABLE_THINKING) did not ask for. So with mode client, no
+// thinking or "disabled" becomes {"type":"disabled"} when the schema allows
+// it, and "enabled" or "adaptive" becomes {"type":"adaptive"} when the schema
+// allows that. A value the schema does not list, an unrecognised client type
+// and mode backend all send no field.
+func resolveThinking(accepted []string, anthropicReq AnthropicRequest, mode string) *ThinkingConfig {
+	if mode == config.ThinkingModeBackend || len(accepted) == 0 {
+		return nil
+	}
+	requested := ""
+	if anthropicReq.Thinking != nil {
+		requested = strings.ToLower(strings.TrimSpace(anthropicReq.Thinking.Type))
+	}
+	var want string
+	switch requested {
+	case "", "disabled":
+		want = "disabled"
+	case "enabled", "adaptive":
+		want = "adaptive"
+	default:
+		return nil
+	}
+	if !slices.Contains(accepted, want) {
+		return nil
+	}
+	return &ThinkingConfig{Type: want}
+}
+
+// resolveMaxTokens returns the client's max_tokens clamped to the range the
+// model's schema declares, or 0 (not sent) when the client sent none or the
+// schema does not declare max_tokens.
+func resolveMaxTokens(entry models.KiroModel, requested int) int {
+	if requested <= 0 {
+		return 0
+	}
+	minimum, maximum, accepted := entry.MaxTokensRange()
+	if !accepted {
+		return 0
+	}
+	if minimum > 0 && requested < minimum {
+		return minimum
+	}
+	if maximum > 0 && requested > maximum {
+		return maximum
+	}
+	return requested
 }
 
 var (
@@ -1567,7 +1723,10 @@ func compactToolDescription(desc string, maxChars int) string {
 	return desc[:cut]
 }
 
-// extractImagesFromContent extracts images from Anthropic message content
+// extractImagesFromContent extracts the images of an Anthropic message: its
+// top-level image blocks, then the image blocks inside the content arrays of
+// its tool_result blocks, each in order. The backend takes images only on the
+// current message (history user messages have no images field).
 func extractImagesFromContent(content any) []ImageBlock {
 	var images []ImageBlock
 
@@ -1577,54 +1736,74 @@ func extractImagesFromContent(content any) []ImageBlock {
 	}
 
 	for _, block := range contentBlocks {
+		if img, ok := imageBlockFrom(block); ok {
+			images = append(images, img)
+		}
+	}
+	for _, block := range contentBlocks {
 		blockMap, ok := block.(map[string]any)
-		if !ok {
+		if !ok || blockMap["type"] != "tool_result" {
 			continue
 		}
-
-		blockType, _ := blockMap["type"].(string)
-		if blockType != "image" {
-			continue
+		items, _ := blockMap["content"].([]any)
+		for _, item := range items {
+			if img, ok := imageBlockFrom(item); ok {
+				images = append(images, img)
+			}
 		}
-
-		source, ok := blockMap["source"].(map[string]any)
-		if !ok {
-			continue
-		}
-
-		sourceType, _ := source["type"].(string)
-		if sourceType != "base64" {
-			continue
-		}
-
-		mediaType, _ := source["media_type"].(string)
-		data, _ := source["data"].(string)
-
-		if data == "" {
-			continue
-		}
-
-		// Convert media type to format (e.g., "image/png" -> "png")
-		format := "png" // default
-		switch mediaType {
-		case "image/png":
-			format = "png"
-		case "image/jpeg", "image/jpg":
-			format = "jpeg"
-		case "image/gif":
-			format = "gif"
-		case "image/webp":
-			format = "webp"
-		}
-
-		imgBlock := ImageBlock{
-			Format: format,
-		}
-		imgBlock.Source.Bytes = data
-		images = append(images, imgBlock)
 	}
 
 	return images
+}
+
+// imageBlockFrom converts one Anthropic base64 image block. Any other block,
+// and an image without data, yields false.
+func imageBlockFrom(block any) (ImageBlock, bool) {
+	blockMap, ok := block.(map[string]any)
+	if !ok {
+		return ImageBlock{}, false
+	}
+
+	blockType, _ := blockMap["type"].(string)
+	if blockType != "image" {
+		return ImageBlock{}, false
+	}
+
+	source, ok := blockMap["source"].(map[string]any)
+	if !ok {
+		return ImageBlock{}, false
+	}
+
+	sourceType, _ := source["type"].(string)
+	if sourceType != "base64" {
+		return ImageBlock{}, false
+	}
+
+	mediaType, _ := source["media_type"].(string)
+	data, _ := source["data"].(string)
+
+	if data == "" {
+		return ImageBlock{}, false
+	}
+
+	// Convert media type to format (e.g., "image/png" -> "png")
+	format := "png" // default
+	switch mediaType {
+	case "image/png":
+		format = "png"
+	case "image/jpeg", "image/jpg":
+		format = "jpeg"
+	case "image/gif":
+		format = "gif"
+	case "image/webp":
+		format = "webp"
+	}
+
+	imgBlock := ImageBlock{
+		Format: format,
+	}
+	imgBlock.Source.Bytes = data
+	return imgBlock, true
 }
 
 // resolveSchemaRefs resolves $ref references by inlining definitions from $defs.
@@ -1836,8 +2015,17 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		convID = convID[:8]
 	}
 
+	// contentChars counts the content field only; tool result text is sent once,
+	// in toolResults, and is counted separately.
+	toolResultChars := 0
+	for _, result := range context.ToolResults {
+		for _, c := range result.Content {
+			toolResultChars += len(c.Text)
+		}
+	}
+
 	return fmt.Sprintf(
-		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v",
+		"Request convId=%s model=%s reqBytes=%d approxInputTokens=%d historyLen=%d tools=%d toolResults=%d contentChars=%d toolResultChars=%d historyMode=%s toolMode=%s aggressiveCachePoints=%v reasoningAttached=%d reasoningBytes=%d recoveredTurns=%d",
 		convID,
 		current.ModelId,
 		reqBytes,
@@ -1846,9 +2034,13 @@ func requestMetricsSummary(cwReq CodeWhispererRequest, reqBytes int, cfg *config
 		len(context.Tools),
 		len(context.ToolResults),
 		len(current.Content),
+		toolResultChars,
 		historyMode,
 		toolMode,
 		advanced.AggressiveCachePoints,
+		cwReq.reasoning.turns,
+		cwReq.reasoning.bytes,
+		cwReq.recoveredTurns,
 	)
 }
 
@@ -1924,7 +2116,7 @@ func fetchProfilesFromAPI(accessToken string) []kiroProfile {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: cfg.Network.HTTPTimeout}
 	resp, err := client.Do(req)
@@ -1995,28 +2187,32 @@ func discoverProfileArn(accessToken string) string {
 	return selectProfileArn(profiles)
 }
 
-// buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
-func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
-	cwReq := CodeWhispererRequest{}
-
-	// Set ProfileArn.
-	//
-	// The Kiro backend associates each request with a CodeWhisperer profile. For
-	// IdC/Enterprise users the correct profile is account-specific and is
-	// discovered + persisted on the token (see discoverProfileArn). Sending the
-	// WRONG profile is worse than sending none — it 403s or silently loses model
-	// access — so we never blindly fall back to the shared consumer profile for
-	// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+// requestProfileArn is the profileArn a request made with token carries.
+//
+// The Kiro backend associates each request with a CodeWhisperer profile. For
+// IdC/Enterprise users the correct profile is account-specific and is
+// discovered + persisted on the token (see discoverProfileArn). Sending the
+// WRONG profile is worse than sending none — it 403s or silently loses model
+// access — so we never blindly fall back to the shared consumer profile for
+// IdC. Social auth (GitHub/Google/Builder ID) uses the shared consumer profile.
+func requestProfileArn(token TokenData) string {
 	switch {
 	case token.ProfileArn != "":
-		cwReq.ProfileArn = token.ProfileArn
+		return token.ProfileArn
 	case token.AuthMethod != "IdC":
-		cwReq.ProfileArn = consumerProfileArn
+		return consumerProfileArn
 	default:
 		// IdC with no discovered profile: omit (works for tokens the backend
 		// doesn't yet require a profile for).
-		cwReq.ProfileArn = ""
+		return ""
 	}
+}
+
+// buildCodeWhispererRequest builds a CodeWhisperer request from an Anthropic request
+func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) CodeWhispererRequest {
+	cwReq := CodeWhispererRequest{}
+	cwReq.scope = responseScope(anthropicReq)
+	cwReq.ProfileArn = requestProfileArn(token)
 	cfg := config.Get()
 	kiroModel := getKiroModelID(anthropicReq.Model)
 	historyMode := cfg.Advanced.HistoryMode
@@ -2036,16 +2232,13 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 	// conversationId and reuses it across turns while still sending prior turns in
 	// history. Users can disable this for the older proxy behavior of one fresh
 	// random UUID per request.
-	if _, sessionKey := extractSessionID(anthropicReq.Metadata); cfg.Advanced.StableConversationID && sessionKey != "" {
+	_, sessionKey := extractSessionID(anthropicReq.Metadata)
+	if cfg.Advanced.StableConversationID && sessionKey != "" {
 		cwReq.ConversationState.ConversationId = stableConversationID(sessionKey)
 	} else {
 		cwReq.ConversationState.ConversationId = generateUUID()
 	}
-	if effort := resolveNativeEffort(kiroModel, anthropicReq); effort != "" {
-		cwReq.AdditionalModelRequestFields = &AdditionalModelRequestFields{
-			OutputConfig: &OutputConfig{Effort: effort},
-		}
-	}
+	cwReq.AdditionalModelRequestFields = buildAdditionalModelRequestFields(kiroModel, anthropicReq, cfg.Advanced)
 	if envState := parseEnvState(anthropicReq.System); envState != nil {
 		cwReq.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.EnvState = envState
 	}
@@ -2185,6 +2378,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		}
 
 		// All messages except the last one (the last is the current message).
+		// assistantTurn is the position of the next assistant message among
+		// the request's assistant messages: part of its reasoning store key.
+		assistantTurn := 0
 		for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 			msg := anthropicReq.Messages[i]
 
@@ -2202,6 +2398,10 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 				} else {
 					assistantMsg.AssistantResponseMessage.ToolUses = make([]any, 0)
 				}
+				scope := cwReq.scope
+				scope.turn = assistantTurn
+				assistantMsg.turnKeys = scope.keys(historyToolUseIDs(toolUses), assistantTurnText(msg.Content))
+				assistantTurn++
 				emit("assistant", assistantMsg)
 				continue
 			}
@@ -2226,6 +2426,13 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		cfgCopy.HistoryMode = historyMode
 		systemPrefix := 2 * len(anthropicReq.System) // user+assistant pair per system message
 		cwReq.ConversationState.History = applyHistoryModeWithToolResultProtection(history, cfgCopy, currentToolResults, systemPrefix)
+
+		// Give the backend its own reasoning back on the turns that remain.
+		// In none_text mode the history holds tool calls as text, not what the
+		// reasoning was signed with, so nothing is attached there.
+		if toolMode != "none_text" {
+			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes, cfg.Advanced.ReasoningHistoryMaxBlocks)
+		}
 	}
 
 	return cwReq
@@ -3567,7 +3774,7 @@ func testProxy() {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	// Bound connection phases only: the streamed generation body may take a
 	// while, but headers arrive quickly — a server that never responds must
@@ -4173,9 +4380,9 @@ func buildServerMux(lg *logger.Logger) *http.ServeMux {
 			if cfg.Advanced.ComparisonMode {
 				capture = &capturedKiroEvents
 			}
-			responsePreview = handleStreamRequestWithLogger(w, anthropicReq, lg, sessionID, reqResult.RequestID, capture)
+			responsePreview = handleStreamRequestCtx(r.Context(), w, anthropicReq, lg, sessionID, reqResult.RequestID, capture)
 		} else {
-			responseStatus = handleNonStreamRequest(w, anthropicReq, lg, sessionID, reqResult.RequestID)
+			responseStatus = handleNonStreamRequestCtx(r.Context(), w, anthropicReq, lg, sessionID, reqResult.RequestID)
 		}
 
 		// Log response
@@ -4485,18 +4692,65 @@ func serveProxyOnce(port string, lg *logger.Logger) (retry bool, served time.Dur
 
 // handleStreamRequestWithLogger is like handleStreamRequest but with TUI logging
 // capturedEvents: optional pointer to slice for capturing SSE events (for comparison mode)
+// outputLimitNote is the answer the client gets when the backend stopped at
+// its output limit (stopReason MAX_TOKENS) before producing any content.
+const outputLimitNote = "[Kiro stopped at the output limit before producing an answer]"
+
+// backendStopReasonLabel is how the backend's stopReason appears in log
+// lines: as sent, or "none" when it sent none.
+func backendStopReasonLabel(reason string) string {
+	if reason == "" {
+		return "none"
+	}
+	return reason
+}
+
+// outputLimitLogLine is the error line logged when the backend stopped at
+// its output limit without producing content.
+func outputLimitLogLine(backendStopReason string, reasoningChars, responseBytes int) string {
+	return fmt.Sprintf("Kiro stopped at the output limit before producing an answer: stopReason=%s reasoningChars=%d (%d bytes response)",
+		backendStopReasonLabel(backendStopReason), reasoningChars, responseBytes)
+}
+
+// servedModelField is the " servedModel=<id>" part of a Parser log line, or
+// nothing when the response named no model.
+func servedModelField(model string) string {
+	if model == "" {
+		return ""
+	}
+	return " servedModel=" + model
+}
+
 func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
+	return handleStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID, capturedEvents)
+}
+
+// handleStreamRequestCtx answers a streaming request. Events are forwarded as
+// the backend produces them, the client gets a ping whenever the stream has
+// been silent for network.stream_keepalive_interval, and ctx (the client's request
+// context) cancels the backend request when the client goes away.
+func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string, capturedEvents *[]CapturedSSEEvent) string {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return ""
 	}
+
+	// From here on every write goes through the keepalive writer, which also
+	// pings the client while the backend is silent. A write that fails (its
+	// deadline passed: the client stopped reading) cancels ctx, so the handler
+	// ends through its client-gone path like after a disconnect.
+	ctx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	keepalive := newKeepaliveWriter(w, config.Get().Network.StreamKeepaliveInterval, cancelStream)
+	defer keepalive.stop()
+	w = keepalive
+	var flusher http.Flusher = keepalive
 
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
 
@@ -4511,7 +4765,12 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	}
 
 	// Build CodeWhisperer request
+	// Put back what the client never saw of earlier recovered responses
+	// (recovery.go).
+	var recovered int
+	anthropicReq, recovered = withRecoveredTurns(anthropicReq)
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
+	cwReq.recoveredTurns = recovered
 
 	// Keep the stable conversationId concurrency-safe: parallel Task subagents
 	// share the parent session id, so without this they'd all hit the backend on
@@ -4538,7 +4797,8 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 
 	// Create streaming request
 	var proxyReq *http.Request
-	proxyReq, err = http.NewRequest(
+	proxyReq, err = http.NewRequestWithContext(
+		ctx,
 		http.MethodPost,
 		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
@@ -4552,11 +4812,30 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	proxyReq.Header.Set("Content-Type", "application/json")
 	proxyReq.Header.Set("Accept", "text/event-stream")
-	proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	proxyReq.Header.Set("User-Agent", kiroide.UserAgent())
 
 	// Limit concurrent Kiro requests (live-tunable via max_concurrent_requests).
-	kiroSema.acquire()
+	queuedAt := time.Now()
+
+	// clientGone reports a client that disconnected; nothing is sent to it and
+	// the backend request, bound to ctx, is already cancelled.
+	clientGone := func(stage string) bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		lg.LogInfo(fmt.Sprintf("Client disconnected %s convId=%s after %s — backend request cancelled",
+			stage, shortID(cwReq.ConversationState.ConversationId), time.Since(queuedAt).Round(time.Millisecond)))
+		return true
+	}
+	if !kiroSema.acquireCtx(ctx) {
+		// The client left while the request waited for a slot; it never took
+		// one and the backend never saw it.
+		clientGone("while queued")
+		return ""
+	}
 	defer kiroSema.release()
+	queueWait := time.Since(queuedAt)
+	var sentAt time.Time // when the attempt that answered was sent
 
 	// Send request with retry logic for transient errors
 	var resp *http.Response
@@ -4566,7 +4845,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	// profileArn in the body, everything else (conversationId, history) kept.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		cwReq.ProfileArn = requestProfileArn(tok)
 		body, merr := jsonStr.Marshal(cwReq)
 		if merr != nil {
 			return merr
@@ -4583,11 +4862,13 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 	skipBackoff := false
 	refreshedFor := map[string]bool{} // the credentials a refresh of this request produced, by refresh token
 	var lastRecoverErr error
-	sent := 0 // requests this handler sent to the backend, switches and refreshes included
+	sent := 0                  // requests this handler sent to the backend, switches and refreshes included
+	reasoningStripped := false // the request was resent once without its reasoning
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || skipBackoff {
 			// Recreate request for retry (body was consumed)
-			proxyReq, err = http.NewRequest(
+			proxyReq, err = http.NewRequestWithContext(
+				ctx,
 				http.MethodPost,
 				cfg.Advanced.CodeWhispererEndpoint,
 				bytes.NewBuffer(cwReqBody),
@@ -4599,16 +4880,29 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			proxyReq.Header.Set("Authorization", "Bearer "+token.AccessToken)
 			proxyReq.Header.Set("Content-Type", "application/json")
 			proxyReq.Header.Set("Accept", "text/event-stream")
-			proxyReq.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+			proxyReq.Header.Set("User-Agent", kiroide.UserAgent())
 			if !skipBackoff {
-				time.Sleep(retryBackoff(attempt)) // exponential backoff with jitter
+				// Exponential backoff with jitter, cut short when the client leaves.
+				backoff := time.NewTimer(retryBackoff(attempt))
+				select {
+				case <-backoff.C:
+				case <-ctx.Done():
+					backoff.Stop()
+				}
+				if clientGone("during the retry backoff") {
+					return ""
+				}
 			}
 			skipBackoff = false
 		}
 
 		sent++
+		sentAt = time.Now()
 		resp, lastErr = proxyHttpClient.Do(proxyReq)
 		if lastErr != nil {
+			if clientGone("before the backend answered") {
+				return ""
+			}
 			lg.LogError(fmt.Sprintf("CodeWhisperer request error (attempt %d): %v", attempt+1, lastErr))
 			continue
 		}
@@ -4633,16 +4927,37 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 				if ferr == nil {
 					ferr = fmt.Errorf("identity switches exhausted after %d", switches)
 				}
-				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel(), reason, ferr))
+				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel(), reason, ferr))
 				sendNonRetryableErrorEvent(w, flusher, quotaExhaustedMessage(reason, ferr))
 				return ""
 			}
 			switches++
-			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 			if err := adopt(fallback, next); err != nil {
 				sendErrorEvent(w, flusher, "Failed to serialize request", err)
 				return ""
 			}
+			attempt--
+			skipBackoff = true
+			continue
+		}
+
+		// The backend rejected a reasoning signature the history carried. Resend
+		// once without any reasoning and forget the rejected turns; the model
+		// then plans again. This is not a transient retry and never repeats.
+		signatureInvalid := resp.StatusCode == 400 && isThinkingSignatureInvalid(body)
+		if signatureInvalid && !reasoningStripped && cwReq.reasoning.turns > 0 {
+			reasoningStripped = true
+			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
+			reasoningStore.Evict(cwReq.stripReasoning()...)
+			stripped, merr := jsonStr.Marshal(cwReq)
+			if merr != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", merr)
+				return ""
+			}
+			cwReqBody = stripped
+			lg.LogInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
+				shortID(cwReq.ConversationState.ConversationId), turns, size))
 			attempt--
 			skipBackoff = true
 			continue
@@ -4677,7 +4992,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			// an identity switch, not a transient retry, so it costs no attempt.
 			if tok, id, terr := tokenForRequest(); terr == nil {
 				switches++
-				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 				if err := adopt(tok, id); err != nil {
 					sendErrorEvent(w, flusher, "Failed to serialize request", err)
 					return ""
@@ -4691,7 +5006,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			tok, id, moved, rerr := recoverFromInvalidBearer(ident, token, refreshedFor, switches < maxSwitches)
 			if rerr != nil {
 				lastRecoverErr = rerr
-				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], rerr))
+				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", shortID(cwReq.ConversationState.ConversationId), rerr))
 				// Fall through to the terminal 403 handler, which surfaces a
 				// clear "refresh failed, please re-login" to the client.
 			} else {
@@ -4703,19 +5018,19 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 					switches++
 					attempt--
 					skipBackoff = true
-					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 				} else {
-					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
+					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", shortID(cwReq.ConversationState.ConversationId)))
 				}
 				continue
 			}
 		}
 
-		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel)) {
+		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel && !signatureInvalid)) {
 			if overloaded {
-				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
+				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, shortID(cwReq.ConversationState.ConversationId), attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
-				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
+				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", shortID(cwReq.ConversationState.ConversationId), attempt+1, len(cwReqBody), string(body)))
 			}
 			continue
 		}
@@ -4724,7 +5039,7 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		if cfg.Advanced.DebugMode {
 			debug.WriteDebugFileWithScrub("cw-FAILED", cwReqBody)
 		}
-		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
+		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", shortID(cwReq.ConversationState.ConversationId), resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 && isInvalidBearerToken(body) {
 			switch {
@@ -4748,6 +5063,11 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 			// classify the error as non-retryable so the client does not resend it.
 			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
 				"Kiro rejected the request body as invalid: %s", strings.TrimSpace(string(body))))
+		} else if signatureInvalid {
+			// Rejected even without reasoning (or again after the fallback):
+			// resending the same request cannot help.
+			sendNonRetryableErrorEvent(w, flusher, fmt.Sprintf(
+				"Kiro rejected a reasoning signature: %s", strings.TrimSpace(string(body))))
 		} else if invalidModel {
 			// Kiro does not serve this model id at all (backstop for when the
 			// pre-flight check couldn't run because the catalog was cold).
@@ -4772,201 +5092,286 @@ func handleStreamRequestWithLogger(w http.ResponseWriter, anthropicReq Anthropic
 		sendErrorEvent(w, flusher, "CodeWhisperer request error after retries", lastErr)
 		return ""
 	}
-	defer resp.Body.Close()
+	// resp changes when an interrupted response is recovered; close whichever
+	// is current.
+	// resp is nil while a recovery request is out, so the body is closed once.
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
 
-	// Read entire response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: failed to read response"))
+	// Forward the response as it arrives: each backend frame is translated and
+	// sent before the next one is read, except tool calls, which are held
+	// until the response ends (recovery.go). The raw bytes are kept for
+	// metering and the debug dump.
+	var rawResp bytes.Buffer
+	translator := parser.NewStreamTranslator()
+	toolNames := buildToolNameMap(anthropicReq.Tools)
+	var responseText strings.Builder
+
+	delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds())
+	started := false
+	var firstEventAfter time.Duration
+	eventCount, toolBlockCount, outputChars := 0, 0, 0
+	hasTextContent := false
+
+	startMessage := func(inputTokens int) {
+		if started {
+			return
+		}
+		started = true
+		firstEventAfter = time.Since(sentAt)
+		sendSSEEvent(w, flusher, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":            messageId,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []any{},
+				"model":         anthropicReq.Model,
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage":         map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
+			},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"}, capturedEvents)
+	}
+	forward := func(e parser.SSEEvent) {
+		if ctx.Err() != nil {
+			return
+		}
+		if dataMap, ok := e.Data.(map[string]any); ok {
+			if delta, ok := dataMap["delta"].(map[string]any); ok {
+				if text, ok := delta["text"].(string); ok {
+					hasTextContent = true
+					outputChars += len(text)
+					responseText.WriteString(text)
+				}
+				if pj, ok := delta["partial_json"].(string); ok {
+					outputChars += len(pj)
+				}
+			}
+			if cb, ok := dataMap["content_block"].(map[string]any); ok && cb["type"] == "tool_use" {
+				toolBlockCount++
+			}
+		}
+		eventCount++
+		sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
+		if delayMs > 0 {
+			// The pause ends when the client leaves; nothing more is sent
+			// and the read loop ends through the client-gone path.
+			pause := time.NewTimer(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
+			select {
+			case <-pause.C:
+			case <-ctx.Done():
+				pause.Stop()
+			}
+		}
+	}
+	emitter := newBlockEmitter(forward)
+	// logMetering logs the credits of the attempt in rawResp; every attempt of
+	// a recovered response is logged, as without streaming.
+	logMetering := func() {
+		if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(rawResp.Bytes())); usageMsg != "" {
+			if cfg.Advanced.ComparisonMode {
+				lg.LogComparison(sessionID, requestID, usageMsg)
+			} else {
+				lg.LogInfo(usageMsg)
+			}
+		}
+	}
+
+	// The request as Kiro saw it; recoveries extend it.
+	currentReq := anthropicReq
+	var hidden recoveredExchange
+	convID := shortID(cwReq.ConversationState.ConversationId)
+	var readErr error
+	var silence time.Duration // how long the backend had been silent when the read failed
+	for recoveries := 0; ; {
+		backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+		body := io.TeeReader(backendBody, &rawResp)
+		readErr = nil
+		for {
+			payload, err := parser.ReadFramePayload(body)
+			if err != nil {
+				// Only io.EOF on a frame boundary is a finished response. A stream
+				// that ends inside a frame, a frame with impossible lengths or a
+				// transport error means the backend did not finish the answer.
+				if err != io.EOF {
+					readErr = err
+				}
+				break
+			}
+			events := translator.Translate(payload)
+			if len(events) == 0 {
+				continue
+			}
+			startMessage(len(cwReqBody) / 4) // approximate from the CodeWhisperer request size
+			restoreToolNames(events, toolNames)
+			emitter.push(events)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		silence = backendBody.silence()
+		kind := interruptionKind(readErr, silence, cfg.Network.BackendIdleCutAfter, translator, emitter)
+		if kind == interruptNone {
+			break
+		}
+		cause := interruptionCause(kind, readErr, silence, cfg.Network.BackendIdleCutAfter)
+		if !cfg.Advanced.InterruptedToolRecovery || recoveries >= maxRecoveries {
+			// Path 3: recovery is off or used up.
+			why := "recovery is off (advanced.interrupted_tool_recovery)"
+			if cfg.Advanced.InterruptedToolRecovery {
+				why = fmt.Sprintf("%d recoveries in a row already", recoveries)
+			}
+			lg.LogError(fmt.Sprintf("Interrupted response convId=%s (%s), backend silent %s, %s since sent, after %d events - path 3, %s: failing the response: %v",
+				convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount, why, readErr))
+			if kind == interruptTruncated || recoveries >= maxRecoveries || isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter) {
+				// Resending as it is cannot help (an idle cut is cut again):
+				// an error the client does not resend, as without streaming.
+				sendNonRetryableErrorEvent(w, flusher, interruptionErrorMessage(kind, silence, recoveries))
+			} else {
+				sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response was interrupted (%s): %v", cause, readErr))
+			}
+			return ""
+		}
+		recoveries++
+		text, tools := emitter.endAttempt()
+		var what string
+		if kind == interruptResend && strings.TrimSpace(text) == "" {
+			// Path 1: nothing reached the client; send the same request again.
+			what = "resending the same request"
+			if !sleepCtx(ctx, recoveryBackoff()) {
+				break
+			}
+		} else {
+			// Path 2: answer the interrupted attempt and ask for the rest.
+			turns := recoveryTurns(text, tools, kind == interruptTruncated, isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter))
+			hidden.Turns = append(hidden.Turns, turns...)
+			if strings.TrimSpace(text) != "" {
+				hidden.LeadTexts = append(hidden.LeadTexts, text)
+			}
+			currentReq = extendedRequest(currentReq, turns)
+			next, body, err := recoveryRequest(currentReq, token, cwReq.ConversationState.ConversationId)
+			if err != nil {
+				sendErrorEvent(w, flusher, "Failed to serialize request", err)
+				return ""
+			}
+			cwReq, cwReqBody = next, body
+			what = describeRecovery(tools)
+		}
+		lg.LogWarn(fmt.Sprintf("Interrupted response convId=%s (%s), backend silent %s, %s since sent, after %d events - path %s, recovery %d of %d: %s",
+			convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount,
+			recoveryPath(kind, text), recoveries, maxRecoveries, what))
+		resp.Body.Close()
+		resp = nil
+		logMetering()
+		sentAt = time.Now()
+		next, err := sendRecoveryRequest(ctx, cfg, token, cwReqBody)
+		if err != nil {
+			if clientGone("before the recovery request was answered") {
+				return ""
+			}
+			lg.LogError(fmt.Sprintf("Recovery request convId=%s failed: %v", convID, err))
+			sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error on the request that recovers an interrupted response: %v", err))
+			return ""
+		}
+		resp = next
+		translator = parser.NewStreamTranslator()
+		rawResp.Reset()
+	}
+
+	if readErr != nil && ctx.Err() == nil {
+		lg.LogError(fmt.Sprintf("CodeWhisperer response read failed convId=%s after %d events, %s since sent, backend silent %s: %v",
+			convID, eventCount, time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
+		// No content_block_stop, message_delta or message_stop: the client must
+		// see an unfinished answer as an error (overloaded, so it retries).
+		sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
 		return ""
 	}
 
 	// Debug: Save raw response for analysis
 	if cfg.Advanced.DebugMode {
-		debug.WriteDebugFile("cw-response", respBody)
+		debug.WriteDebugFile("cw-response", rawResp.Bytes())
+	}
+	logMetering()
+
+	if clientGone("mid-response") {
+		return responseText.String()
 	}
 
-	// Use CodeWhisperer parser
-	events := parser.ParseEvents(respBody)
-	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(respBody)); usageMsg != "" {
-		if cfg.Advanced.ComparisonMode {
-			lg.LogComparison(sessionID, requestID, usageMsg)
-		} else {
-			lg.LogInfo(usageMsg)
+	// Close the open blocks and send the held tool calls.
+	emitter.push(func() []parser.SSEEvent {
+		events := translator.Finish()
+		restoreToolNames(events, toolNames)
+		return events
+	}())
+	finalTools := emitter.heldTools()
+	emitter.flushTools()
+	if len(hidden.Turns) > 0 {
+		ids := make([]string, 0, len(finalTools))
+		for _, t := range finalTools {
+			ids = append(ids, t.id)
 		}
+		recoveredTurns.put(recoveryKeys(recoveryScope(anthropicReq), ids, responseText.String()), hidden)
 	}
 
-	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit)
-	// so Claude Code recognizes its tools.
-	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
-	var responseText strings.Builder
+	if translator.Emitted() || emitter.next > 0 {
+		rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
+			translator.Reasoning(), translator.ToolUseIDs(), translator.Text())
 
-	// Debug: Log if no events parsed
-	if len(events) == 0 {
-		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response", len(respBody)))
-	}
-
-	if len(events) > 0 {
-		// Check if this is a tool-only response (no text content events)
-		hasTextContent := false
-		hasToolUse := false
-		parserSentMessageDelta := false
-		toolBlockCount := 0
-		for _, e := range events {
-			if e.Event == "content_block_delta" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if delta, ok := dataMap["delta"].(map[string]any); ok {
-						if _, ok := delta["text"]; ok {
-							hasTextContent = true
-						}
-						if _, ok := delta["partial_json"]; ok {
-							hasToolUse = true
-						}
-					}
-				}
-			}
-			if e.Event == "content_block_start" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if cb, ok := dataMap["content_block"].(map[string]any); ok {
-						if cbType, ok := cb["type"].(string); ok && cbType == "tool_use" {
-							hasToolUse = true
-							toolBlockCount++
-						}
-					}
-				}
-			}
-			if e.Event == "message_delta" {
-				// Parser already sent a message_delta (for tool_use stop)
-				parserSentMessageDelta = true
-			}
-		}
-
-		// Log event analysis results
 		if cfg.Advanced.ComparisonMode {
-			// In comparison mode, show preview of actual response text
 			textPreview := responseText.String()
 			if len(textPreview) > 80 {
 				textPreview = textPreview[:80]
 			}
 			lg.LogComparison(sessionID, requestID, fmt.Sprintf("Kiro: %d events, preview=%q (%d bytes), tools=%d",
-				len(events), textPreview, len(respBody), toolBlockCount))
+				eventCount, textPreview, rawResp.Len(), toolBlockCount))
 		} else {
-			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), parserSentDelta=%v",
-				len(events), hasTextContent, hasToolUse, toolBlockCount, parserSentMessageDelta))
+			lg.LogInfo(fmt.Sprintf("Parser: %d events, hasText=%v, hasToolUse=%v (tools=%d), queueWait=%s firstEvent=%s stopReason=%s reasoningChars=%d%s",
+				eventCount, hasTextContent, toolBlockCount > 0, toolBlockCount,
+				queueWait.Round(time.Millisecond), firstEventAfter.Round(time.Millisecond),
+				backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars(),
+				servedModelField(translator.ServedModel())))
 		}
 
-		// Send start event
-		messageStart := map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            messageId,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []any{},
-				"model":         anthropicReq.Model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage": map[string]any{
-					"input_tokens":  len(cwReqBody) / 4, // Approximate from CW request body size
-					"output_tokens": 0,
-				},
-			},
-		}
-		sendSSEEvent(w, flusher, "message_start", messageStart, capturedEvents)
-		sendSSEEvent(w, flusher, "ping", map[string]string{"type": "ping"}, capturedEvents)
-
-		// Only send text content_block_start if there's text content (not tool-only)
-		if hasTextContent || !hasToolUse {
-			contentBlockStart := map[string]any{
-				"content_block": map[string]any{"text": "", "type": "text"},
-				"index":         0,
-				"type":          "content_block_start",
-			}
-			sendSSEEvent(w, flusher, "content_block_start", contentBlockStart, capturedEvents)
-		}
-
-		// Separate events into text deltas and non-text (tool blocks, message_delta).
-		// Anthropic requires text block to be fully closed before tool blocks begin.
-		outputChars := 0
-		var textEvents []parser.SSEEvent
-		var toolEvents []parser.SSEEvent
-		for _, e := range events {
-			if e.Event == "content_block_delta" {
-				if dataMap, ok := e.Data.(map[string]any); ok {
-					if delta, ok := dataMap["delta"].(map[string]any); ok {
-						if text, ok := delta["text"].(string); ok {
-							outputChars += len(text)
-							responseText.WriteString(text)
-							textEvents = append(textEvents, e)
-							continue
-						}
-						if pj, ok := delta["partial_json"].(string); ok {
-							outputChars += len(pj)
-						}
-					}
-				}
-			}
-			toolEvents = append(toolEvents, e)
-		}
-
-		delayMs := int(cfg.Network.StreamingDelayMax.Milliseconds())
-		delayFn := func() {
-			if delayMs > 0 {
-				time.Sleep(time.Duration(cryptoRandIntn(delayMs)) * time.Millisecond)
-			}
-		}
-
-		// Phase 1: Send text deltas
-		for _, e := range textEvents {
-			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
-			delayFn()
-		}
-
-		// Close text block before tool blocks (if we opened one)
-		if hasTextContent || !hasToolUse {
-			contentBlockStop := map[string]any{"index": 0, "type": "content_block_stop"}
-			sendSSEEvent(w, flusher, "content_block_stop", contentBlockStop, capturedEvents)
-		}
-
-		// Phase 2: Send tool blocks and message_delta
-		for _, e := range toolEvents {
-			sendSSEEvent(w, flusher, e.Event, e.Data, capturedEvents)
-			delayFn()
-		}
-
-		// Always send message_delta if parser didn't already send one
-		if !parserSentMessageDelta {
-			stopReason := "end_turn"
-			if hasToolUse && !hasTextContent {
-				stopReason = "tool_use"
-			}
-			contentBlockStopReason := map[string]any{
-				"type":  "message_delta",
-				"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-				"usage": map[string]any{"output_tokens": outputChars / 4},
-			}
-			sendSSEEvent(w, flusher, "message_delta", contentBlockStopReason, capturedEvents)
-		}
-
-		messageStop := map[string]any{"type": "message_stop"}
-		sendSSEEvent(w, flusher, "message_stop", messageStop, capturedEvents)
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": translator.StopReason(), "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": outputChars / 4},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+	} else if translator.StopReason() == "max_tokens" {
+		// The model spent its whole output budget (on reasoning) before it
+		// wrote anything. Say so in a normal message instead of an error.
+		lg.LogError(outputLimitLogLine(translator.BackendStopReason(), translator.ReasoningChars(), rawResp.Len()))
+		startMessage(len(cwReqBody) / 4)
+		sendSSEEvent(w, flusher, "content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": outputLimitNote},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "max_tokens", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 0},
+		}, capturedEvents)
+		sendSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"}, capturedEvents)
+		responseText.WriteString(outputLimitNote)
 	} else {
 		// No events parsed - send an empty response to prevent Claude Code from hanging
+		lg.LogError(fmt.Sprintf("WARNING: Parser returned 0 events from %d bytes response (stopReason=%s reasoningChars=%d)",
+			rawResp.Len(), backendStopReasonLabel(translator.BackendStopReason()), translator.ReasoningChars()))
 		lg.LogError("Sending empty response due to no parsed events")
-		messageStart := map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            messageId,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []any{},
-				"model":         anthropicReq.Model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-		}
-		sendSSEEvent(w, flusher, "message_start", messageStart, capturedEvents)
+		startMessage(0)
 		contentBlockStart := map[string]any{
 			"content_block": map[string]any{"text": "[Error: No response received from backend]", "type": "text"},
 			"index":         0,
@@ -5243,7 +5648,6 @@ func interactiveIdCLogin() *LoginConfig {
 const (
 	kiroAuthEndpoint        = "https://prod.us-east-1.auth.desktop.kiro.dev"
 	kiroSocialLoginEndpoint = "https://app.kiro.dev/signin"
-	kiroVersion             = "0.11.107" // Kiro IDE version to impersonate
 )
 
 // buildSocialLoginURL builds the browser URL used by the current Kiro CLI.
@@ -5787,7 +6191,7 @@ func postSocialDeviceJSON(client *http.Client, endpoint string, payload any, res
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
@@ -6156,7 +6560,7 @@ func registerSSOClient(startUrl, region string) (*SSOClientRegistration, error) 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6381,7 +6785,7 @@ func exchangeCodeForTokensIdC(code, codeVerifier, redirectUri string, clientReg 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6442,7 +6846,7 @@ func exchangeCodeForTokens(code, codeVerifier, redirectUri, provider string) (*T
 
 	// Set headers to match Kiro IDE
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -6613,7 +7017,7 @@ func refreshTokenIdC(currentToken TokenData) (TokenData, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+	req.Header.Set("User-Agent", kiroide.UserAgent())
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -7366,6 +7770,16 @@ func adoptReplacedCredentials(rejected TokenData) (bool, error) {
 // status it wrote so the caller's response log reflects backend errors instead
 // of a hardcoded 200 (streaming has no such choice: SSE commits 200 up front).
 func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string) int {
+	return handleNonStreamRequestCtx(context.Background(), w, anthropicReq, lg, sessionID, requestID)
+}
+
+// statusClientClosedRequest is logged for a request whose client went away
+// before the answer was ready (nginx's 499); nothing is written to the client.
+const statusClientClosedRequest = 499
+
+// handleNonStreamRequestCtx is handleNonStreamRequest bound to the client's
+// request context: when the client disconnects, the backend request stops.
+func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropicReq AnthropicRequest, lg *logger.Logger, sessionID, requestID string) int {
 	// Token and the identity it was read for, as one pair (see
 	// identity_failover.go). The dispatcher's own read of the token is only
 	// for the proactive refresh; it may belong to a previous identity by now.
@@ -7376,7 +7790,12 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	}
 
 	// Build CodeWhisperer request
+	// Put back what the client never saw of earlier recovered responses
+	// (recovery.go).
+	var recovered int
+	anthropicReq, recovered = withRecoveredTurns(anthropicReq)
 	cwReq := buildCodeWhispererRequest(anthropicReq, token)
+	cwReq.recoveredTurns = recovered
 
 	// Concurrency-safe stable conversationId (see claimStableConversation). Must
 	// run before marshaling the body below.
@@ -7396,7 +7815,8 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 
 	// Create request
 	cfg := config.Get()
-	proxyReq, err := http.NewRequest(
+	proxyReq, err := http.NewRequestWithContext(
+		ctx,
 		http.MethodPost,
 		cfg.Advanced.CodeWhispererEndpoint,
 		bytes.NewBuffer(cwReqBody),
@@ -7411,7 +7831,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE-%s-%s", kiroVersion, runtime.GOOS))
+		req.Header.Set("User-Agent", kiroide.UserAgent())
 	}
 
 	setKiroHeaders(proxyReq, token)
@@ -7426,16 +7846,21 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 			lg.LogError(msg)
 		}
 	}
+	logWarn := func(msg string) {
+		if lg != nil {
+			lg.LogWarn(msg)
+		}
+	}
 	// adopt rebuilds the outgoing request for another identity's token.
 	adopt := func(tok TokenData, id identityRef) error {
 		token, ident = tok, id
-		cwReq.ProfileArn = buildCodeWhispererRequest(anthropicReq, tok).ProfileArn
+		cwReq.ProfileArn = requestProfileArn(tok)
 		body, merr := jsonStr.Marshal(cwReq)
 		if merr != nil {
 			return merr
 		}
 		cwReqBody = body
-		req, rerr := http.NewRequest(http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Advanced.CodeWhispererEndpoint, bytes.NewBuffer(cwReqBody))
 		if rerr != nil {
 			return rerr
 		}
@@ -7460,19 +7885,57 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// changing under the request cannot keep it going
 	const bearerRetriesPerIdentity = 3
 	bearerRetries := 0
+	reasoningStripped := false // the request was resent once without its reasoning
+	var readErr error          // the 200 response broke while it was read
+	var silence time.Duration  // how long the backend had been silent then
+	var sentAt time.Time
 	for {
+		sentAt = time.Now()
 		resp, err = proxyHttpClient.Do(proxyReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				logInfo("Client disconnected (non-stream) before the backend answered — backend request cancelled")
+				return statusClientClosedRequest
+			}
 			http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
 			return http.StatusInternalServerError
 		}
 
 		// Read response
-		cwRespBody, err = io.ReadAll(resp.Body)
+		backendBody := newLastReadReader(resp.Body, time.Now()) // the headers just arrived
+		cwRespBody, err = io.ReadAll(backendBody)
 		resp.Body.Close()
+		if err != nil && ctx.Err() != nil {
+			logInfo("Client disconnected (non-stream) mid-response — backend request cancelled")
+			return statusClientClosedRequest
+		}
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-			return http.StatusInternalServerError
+			// The backend broke the answer (for example an HTTP/2 RST_STREAM).
+			// A 200 is recovered below (recovery.go); anything else fails.
+			silence = backendBody.silence()
+			if resp.StatusCode == http.StatusOK {
+				readErr = err
+				break
+			}
+			logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s status=%d after %d bytes, %s since sent, backend silent %s: %v",
+				shortID(cwReq.ConversationState.ConversationId), resp.StatusCode, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
+			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", err))
+		}
+
+		// A rejected reasoning signature: resend once without any reasoning and
+		// forget the rejected turns (see the streaming handler).
+		if resp.StatusCode == 400 && isThinkingSignatureInvalid(cwRespBody) && !reasoningStripped && cwReq.reasoning.turns > 0 {
+			reasoningStripped = true
+			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
+			reasoningStore.Evict(cwReq.stripReasoning()...)
+			logInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID (non-stream) convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
+				shortID(cwReq.ConversationState.ConversationId), turns, size))
+			if err := adopt(token, ident); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
+				return http.StatusInternalServerError
+			}
+			continue
 		}
 
 		if isMonthlyQuotaExceeded(resp.StatusCode, cwRespBody) {
@@ -7572,82 +8035,158 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		os.WriteFile(filepath.Join(debugDir, "last-cw-response.bin"), cwRespBody, 0600)
 	}
 
-	events := parser.ParseEvents(cwRespBody)
-	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
-		lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
-	}
-
-	// Restore original tool names (sanitized for CodeWhisperer's 64-char limit).
-	restoreToolNames(events, buildToolNameMap(anthropicReq.Tools))
-
-	textContent := ""
-	toolName := ""
-	toolUseId := ""
-	partialJsonStr := ""
-
-	contexts := []map[string]any{}
-
-	// Extract content from parsed events.
-	// Parser generates: content_block_delta (text_delta/input_json_delta) and message_delta.
-	// Note: parser does NOT generate content_block_start or content_block_stop events.
-	for _, event := range events {
-		if event.Data == nil {
-			continue
+	// Translate the answer attempt by attempt: an interrupted attempt, or one
+	// that stopped at MAX_TOKENS inside a tool call, is recovered the way
+	// Kiro's client does it (recovery.go). Text of every attempt and the tool
+	// calls of the last one make the answer.
+	toolNames := buildToolNameMap(anthropicReq.Tools)
+	var events []parser.SSEEvent
+	emitter := newBlockEmitter(func(e parser.SSEEvent) { events = append(events, e) })
+	currentReq := anthropicReq
+	var hidden recoveredExchange
+	var finalTools []*heldTool
+	var allText strings.Builder
+	convID := shortID(cwReq.ConversationState.ConversationId)
+	for recoveries := 0; ; {
+		if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
+			lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
 		}
-		dataMap, ok := event.Data.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		switch event.Event {
-		case "content_block_delta":
-			if delta, ok := dataMap["delta"].(map[string]any); ok {
-				switch delta["type"] {
-				case "text_delta":
-					if text, ok := delta["text"].(string); ok {
-						textContent += text
-					}
-				case "input_json_delta":
-					if pj, ok := delta["partial_json"].(string); ok {
-						partialJsonStr += pj
-					}
+		translator := parser.NewStreamTranslator()
+		frames := bytes.NewReader(cwRespBody)
+		attemptStart := len(events) // the emitter's output before this attempt
+		var attemptEvents []parser.SSEEvent
+		for {
+			payload, ferr := parser.ReadFramePayload(frames)
+			if ferr != nil {
+				if ferr != io.EOF && readErr == nil {
+					readErr = ferr // a body that ends inside a frame did not finish
 				}
+				break
 			}
-			// Also check direct content field (Kiro raw format)
-			if content, ok := dataMap["content"].(string); ok && content != "" {
-				textContent += content
+			translated := translator.Translate(payload)
+			restoreToolNames(translated, toolNames)
+			attemptEvents = append(attemptEvents, translated...)
+			emitter.push(translated)
+		}
+		kind := interruptionKind(readErr, silence, cfg.Network.BackendIdleCutAfter, translator, emitter)
+		if kind == interruptNone {
+			if readErr != nil {
+				logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s after %d bytes, %s since sent, backend silent %s: %v",
+					convID, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), readErr))
+				return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+					fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
 			}
-
-		case "content_block_start":
-			if cb, ok := dataMap["content_block"].(map[string]any); ok {
-				if cb["type"] == "tool_use" {
-					if name, ok := cb["name"].(string); ok {
-						toolName = name
-					}
-					if id, ok := cb["id"].(string); ok {
-						toolUseId = id
-					}
-				}
+			// The finished attempt keeps its own order (text after a tool
+			// stays after it); earlier attempts gave only their text.
+			finished := translator.Finish()
+			restoreToolNames(finished, toolNames)
+			emitter.push(finished)
+			finalTools = emitter.heldTools()
+			events = append(append(events[:attemptStart], attemptEvents...), finished...)
+			break
+		}
+		cause := interruptionCause(kind, readErr, silence, cfg.Network.BackendIdleCutAfter)
+		if !cfg.Advanced.InterruptedToolRecovery || recoveries >= maxRecoveries {
+			why := "recovery is off (advanced.interrupted_tool_recovery)"
+			if cfg.Advanced.InterruptedToolRecovery {
+				why = fmt.Sprintf("%d recoveries in a row already", recoveries)
 			}
+			logError(fmt.Sprintf("Interrupted response (non-stream) convId=%s (%s), backend silent %s, %s since sent, %d bytes - path 3, %s: failing the response: %v",
+				convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), len(cwRespBody), why, readErr))
+			if kind == interruptTruncated || recoveries >= maxRecoveries || isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter) {
+				// Resending as it is cannot help: a 400, which Claude Code
+				// does not resend.
+				return writeNonStreamError(w, lg, http.StatusBadRequest, "invalid_request_error", interruptionErrorMessage(kind, silence, recoveries))
+			}
+			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
+				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", readErr))
+		}
+		recoveries++
+		text, tools := emitter.endAttempt()
+		allText.WriteString(text)
+		var what string
+		if kind == interruptResend && strings.TrimSpace(text) == "" {
+			what = "resending the same request"
+			if !sleepCtx(ctx, recoveryBackoff()) {
+				return statusClientClosedRequest
+			}
+		} else {
+			turns := recoveryTurns(text, tools, kind == interruptTruncated, isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter))
+			hidden.Turns = append(hidden.Turns, turns...)
+			if strings.TrimSpace(text) != "" {
+				hidden.LeadTexts = append(hidden.LeadTexts, text)
+			}
+			currentReq = extendedRequest(currentReq, turns)
+			next, body, berr := recoveryRequest(currentReq, token, cwReq.ConversationState.ConversationId)
+			if berr != nil {
+				return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error", fmt.Sprintf("Failed to serialize request: %v", berr))
+			}
+			cwReq, cwReqBody = next, body
+			what = describeRecovery(tools)
+		}
+		logWarn(fmt.Sprintf("Interrupted response (non-stream) convId=%s (%s), backend silent %s, %s since sent, %d bytes - path %s, recovery %d of %d: %s",
+			convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), len(cwRespBody),
+			recoveryPath(kind, text), recoveries, maxRecoveries, what))
+		sentAt = time.Now()
+		next, serr := sendRecoveryRequest(ctx, cfg, token, cwReqBody)
+		if serr != nil {
+			if ctx.Err() != nil {
+				return statusClientClosedRequest
+			}
+			logError(fmt.Sprintf("Recovery request (non-stream) convId=%s failed: %v", convID, serr))
+			return writeNonStreamError(w, lg, http.StatusBadGateway, "api_error",
+				fmt.Sprintf("CodeWhisperer Error on the request that recovers an interrupted response: %v", serr))
+		}
+		body := newLastReadReader(next.Body, time.Now())
+		cwRespBody, readErr = io.ReadAll(body)
+		next.Body.Close()
+		silence = body.silence()
+		if readErr != nil && ctx.Err() != nil {
+			return statusClientClosedRequest
 		}
 	}
-
-	// Build content blocks
-	if strings.TrimSpace(textContent) != "" {
-		contexts = append(contexts, map[string]any{
-			"type": "text",
-			"text": textContent,
-		})
+	_, summary := parser.ParseEventsWithSummary(cwRespBody)
+	rememberReasoning(cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId, cwReq.scope,
+		summary.Reasoning, summary.ToolUseIDs, summary.Text)
+	if len(hidden.Turns) > 0 {
+		allText.WriteString(summary.Text)
+		ids := make([]string, 0, len(finalTools))
+		for _, t := range finalTools {
+			ids = append(ids, t.id)
+		}
+		recoveredTurns.put(recoveryKeys(recoveryScope(anthropicReq), ids, allText.String()), hidden)
 	}
-	if toolName != "" && partialJsonStr != "" {
-		toolInput := map[string]any{}
-		jsonStr.Unmarshal([]byte(partialJsonStr), &toolInput)
-		contexts = append(contexts, map[string]any{
-			"type":  "tool_use",
-			"id":    toolUseId,
-			"name":  toolName,
-			"input": toolInput,
-		})
+
+	contexts, toolCount, outputChars, blocksErr := nonStreamContentBlocks(events)
+	if blocksErr != nil {
+		if lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream answer dropped: %v [%s:%s]", blocksErr, sessionID, requestID))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		if encErr := json.NewEncoder(w).Encode(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "api_error", "message": "The Kiro " + blocksErr.Error()},
+		}); encErr != nil && lg != nil {
+			lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
+		}
+		return http.StatusBadGateway
+	}
+
+	if lg != nil {
+		lg.LogInfo(fmt.Sprintf("Parser (non-stream): %d events, hasText=%v, hasToolUse=%v, stopReason=%s reasoningChars=%d%s [%s:%s]",
+			len(events), len(contexts) > toolCount, toolCount > 0,
+			backendStopReasonLabel(summary.BackendStopReason), summary.ReasoningChars,
+			servedModelField(summary.ServedModel), sessionID, requestID))
+	}
+
+	if len(contexts) == 0 && summary.StopReason == "max_tokens" {
+		// The model spent its whole output budget (on reasoning) before it
+		// wrote anything. Say so in a normal message instead of nothing.
+		if lg != nil {
+			lg.LogError(outputLimitLogLine(summary.BackendStopReason, summary.ReasoningChars, len(cwRespBody)))
+		}
+		contexts = append(contexts, map[string]any{"type": "text", "text": outputLimitNote})
 	}
 
 	// Build Anthropic response
@@ -7655,19 +8194,170 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 		"content":       contexts,
 		"model":         anthropicReq.Model,
 		"role":          "assistant",
-		"stop_reason":   "end_turn",
+		"stop_reason":   summary.StopReason,
 		"stop_sequence": nil,
 		"type":          "message",
+		// The same estimates as the streaming path: characters / 4.
 		"usage": map[string]any{
-			"input_tokens":  len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
-			"output_tokens": len(textContent),
+			"input_tokens":  len(cwReqBody) / 4,
+			"output_tokens": outputChars / 4,
 		},
 	}
 
 	// Send response
 	w.Header().Set("Content-Type", "application/json")
-	jsonStr.NewEncoder(w).Encode(anthropicResp)
+	if err := writeNonStreamJSON(w, anthropicResp); err != nil && lg != nil {
+		lg.LogError(fmt.Sprintf("Non-stream response write failed [%s:%s]: %v", sessionID, requestID, err))
+	}
 	return http.StatusOK
+}
+
+// writeNonStreamError answers a non-streaming request with an Anthropic error
+// envelope and returns the status it wrote.
+func writeNonStreamError(w http.ResponseWriter, lg *logger.Logger, status int, errType, message string) int {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if encErr := json.NewEncoder(w).Encode(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": errType, "message": message},
+	}); encErr != nil && lg != nil {
+		lg.LogError(fmt.Sprintf("Non-stream error envelope write failed: %v", encErr))
+	}
+	return status
+}
+
+// writeNonStreamJSON writes a non-streaming answer under the per-write
+// deadline streaming uses (streamWriteTimeout), so a client that stops reading
+// without closing cannot hold the handler forever. It flushes before clearing
+// the deadline, so the whole answer is written under it and no deadline stays
+// armed for a later request on the same connection. A writer without
+// deadlines answers http.ErrNotSupported, which is ignored.
+func writeNonStreamJSON(w http.ResponseWriter, v any) error {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	if err := jsonStr.NewEncoder(w).Encode(v); err != nil {
+		return err
+	}
+	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
+}
+
+// nonStreamContentBlocks builds the content of a non-streaming answer from the
+// parsed events, in arrival order: one text block per run of text, and one
+// tool_use block per tool call with its own id, name and input. A text run of
+// only whitespace is dropped. It also returns the number of tool blocks and
+// the characters of text and tool input, for the usage estimate. A tool call
+// whose input is not valid JSON is an error (malformedToolInputError): the
+// answer would otherwise carry a tool call with an input the model never gave.
+func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, tools int, outputChars int, err error) {
+	type toolBlock struct {
+		block map[string]any
+		input strings.Builder
+	}
+	type pending struct {
+		text *strings.Builder
+		tool *toolBlock
+	}
+	var order []pending
+	toolsByIndex := map[any]*toolBlock{}
+	// A text block keeps its own text: an answer recovered after an
+	// interruption has one text block per attempt (recovery.go), and the
+	// history of later requests relies on finding the first one whole.
+	textByIndex := map[any]*strings.Builder{}
+	appendText := func(text string) {
+		outputChars += len(text)
+		if n := len(order); n > 0 && order[n-1].text != nil {
+			order[n-1].text.WriteString(text)
+			return
+		}
+		b := &strings.Builder{}
+		b.WriteString(text)
+		order = append(order, pending{text: b})
+	}
+
+	for _, event := range events {
+		dataMap, ok := event.Data.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch event.Event {
+		case "content_block_start":
+			cb, ok := dataMap["content_block"].(map[string]any)
+			if ok && cb["type"] == "text" {
+				b := &strings.Builder{}
+				textByIndex[dataMap["index"]] = b
+				order = append(order, pending{text: b})
+				continue
+			}
+			if !ok || cb["type"] != "tool_use" {
+				continue
+			}
+			tb := &toolBlock{block: map[string]any{"type": "tool_use", "id": cb["id"], "name": cb["name"]}}
+			toolsByIndex[dataMap["index"]] = tb
+			order = append(order, pending{tool: tb})
+		case "content_block_delta":
+			if delta, ok := dataMap["delta"].(map[string]any); ok {
+				switch delta["type"] {
+				case "text_delta":
+					if text, ok := delta["text"].(string); ok {
+						if b := textByIndex[dataMap["index"]]; b != nil {
+							outputChars += len(text)
+							b.WriteString(text)
+						} else {
+							appendText(text)
+						}
+					}
+				case "input_json_delta":
+					if pj, ok := delta["partial_json"].(string); ok {
+						outputChars += len(pj)
+						if tb := toolsByIndex[dataMap["index"]]; tb != nil {
+							tb.input.WriteString(pj)
+						}
+					}
+				}
+			}
+			// Also check direct content field (Kiro raw format)
+			if content, ok := dataMap["content"].(string); ok && content != "" {
+				appendText(content)
+			}
+		}
+	}
+
+	blocks = []map[string]any{} // an empty answer is "content": [], never null
+	for _, p := range order {
+		if p.text != nil {
+			if text := p.text.String(); strings.TrimSpace(text) != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": text})
+			}
+			continue
+		}
+		input := map[string]any{}
+		if raw := p.tool.input.String(); raw != "" {
+			if uerr := jsonStr.Unmarshal([]byte(raw), &input); uerr != nil {
+				return nil, 0, 0, &malformedToolInputError{name: fmt.Sprint(p.tool.block["name"]), id: fmt.Sprint(p.tool.block["id"]), err: uerr}
+			}
+		}
+		p.tool.block["input"] = input
+		blocks = append(blocks, p.tool.block)
+		tools++
+	}
+	return blocks, tools, outputChars, nil
+}
+
+// malformedToolInputError is a tool call of a non-streaming answer whose
+// input the backend sent as JSON that does not parse.
+type malformedToolInputError struct {
+	name, id string
+	err      error
+}
+
+func (e *malformedToolInputError) Error() string {
+	return fmt.Sprintf("backend sent malformed tool input for tool %s (%s): %v", e.name, e.id, e.err)
 }
 
 // sendSSEEvent sends an SSE event and optionally captures it
@@ -7686,8 +8376,11 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 		})
 	}
 
-	io.Copy(w, strings.NewReader("event: "+eventType+"\n"))
-	io.Copy(w, strings.NewReader("data: "+string(json)+"\n\n"))
+	// One write per frame: the keepalive ping shares this writer and must
+	// never land between an event line and its data line.
+	if _, err := io.WriteString(w, "event: "+eventType+"\ndata: "+string(json)+"\n\n"); err != nil {
+		return // the client is gone; the handler learns it from the request context
+	}
 	flusher.Flush()
 
 }

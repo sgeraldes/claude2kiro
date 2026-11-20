@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,11 +77,16 @@ type DisplayConfig struct {
 
 // NetworkConfig holds network-related settings
 type NetworkConfig struct {
-	HTTPTimeout           time.Duration `yaml:"http_timeout"`
-	TokenRefreshThreshold time.Duration `yaml:"token_refresh_threshold"`
-	StreamingDelayMax     time.Duration `yaml:"streaming_delay_max"`
-	MaxConcurrentReqs     int           `yaml:"max_concurrent_requests"` // Max parallel requests to Kiro backend
-	MaxToolsPerRequest    int           `yaml:"max_tools_per_request"`   // Max tools sent per request (Kiro limit)
+	HTTPTimeout             time.Duration `yaml:"http_timeout"`
+	TokenRefreshThreshold   time.Duration `yaml:"token_refresh_threshold"`
+	StreamingDelayMax       time.Duration `yaml:"streaming_delay_max"`
+	MaxConcurrentReqs       int           `yaml:"max_concurrent_requests"`   // Max parallel requests to Kiro backend
+	MaxToolsPerRequest      int           `yaml:"max_tools_per_request"`     // Max tools sent per request (Kiro limit)
+	StreamKeepaliveInterval time.Duration `yaml:"stream_keepalive_interval"` // Ping a streaming client after this much silence (0 = no pings)
+	// BackendIdleCutAfter is the backend silence after which a broken
+	// response is taken for Kiro's idle cut (Kiro closes a response after
+	// 240 s without output). Default 230s; 0 or less means the default.
+	BackendIdleCutAfter time.Duration `yaml:"backend_idle_cut_after"`
 }
 
 // AdvancedConfig holds advanced/API settings
@@ -104,7 +110,45 @@ type AdvancedConfig struct {
 	ToolMode              string `yaml:"tool_mode"`               // Request diet tool mode: full, compact, none_text (default: full)
 	ToolCompactMaxChars   int    `yaml:"tool_compact_max_chars"`  // Max description chars when tool_mode=compact
 	AggressiveCachePoints bool   `yaml:"aggressive_cache_points"` // Add cachePoint boundaries after tools even without Anthropic cache_control (default: false)
-	Profile               string `yaml:"profile"`                 // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+	ThinkingMode          string `yaml:"thinking_mode"`           // Who decides the model's thinking: client (translate the client's thinking field, default) or backend (send none, the backend default applies)
+	// ReasoningHistoryMaxBytes caps the reasoning the proxy gives back to the
+	// backend in one request's history, newest turns first (default 4 MiB). 0
+	// turns the feature off: no reasoning is kept or sent back.
+	ReasoningHistoryMaxBytes int `yaml:"reasoning_history_max_bytes"`
+	// ReasoningHistoryMaxBlocks caps how many turns' reasoning one request
+	// carries, newest first. 0 (the default) means no limit.
+	ReasoningHistoryMaxBlocks int `yaml:"reasoning_history_max_blocks"`
+	// InterruptedToolRecovery: when a response is interrupted (Kiro's idle
+	// cut, a broken stream) or stops at its output limit inside a tool call,
+	// the proxy answers the interrupted tool calls with failed tool results
+	// and asks Kiro again, as Kiro's own client does, at most 3 times per
+	// response. Default true. Off: such a response fails as an error.
+	InterruptedToolRecovery bool   `yaml:"interrupted_tool_recovery"`
+	Profile                 string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+}
+
+// DefaultReasoningHistoryMaxBytes is the default of
+// AdvancedConfig.ReasoningHistoryMaxBytes, 4 MiB.
+const DefaultReasoningHistoryMaxBytes = 4 << 20
+
+// DefaultBackendIdleCutAfter is the default of
+// NetworkConfig.BackendIdleCutAfter: a little under Kiro's 240 s, so the
+// measured cuts (240.0 s after the last frame) fall above it.
+const DefaultBackendIdleCutAfter = 230 * time.Second
+
+// Values of AdvancedConfig.ThinkingMode.
+const (
+	ThinkingModeClient  = "client"  // translate what the client asked for
+	ThinkingModeBackend = "backend" // never send a thinking field
+)
+
+// EffectiveThinkingMode returns ThinkingMode, or client when it is empty or
+// not a known value. Case and surrounding spaces are ignored.
+func (a AdvancedConfig) EffectiveThinkingMode() string {
+	if strings.EqualFold(strings.TrimSpace(a.ThinkingMode), ThinkingModeBackend) {
+		return ThinkingModeBackend
+	}
+	return ThinkingModeClient
 }
 
 // FilterConfig holds log filter settings (persisted across sessions)
@@ -159,11 +203,13 @@ func Default() *Config {
 			TruncateBase64:     true,      // Replace base64 blobs with placeholders
 		},
 		Network: NetworkConfig{
-			HTTPTimeout:           30 * time.Second,
-			TokenRefreshThreshold: 5 * time.Minute,
-			StreamingDelayMax:     0,  // No artificial delay - Claude Code handles rendering pacing
-			MaxConcurrentReqs:     4,  // Max parallel requests to Kiro backend
-			MaxToolsPerRequest:    85, // Kiro rejects requests with ~95+ tools
+			HTTPTimeout:             30 * time.Second,
+			TokenRefreshThreshold:   5 * time.Minute,
+			StreamingDelayMax:       0,                // No artificial delay - Claude Code handles rendering pacing
+			MaxConcurrentReqs:       4,                // Max parallel requests to Kiro backend
+			MaxToolsPerRequest:      85,               // Kiro rejects requests with ~95+ tools
+			StreamKeepaliveInterval: 15 * time.Second, // Keeps a client from giving up while Kiro is silent
+			BackendIdleCutAfter:     DefaultBackendIdleCutAfter,
 		},
 		Advanced: AdvancedConfig{
 			CodeWhispererEndpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
@@ -181,6 +227,10 @@ func Default() *Config {
 			ToolMode:              "full",
 			ToolCompactMaxChars:   1024,
 			AggressiveCachePoints: false,
+			ThinkingMode:          ThinkingModeClient,
+
+			ReasoningHistoryMaxBytes: DefaultReasoningHistoryMaxBytes,
+			InterruptedToolRecovery:  true,
 		},
 	}
 }
@@ -238,6 +288,12 @@ func Load() (*Config, error) {
 func (c *Config) normalize() {
 	if c.Network.HTTPTimeout <= 0 {
 		c.Network.HTTPTimeout = Default().Network.HTTPTimeout
+	}
+	if c.Network.BackendIdleCutAfter <= 0 {
+		c.Network.BackendIdleCutAfter = DefaultBackendIdleCutAfter
+	}
+	if c.Advanced.ReasoningHistoryMaxBlocks < 0 {
+		c.Advanced.ReasoningHistoryMaxBlocks = 0
 	}
 }
 
@@ -307,6 +363,40 @@ func Set(cfg *Config) {
 	currentMu.Lock()
 	current = cfg
 	currentMu.Unlock()
+
+	changeMu.Lock()
+	fns := make([]func(), 0, len(changeFns))
+	for _, fn := range changeFns {
+		fns = append(fns, fn)
+	}
+	changeMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// Change listeners, called after every Set. A reader that parks on a value from
+// the config (the concurrency limiter's waiters) registers one so a live change
+// reaches it at once instead of at its next unrelated wake-up.
+var (
+	changeMu   sync.Mutex
+	changeNext int
+	changeFns  = map[int]func(){}
+)
+
+// OnChange registers fn to run after every Set, outside the config lock, and
+// returns a function that removes it.
+func OnChange(fn func()) (remove func()) {
+	changeMu.Lock()
+	id := changeNext
+	changeNext++
+	changeFns[id] = fn
+	changeMu.Unlock()
+	return func() {
+		changeMu.Lock()
+		delete(changeFns, id)
+		changeMu.Unlock()
+	}
 }
 
 // Reload reloads configuration from file

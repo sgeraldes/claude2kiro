@@ -694,7 +694,7 @@ func (m *LogViewerModel) updateDetailContent() {
 		typeColor = infoColor
 	case logger.LogTypeErr:
 		typeColor = errorColor
-	case logger.LogTypeInf:
+	case logger.LogTypeInf, logger.LogTypeWrn:
 		typeColor = warnColor
 	}
 	typeStyle := lipgloss.NewStyle().Foreground(typeColor).Bold(true)
@@ -2129,6 +2129,9 @@ func (m LogViewerModel) renderEntryLine(entry logger.LogEntry, contentWidth int,
 		case logger.LogTypeCmp:
 			typeChar = "◆"
 			typeColor = lipgloss.Color("#FFB86C") // Orange for comparison
+		case logger.LogTypeWrn:
+			typeChar = "▲"
+			typeColor = warnColor
 		}
 	}
 	// Set type char even when selected
@@ -2143,6 +2146,8 @@ func (m LogViewerModel) renderEntryLine(entry logger.LogEntry, contentWidth int,
 		typeChar = "●"
 	case logger.LogTypeCmp:
 		typeChar = "◆"
+	case logger.LogTypeWrn:
+		typeChar = "▲"
 	}
 
 	// TIME column (8 chars)

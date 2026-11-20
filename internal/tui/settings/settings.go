@@ -531,19 +531,32 @@ func (m *Model) loadSettings() {
 			},
 		},
 		{
+			Key:         "network.stream_keepalive_interval",
+			Label:       "Stream Keepalive Interval",
+			Description: "Ping a streaming client after this much silence",
+			Type:        TypeText,
+			Value:       m.config.Network.StreamKeepaliveInterval.String(),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "15s",
+				RecommendedValue: "15s",
+				Sensitive:        false,
+				DetailedDesc:     "While Kiro sends nothing (it can take minutes before the first byte), the proxy sends the client an SSE ping after this much silence, so the client does not give up and resend the request. Lower it for a client with a shorter idle timeout. Set to 0 to turn the pings off. Applies to requests that start after the change. Format: 5s, 15s, 30s.",
+				ReferenceURL:     "https://pkg.go.dev/time#ParseDuration",
+			},
+		},
+		{
 			Key:         "network.max_concurrent_requests",
 			Label:       "Max Concurrent Requests",
 			Description: "Parallel requests to the Kiro backend",
 			Type:        TypeNumber,
 			Value:       fmt.Sprintf("%d", m.config.Network.MaxConcurrentReqs),
-			Min:         1,
-			Max:         32,
+			Min:         1, // no Max: like config.yaml, any value from 1 up
 			Step:        1,
 			ExtendedHelp: ExtendedHelp{
 				DefaultValue:     "4",
 				RecommendedValue: "4",
 				Sensitive:        false,
-				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Range: 1-32.",
+				DetailedDesc:     "How many requests the proxy sends to the Kiro backend at once. Lower this (2-3) if many parallel subagents trigger HTTP 500 'unexpectedly high load' errors; raising it risks more backend throttling. Any value from 1 up.",
 			},
 		},
 		{
@@ -780,6 +793,63 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "EXPERIMENTAL. Adds Kiro cachePoint entries after tools even when Claude Code did not send Anthropic cache_control. Only enable while measuring whether Kiro credits drop.",
 			},
 		},
+		{
+			Key:         "advanced.thinking_mode",
+			Label:       "Thinking Mode",
+			Description: "Who decides whether the model thinks",
+			Type:        TypeSelect,
+			Value:       m.config.Advanced.EffectiveThinkingMode(),
+			Options:     []string{config.ThinkingModeClient, config.ThinkingModeBackend},
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     config.ThinkingModeClient,
+				RecommendedValue: config.ThinkingModeClient,
+				Sensitive:        false,
+				DetailedDesc:     "client sends Kiro the thinking the client asked for: off when the client sent no thinking field (claude2kiro run turns it off), adaptive when it asked for thinking. A model whose catalog entry cannot turn thinking off keeps the backend default. backend never sends a thinking field, so Kiro applies its default, which is adaptive thinking on: slower and more credits per request.",
+			},
+		},
+		{
+			Key:         "advanced.reasoning_history_max_bytes",
+			Label:       "Reasoning History Bytes",
+			Description: "Max reasoning bytes given back per request",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.ReasoningHistoryMaxBytes),
+			Min:         0,
+			Max:         128 << 20,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     strconv.Itoa(config.DefaultReasoningHistoryMaxBytes),
+				RecommendedValue: strconv.Itoa(config.DefaultReasoningHistoryMaxBytes),
+				Sensitive:        false,
+				DetailedDesc:     "The proxy keeps the model's reasoning (in memory, lost on restart) and gives it back to Kiro in the history of later turns, as the Kiro IDE does, so the model does not plan every step again. This caps the reasoning bytes one request carries, newest turns first. 0 turns the feature off. Range: 0-134217728.",
+			},
+		},
+		{
+			Key:         "advanced.reasoning_history_max_blocks",
+			Label:       "Reasoning History Turns",
+			Description: "Max turns whose reasoning is given back (0 = all)",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.ReasoningHistoryMaxBlocks),
+			Min:         0,
+			Max:         1000,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "0",
+				RecommendedValue: "0",
+				Sensitive:        false,
+				DetailedDesc:     "Caps how many earlier turns' reasoning one request carries, newest first, on top of the byte cap. 0 means no limit. For measurements (for example newest only = 1); the default is unchanged. Range: 0-1000.",
+			},
+		},
+		{
+			Key:         "advanced.interrupted_tool_recovery",
+			Label:       "Interrupted Tool Recovery",
+			Description: "Recover a response Kiro cut inside a tool call",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.InterruptedToolRecovery),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "true",
+				RecommendedValue: "true",
+				Sensitive:        false,
+				DetailedDesc:     "Kiro ends a response after about 240 s without output, which breaks a tool call whose input (a large file) takes longer to write; a tool call can also hit the model's output limit. On: the proxy never passes an incomplete tool call to the client. It answers it with a failed tool result telling the model to split the work, asks Kiro again in the same conversation and streams the new answer as the rest of the same message, at most 3 times per response, as Kiro's own client does. That exchange goes to Kiro only and is put back into the history of later requests. Off: such a response fails as an error.",
+			},
+		},
 	}
 }
 
@@ -885,6 +955,10 @@ func (m *Model) applySetting(s Setting) {
 		if d, err := parseDuration(s.Value); err == nil {
 			m.config.Network.StreamingDelayMax = d
 		}
+	case "network.stream_keepalive_interval":
+		if d, err := parseDuration(s.Value); err == nil && d >= 0 {
+			m.config.Network.StreamKeepaliveInterval = d
+		}
 	case "network.max_concurrent_requests":
 		if v, err := strconv.Atoi(s.Value); err == nil && v >= 1 {
 			m.config.Network.MaxConcurrentReqs = v
@@ -934,6 +1008,18 @@ func (m *Model) applySetting(s Setting) {
 		}
 	case "advanced.aggressive_cache_points":
 		m.config.Advanced.AggressiveCachePoints = stringToBool(s.Value)
+	case "advanced.thinking_mode":
+		m.config.Advanced.ThinkingMode = s.Value
+	case "advanced.reasoning_history_max_bytes":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.ReasoningHistoryMaxBytes = v
+		}
+	case "advanced.reasoning_history_max_blocks":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.ReasoningHistoryMaxBlocks = v
+		}
+	case "advanced.interrupted_tool_recovery":
+		m.config.Advanced.InterruptedToolRecovery = stringToBool(s.Value)
 	}
 }
 
@@ -1167,15 +1253,8 @@ func (m Model) handleEditing(msg tea.Msg) (Model, tea.Cmd) {
 					m.textInput.Blur()
 					return m, nil
 				} else {
-					// Clamp to range
 					if s.Min != 0 || s.Max != 0 {
-						if v < s.Min {
-							v = s.Min
-						}
-						if v > s.Max {
-							v = s.Max
-						}
-						newValue = fmt.Sprintf("%d", v)
+						newValue = fmt.Sprintf("%d", clampNumber(*s, v))
 					}
 				}
 			}
@@ -1709,8 +1788,11 @@ func (m Model) renderHelpPanel(width, height int) string {
 		lines = append(lines, hintStyle.Render("Options: "+strings.Join(s.Options, ", ")))
 	case TypeNumber:
 		hint := "Press Enter to edit, Up/Down to adjust ±1"
-		if s.Min != 0 || s.Max != 0 {
+		switch {
+		case s.Max != 0:
 			hint += fmt.Sprintf("\nRange: %d - %d", s.Min, s.Max)
+		case s.Min != 0:
+			hint += fmt.Sprintf("\nMinimum: %d", s.Min)
 		}
 		lines = append(lines, hintStyle.Render(hint))
 	case TypeText:
@@ -1853,4 +1935,15 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("esc", "back"),
 		),
 	}
+}
+
+// clampNumber keeps v within the setting's range. Max 0 means no upper bound.
+func clampNumber(s Setting, v int) int {
+	if v < s.Min {
+		v = s.Min
+	}
+	if s.Max != 0 && v > s.Max {
+		v = s.Max
+	}
+	return v
 }

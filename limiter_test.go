@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -43,6 +44,112 @@ func TestKiroLimiterEnforcesLimit(t *testing.T) {
 
 	l.release()
 	l.release()
+}
+
+// A request whose client leaves while it waits for a slot stops waiting at
+// once and never takes a slot; the next request still gets the slot.
+func TestKiroLimiterCancelWhileQueued(t *testing.T) {
+	prev := config.Get()
+	cfg := *prev
+	cfg.Network.MaxConcurrentReqs = 1
+	config.Set(&cfg)
+	t.Cleanup(func() { config.Set(prev) })
+
+	l := newKiroLimiter()
+	if !l.acquireCtx(context.Background()) {
+		t.Fatal("the first acquire must get the free slot")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan bool)
+	go func() { got <- l.acquireCtx(ctx) }()
+	select {
+	case <-got:
+		t.Fatal("the second acquire should wait at limit=1")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case ok := <-got:
+		if ok {
+			t.Fatal("a cancelled acquire must not take a slot")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled acquire kept waiting")
+	}
+
+	l.mu.Lock()
+	active := l.active
+	l.mu.Unlock()
+	if active != 1 {
+		t.Fatalf("active = %d after the cancelled wait, want 1", active)
+	}
+
+	// The slot is still the first request's; once it is released a later
+	// request gets it.
+	later := make(chan bool)
+	go func() { later <- l.acquireCtx(context.Background()) }()
+	l.release()
+	select {
+	case ok := <-later:
+		if !ok {
+			t.Fatal("a later acquire must get the released slot")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a later acquire was not admitted after the release")
+	}
+	l.release()
+}
+
+// An acquire whose context is already done never takes a slot, even a free one.
+func TestKiroLimiterDoneContextTakesNoSlot(t *testing.T) {
+	l := newKiroLimiter()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if l.acquireCtx(ctx) {
+		t.Fatal("an acquire with a done context must fail")
+	}
+	if l.active != 0 {
+		t.Fatalf("active = %d, want 0", l.active)
+	}
+}
+
+// Raising the limit live admits a request already parked at the old limit,
+// without waiting for some other request to finish.
+func TestKiroLimiterRaiseLimitWakesWaiter(t *testing.T) {
+	prev := config.Get()
+	cfg := *prev
+	cfg.Network.MaxConcurrentReqs = 1
+	config.Set(&cfg)
+	t.Cleanup(func() { config.Set(prev) })
+
+	l := newKiroLimiter()
+	if !l.acquireCtx(context.Background()) {
+		t.Fatal("the first acquire must get the free slot")
+	}
+	defer l.release()
+
+	admitted := make(chan bool, 1)
+	go func() { admitted <- l.acquireCtx(context.Background()) }()
+	select {
+	case <-admitted:
+		t.Fatal("the second acquire should wait at limit=1")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	raised := cfg
+	raised.Network.MaxConcurrentReqs = 2
+	config.Set(&raised)
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("the waiter must take the new slot")
+		}
+		l.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("raising the limit did not admit the parked waiter")
+	}
 }
 
 // TestKiroLimiterLowerLimitLive verifies that lowering the limit while requests

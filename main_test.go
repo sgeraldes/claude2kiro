@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -19,6 +20,17 @@ func withStubCatalog(t *testing.T, list []models.KiroModel) {
 	orig := modelCatalog
 	modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) {
 		return list, nil
+	})
+	t.Cleanup(func() { modelCatalog = orig })
+}
+
+// withOfflineCatalog replaces the package model catalog with one whose fetch
+// always fails, as when ListAvailableModels is unreachable.
+func withOfflineCatalog(t *testing.T) {
+	t.Helper()
+	orig := modelCatalog
+	modelCatalog = models.NewCatalog(time.Minute, func() ([]models.KiroModel, error) {
+		return nil, errors.New("model catalog offline in this test")
 	})
 	t.Cleanup(func() { modelCatalog = orig })
 }

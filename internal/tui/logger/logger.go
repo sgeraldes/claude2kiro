@@ -32,6 +32,7 @@ const (
 	LogTypeErr
 	LogTypeInf
 	LogTypeCmp
+	LogTypeWrn // a failure the proxy worked around
 )
 
 // maxDeltaSessions bounds the per-session delta-tracking maps so a long-lived
@@ -78,6 +79,8 @@ func (t LogType) String() string {
 		return "INF"
 	case LogTypeCmp:
 		return "CMP"
+	case LogTypeWrn:
+		return "WRN"
 	default:
 		return "???"
 	}
@@ -150,7 +153,7 @@ func (e LogEntry) Format(maxWidth int) string {
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorReq)
 	case LogTypeRes:
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorRes)
-	case LogTypeErr:
+	case LogTypeErr, LogTypeWrn:
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorErr)
 	case LogTypeCmp:
 		typeStyle = lipgloss.NewStyle().Bold(true).Foreground(colorCmp)
@@ -1538,6 +1541,18 @@ func (l *Logger) LogError(message string) {
 	})
 }
 
+// LogWarn logs a failure the proxy worked around (a resend, a repaired
+// answer): worth seeing, but the client was not failed.
+func (l *Logger) LogWarn(message string) {
+	cfg := config.Get()
+	l.Log(LogEntry{
+		Timestamp: time.Now(),
+		Type:      LogTypeWrn,
+		Preview:   sanitizePreview(message, cfg.Logging.PreviewLength),
+		Body:      message,
+	})
+}
+
 // LogInfo is a convenience method for logging info messages
 func (l *Logger) LogInfo(message string) {
 	cfg := config.Get()
@@ -1757,6 +1772,8 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 		logType = LogTypeInf
 	case "CMP":
 		logType = LogTypeCmp
+	case "WRN":
+		logType = LogTypeWrn
 	default:
 		return LogEntry{}, false
 	}
@@ -1809,7 +1826,7 @@ func parsePlainLogLine(line string) (LogEntry, bool) {
 		parseResponseDetails(&entry, mainDetails)
 	case LogTypeCmp:
 		parseComparisonDetails(&entry, mainDetails)
-	case LogTypeErr, LogTypeInf:
+	case LogTypeErr, LogTypeInf, LogTypeWrn:
 		entry.Preview = mainDetails
 		entry.Body = mainDetails
 	}
