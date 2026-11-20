@@ -334,6 +334,15 @@ A streaming request (`"stream": true`) is forwarded frame by frame. `parser.Read
 
 Non-streaming requests (`"stream": false`) still read the whole backend response and translate it with `parser.ParseEventsWithSummary`, which also returns the stop reason and the reasoning size. Their log line is `Parser (non-stream): N events, hasText=…, hasToolUse=…, stopReason=… reasoningChars=…`, with `servedModel=…` when the backend named a model. The answer's `content` keeps the arrival order: one `text` block per run of text and one `tool_use` block per tool call, each with its own `id`, `name` and `input`. A tool call with no input gets `input: {}`. A tool call whose input the backend sent as JSON that does not parse is not turned into an empty input: the proxy logs an error line naming the tool, its id and the parse error, and answers `502` with an `api_error` envelope saying the backend sent malformed tool input. The streaming path forwards the backend's input fragments unchanged as `input_json_delta` events, and the client parses the assembled JSON itself.
 
+A non-streaming response that breaks while it is being read is logged as `CodeWhisperer response read failed (non-stream) convId=… after N bytes, … since sent, backend silent …: <error>` and answered with an `api_error` envelope (`500`, which Claude Code resends). The streaming path logs the same timings on its `CodeWhisperer response read failed` line.
+
+#### Kiro's idle cut (backend_idle_cut.go)
+
+Kiro resets a response stream (HTTP/2 `RST_STREAM`, `INTERNAL_ERROR`) after 240 seconds in which it sent nothing. It also holds a tool call's input value until the model has finished writing it: a `Write` call's name and `file_path` arrive at once, then nothing, then the whole content in one burst. A tool input that takes the model longer than 240 s to write (a large file in one `Write` call) therefore never arrives. Measured on 2026-11-20 by replaying one request straight against the backend, without the proxy: one send stayed silent after the `file_path` and was cut 240.0 s after its last frame; the identical body ten minutes later burst its content after 97 s of silence and finished. In the three task runs that hit it, Claude Code resent the request as a non-streaming request every four minutes until the run's 45-minute limit, and every resend was cut. The proxy cannot keep the backend's stream alive, so:
+
+- a streaming response cut after at least 230 s of backend silence fails as before, retryable, and Claude Code falls back to a non-streaming request;
+- a non-streaming response cut that way gets `400 invalid_request_error`, which Claude Code does not resend, with a message that names the tool call, the 240 s limit and what to ask for instead (smaller pieces).
+
 Kiro reports no token counts, so `usage` is an estimate, the same on both paths: `input_tokens` is the size of the request sent to the backend in bytes / 4, `output_tokens` the characters of text and tool input / 4.
 
 ## Credit-Efficiency Optimizations
