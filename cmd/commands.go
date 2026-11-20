@@ -1081,6 +1081,44 @@ func isClaude2KiroDesktopConfig(path string) bool {
 	return found
 }
 
+// ClaudeCodeRouting lists the persistent Claude Code settings that route
+// Claude Code through Claude2Kiro, by the same rules `claude2kiro disable`
+// uses to remove them: proxy variables in settingsPath's env block, the
+// kiro-proxy plugin enabled there, and the proxy account in statePath
+// (.claude.json). A missing file is not an error.
+func ClaudeCodeRouting(settingsPath, statePath string) ([]string, error) {
+	var found []string
+	settings, err := readJSONMap(settingsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read %s: %w", settingsPath, err)
+	}
+	if err == nil {
+		if envMap, ok := settings["env"].(map[string]any); ok && envLooksClaude2Kiro(envMap) {
+			found = append(found, "settings.json env routes Claude Code to the proxy")
+		}
+		if enabled, ok := settings["enabledPlugins"].(map[string]any); ok && enabled["kiro-proxy@claude2kiro"] == true {
+			found = append(found, "kiro-proxy plugin enabled")
+		}
+	}
+	state, err := readJSONMap(statePath)
+	if err != nil && !os.IsNotExist(err) {
+		return found, fmt.Errorf("read %s: %w", statePath, err)
+	}
+	if err == nil && claudeJSONUsesProxyAccount(state) {
+		found = append(found, ".claude.json has the proxy account")
+	}
+	return found, nil
+}
+
+// DesktopGatewayConfigured reports whether Claude Desktop's gateway config
+// under localAppData (Claude-3p\configLibrary) was written by Claude2Kiro.
+func DesktopGatewayConfigured(localAppData string) bool {
+	if localAppData == "" {
+		return false
+	}
+	return isClaude2KiroDesktopConfig(filepath.Join(localAppData, "Claude-3p", "configLibrary"))
+}
+
 func readJSONMap(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
