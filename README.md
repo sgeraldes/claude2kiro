@@ -110,6 +110,10 @@ Supported login methods:
 - AWS Builder ID
 - Enterprise Identity Center
 
+GitHub and Google use Kiro's device authorization: the terminal prints a short code and an
+`app.kiro.dev` link, you approve the code in the browser, and the login finishes on its own
+(no local callback port is involved).
+
 Use this first if you have not authenticated yet, or if you need to switch accounts.
 
 #### Two Kiro identities on one machine
