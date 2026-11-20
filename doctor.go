@@ -88,7 +88,23 @@ func collectDoctorReport(opts doctorOptions) diagnostics.Report {
 		if name != profile.Active() {
 			id = "kiro_token_" + name
 		}
-		return diagnostics.TokenCheck(id, label, data, err, errors.Is(err, os.ErrNotExist), opts.Now, fallback)
+		check, facts := diagnostics.TokenCheck(id, label, data, err, errors.Is(err, os.ErrNotExist), opts.Now, fallback)
+		if facts.Usable {
+			return check, facts
+		}
+		// A refresh that could not replace the token file leaves the new
+		// token next to it; the next use moves it into place. Read it, never
+		// move it.
+		renewedData, renewedErr := tokenfile.ReadFile(tokenfile.RenewedPath(path))
+		if renewedErr != nil {
+			return check, facts
+		}
+		renewed, renewedFacts := diagnostics.TokenCheck(id, label, renewedData, nil, false, opts.Now, fallback)
+		if !renewedFacts.Usable {
+			return check, facts
+		}
+		renewed.Detail += "; from the renewed token waiting next to the token file, which the next use moves into place"
+		return renewed, renewedFacts
 	}
 	check, facts := tokenCheck(profile.Active(), "Kiro token", false)
 	add(check)

@@ -183,6 +183,29 @@ func TestDoctorOfflineAndExpiredTokenSkipCatalogue(t *testing.T) {
 	}
 }
 
+func TestDoctorReadsStagedRenewedTokenWithoutMovingIt(t *testing.T) {
+	now := time.Now()
+	home := doctorHome(t, now.Add(-time.Hour))
+	tokenPath := filepath.Join(home, ".aws", "sso", "cache", "kiro-auth-token.json")
+	renewedPath := tokenPath + ".renewed"
+	writeDoctorFile(t, renewedPath, `{"accessToken":"`+doctorSecretAccess+`","refreshToken":"r","expiresAt":"`+
+		now.Add(time.Hour).Format(time.RFC3339)+`","profileArn":"`+doctorSecretArn+`"}`)
+	before := snapshot(t, home)
+	opts, calls := testDoctorOptions(now)
+	r := collectDoctorReport(opts)
+	c := checkByID(t, r, "kiro_token")
+	if c.Severity != diagnostics.SeverityOK || !strings.Contains(c.Detail, "renewed token waiting") {
+		t.Fatalf("staged renewed token not reported: %+v", c)
+	}
+	if *calls != 1 {
+		t.Fatal("the renewed token is usable, so the catalogue should be checked with it")
+	}
+	after := snapshot(t, home)
+	if after[renewedPath] != before[renewedPath] || after[tokenPath] != before[tokenPath] || len(after) != len(before) {
+		t.Fatal("doctor moved or changed the renewed token")
+	}
+}
+
 func TestDoctorMissingTokenIsAnError(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("USERPROFILE", home)

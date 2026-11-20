@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -182,12 +183,20 @@ func ConfigCheck(path string, exists bool, statErr error, loadErr error) Check {
 	case !exists:
 		c.Severity, c.Detail = SeverityOK, "no config file at "+path+"; defaults in use"
 	case loadErr != nil:
-		c.Severity, c.Detail = SeverityError, path+" does not parse: "+loadErr.Error()
+		// YAML errors can quote values from the file, which holds
+		// anthropic_api_key; keep only the line numbers.
+		where := ""
+		if lines := yamlLineRE.FindAllString(loadErr.Error(), -1); len(lines) > 0 {
+			where = " (" + strings.Join(lines, ", ") + ")"
+		}
+		c.Severity, c.Detail = SeverityError, path+" does not parse"+where+"; the proxy runs on the defaults until it is fixed"
 	default:
 		c.Severity, c.Detail = SeverityOK, path
 	}
 	return c
 }
+
+var yamlLineRE = regexp.MustCompile(`line \d+`)
 
 // ProxyProbe is what the caller found about the local proxy.
 type ProxyProbe struct {
@@ -292,6 +301,9 @@ func RequestSettingsCheck(adv config.AdvancedConfig) Check {
 		}
 		unknown = append(unknown, fmt.Sprintf("%s %q is not a known value and works as full", key, value))
 		return "full"
+	}
+	if v := strings.ToLower(strings.TrimSpace(adv.ThinkingMode)); v != "" && v != config.ThinkingModeClient && v != config.ThinkingModeBackend {
+		unknown = append(unknown, fmt.Sprintf("thinking_mode %q is not a known value and works as %s", adv.ThinkingMode, config.ThinkingModeClient))
 	}
 	history := describe("history_mode", adv.HistoryMode, "full", "recent", "current_only")
 	tools := describe("tool_mode", adv.ToolMode, "full", "compact", "none_text")

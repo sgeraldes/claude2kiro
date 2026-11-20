@@ -174,6 +174,18 @@ func TestRequestSettingsCheck(t *testing.T) {
 		t.Fatalf("an unknown value works as the default; it is not a change: %+v", c)
 	}
 
+	badThinking := def
+	badThinking.ThinkingMode = "backlend"
+	c = RequestSettingsCheck(badThinking)
+	if c.Severity != SeverityWarn || !strings.Contains(c.Detail, `thinking_mode "backlend" is not a known value and works as client`) {
+		t.Fatalf("an unknown thinking mode must be reported: %+v", c)
+	}
+	upper := def
+	upper.ThinkingMode = "Backend"
+	if c = RequestSettingsCheck(upper); strings.Contains(c.Detail, "not a known value") {
+		t.Fatalf("thinking_mode is read case-insensitively by the proxy: %+v", c)
+	}
+
 	direct := def
 	direct.AnthropicDirect = true
 	direct.AnthropicApiKey = "sk-ant-SECRET"
@@ -187,8 +199,9 @@ func TestConfigCheck(t *testing.T) {
 	if c := ConfigCheck("/h/.claude2kiro/config.yaml", false, nil, nil); c.Severity != SeverityOK || !strings.Contains(c.Detail, "defaults in use") {
 		t.Fatalf("missing: %+v", c)
 	}
-	if c := ConfigCheck("/h/.claude2kiro/config.yaml", true, nil, errors.New("yaml: line 3")); c.Severity != SeverityError {
-		t.Fatalf("parse error: %+v", c)
+	parseErr := errors.New("yaml: unmarshal errors:\n  line 7: cannot unmarshal !!map into string `sk-ant-SECRET`")
+	if c := ConfigCheck("/h/.claude2kiro/config.yaml", true, nil, parseErr); c.Severity != SeverityError || !strings.Contains(c.Detail, "(line 7)") || strings.Contains(c.Detail, "sk-ant-SECRET") {
+		t.Fatalf("parse error must name the line and never quote the file: %+v", c)
 	}
 	if c := ConfigCheck("/h/.claude2kiro/config.yaml", true, nil, nil); c.Severity != SeverityOK || c.Detail != "/h/.claude2kiro/config.yaml" {
 		t.Fatalf("ok: %+v", c)
