@@ -2538,7 +2538,7 @@ func main() {
 	case "refresh":
 		refreshToken()
 	case "export":
-		exportEnvVars()
+		exportEnvVars(os.Args[2:])
 	case "claude":
 		setClaude()
 	case "disable", "unconfigure":
@@ -2720,7 +2720,7 @@ func seedClaudeConfig() error {
 	changed := false
 
 	// Claude Code uses the last 20 chars of ANTHROPIC_API_KEY to identify it
-	const proxyKeyTail = "claude2kiro" // our ANTHROPIC_API_KEY value (< 20 chars, used as-is)
+	const proxyKeyTail = exportProxyAPIKey // our ANTHROPIC_API_KEY value (< 20 chars, used as-is)
 
 	// Get or create customApiKeyResponses.approved
 	responses, _ := cfg["customApiKeyResponses"].(map[string]any)
@@ -3879,7 +3879,7 @@ func printUsage() {
 	fmt.Println("  claude2kiro read           - Read and display token")
 	fmt.Println("  claude2kiro refresh        - Refresh the access token")
 	fmt.Println("  claude2kiro logout         - Clear saved credentials and token")
-	fmt.Println("  claude2kiro export         - Export environment variables")
+	fmt.Println("  claude2kiro export [--show-token] - Print env vars for the proxy (--show-token: Kiro token as API key)")
 	fmt.Println("  claude2kiro disable        - Remove Claude2Kiro Claude Code/Desktop integrations")
 	fmt.Println("  claude2kiro run [args...]       - Start proxy + launch claude (per-session, no global config)")
 	fmt.Println("    Args go to Claude Code: 'run --resume <session-id>' resumes a session;")
@@ -7053,37 +7053,76 @@ func renewTokenLocked(tokenPath string, force bool, rejected *TokenData) (newTok
 	return newToken, false, nil
 }
 
-// exportEnvVars exports environment variables
-func exportEnvVars() {
-	tokenPath := getTokenFilePath()
+// exportProxyAPIKey is the API key `export` prints by default. The proxy never
+// reads the client's key (it signs requests with the Kiro token itself), so
+// any value works; this one is the key seedClaudeConfig pre-approves.
+const exportProxyAPIKey = "claude2kiro"
 
-	data, err := os.ReadFile(tokenPath)
+// parseExportArgs reads the arguments after `export`: only --show-token,
+// which prints the Kiro access token as the API key instead of the proxy key.
+func parseExportArgs(args []string) (showToken bool, err error) {
+	for _, a := range args {
+		if a != "--show-token" {
+			return false, fmt.Errorf("unknown argument %q (usage: claude2kiro export [--show-token])", a)
+		}
+		if showToken {
+			return false, fmt.Errorf("--show-token given twice")
+		}
+		showToken = true
+	}
+	return showToken, nil
+}
+
+// writeExportEnv writes the commands that point a shell at the proxy on port,
+// with apiKey as ANTHROPIC_API_KEY. Without showToken it adds a comment on how
+// to print the access token instead. On Unix every line is an export or a
+// comment, so the output can go straight to eval.
+func writeExportEnv(w io.Writer, goos, port, apiKey string, showToken bool) {
+	hint := "claude2kiro export --show-token prints the Kiro access token as the API key; the proxy does not need it"
+	if goos == "windows" {
+		fmt.Fprintln(w, "CMD")
+		fmt.Fprintf(w, "set ANTHROPIC_BASE_URL=http://localhost:%s\n", port)
+		fmt.Fprintf(w, "set ANTHROPIC_API_KEY=%s\n\n", apiKey)
+		fmt.Fprintln(w, "PowerShell")
+		fmt.Fprintf(w, "$env:ANTHROPIC_BASE_URL=\"http://localhost:%s\"\n", port)
+		fmt.Fprintf(w, "$env:ANTHROPIC_API_KEY=\"%s\"\n", apiKey)
+		if !showToken {
+			fmt.Fprintf(w, "\n# %s\n", hint)
+		}
+		return
+	}
+	if !showToken {
+		fmt.Fprintf(w, "# %s\n", hint)
+	}
+	fmt.Fprintf(w, "export ANTHROPIC_BASE_URL=http://localhost:%s\n", port)
+	fmt.Fprintf(w, "export ANTHROPIC_API_KEY=\"%s\"\n", apiKey)
+}
+
+// exportEnvVars prints the environment for using the proxy by hand. The Kiro
+// access token is printed only with --show-token.
+func exportEnvVars(args []string) {
+	showToken, err := parseExportArgs(args)
 	if err != nil {
-		fmt.Printf("Failed to read token. Please install Kiro and log in first: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 
-	var token TokenData
-	if err := jsonStr.Unmarshal(data, &token); err != nil {
-		fmt.Printf("Failed to parse token file: %v\n", err)
-		os.Exit(1)
+	apiKey := exportProxyAPIKey
+	if showToken {
+		data, err := os.ReadFile(getTokenFilePath())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read token. Please log in first: %v\n", err)
+			os.Exit(1)
+		}
+		var token TokenData
+		if err := jsonStr.Unmarshal(data, &token); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse token file: %v\n", err)
+			os.Exit(1)
+		}
+		apiKey = token.AccessToken
 	}
 
-	// Output environment variable commands based on OS
-	cfg := config.Get()
-	port := cfg.Server.Port
-	if runtime.GOOS == "windows" {
-		fmt.Println("CMD")
-		fmt.Printf("set ANTHROPIC_BASE_URL=http://localhost:%s\n", port)
-		fmt.Printf("set ANTHROPIC_API_KEY=%s\n\n", token.AccessToken)
-		fmt.Println("Powershell")
-		fmt.Printf(`$env:ANTHROPIC_BASE_URL="http://localhost:%s"`, port)
-		fmt.Println()
-		fmt.Printf(`$env:ANTHROPIC_API_KEY="%s"`, token.AccessToken)
-	} else {
-		fmt.Printf("export ANTHROPIC_BASE_URL=http://localhost:%s\n", port)
-		fmt.Printf("export ANTHROPIC_API_KEY=\"%s\"\n", token.AccessToken)
-	}
+	writeExportEnv(os.Stdout, runtime.GOOS, config.Get().Server.Port, apiKey, showToken)
 }
 
 // setClaude configures Claude Code settings via the same non-destructive

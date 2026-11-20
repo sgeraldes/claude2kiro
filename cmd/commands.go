@@ -321,26 +321,16 @@ func ViewTokenCmd() tea.Msg {
 	}
 }
 
-// ExportEnvCmd returns a function that shows env export info
+// ExportEnvCmd returns the env export line for the TUI. Like `claude2kiro
+// export`, it shows the proxy key, never any part of the Kiro access token:
+// the proxy does not read the client's key.
 func ExportEnvCmd() tea.Msg {
-	token, err := GetToken()
-	if err != nil {
-		return StatusMsg{
-			Message: fmt.Sprintf("Failed to read token: %v", err),
-			IsError: true,
-		}
-	}
-
-	// Return instructions with truncated token preview
+	port := config.Get().Server.Port
 	var msg string
-	tokenPreview := token.AccessToken
-	if len(tokenPreview) > 20 {
-		tokenPreview = tokenPreview[:20] + "..."
-	}
 	if runtime.GOOS == "windows" {
-		msg = fmt.Sprintf("CMD: set ANTHROPIC_BASE_URL=http://localhost:8080 && set ANTHROPIC_API_KEY=%s", tokenPreview)
+		msg = fmt.Sprintf("CMD: set ANTHROPIC_BASE_URL=http://localhost:%s && set ANTHROPIC_API_KEY=claude2kiro", port)
 	} else {
-		msg = fmt.Sprintf("export ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=%s", tokenPreview)
+		msg = fmt.Sprintf("export ANTHROPIC_BASE_URL=http://localhost:%s ANTHROPIC_API_KEY=claude2kiro", port)
 	}
 
 	return StatusMsg{
