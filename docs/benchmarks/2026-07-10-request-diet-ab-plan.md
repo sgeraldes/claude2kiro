@@ -1,67 +1,66 @@
-# Request Diet Controlled A/B and Hardening Plan — 2026-07-10
+# Request diet: offline A/B gate and plan (2026-07-10, revised 2026-11-20)
 
 ## Decision
 
-Keep `full` history and `full` tools as the production control. Canary `recent` history plus `compact` tool descriptions only after the offline replay passes. Do not enable aggressive cache points by default: cache points share the 85-entry tool-array budget and can displace actual tool definitions.
+Full history and full tools stay the production default (`history_mode: full`, `tool_mode: full`, `aggressive_cache_points: false` in `internal/config/config.go`). The recent-history plus compact-tools profile is a candidate only. Aggressive cache points stay off: each cache point takes a slot in the same `max_tools_per_request` budget as the tool definitions, so with 85 tools it pushes 42 of them out of the request.
 
 ## Offline replay gate
 
-`TestRequestDietControlledABReplay` builds a deterministic request calibrated to the observed Claude Code workload:
+`TestRequestDietControlledABReplay` in `request_diet_ab_test.go` runs offline: no network, no token, no recorded traffic. It builds a synthetic request shaped like a Claude Code session:
 
-- 85 large tool definitions and schemas;
-- 14 tool-use/result turns with injected system reminders;
-- a current tool result whose matching tool use must remain in history;
-- a long system prompt and long message content.
+- 85 tool definitions with long descriptions and schemas;
+- 14 assistant tool-use turns, each followed by an injected system message and a user tool result;
+- a current message with a tool result whose tool use is in the history;
+- a long system prompt.
 
-The test compares `control-full`, `candidate-recent-compact`, and `experimental-aggressive-cache`. A candidate passes only when it:
+It translates that request under three profiles:
 
-1. preserves current user text and current tool results;
-2. keeps strict user/assistant history alternation;
-3. retains a prior tool use for every retained tool result;
-4. retains the same 85 callable tool definitions as the control;
-5. reduces serialized request bytes by at least 20%.
+| Profile | Settings |
+|---|---|
+| `control-full` | full history, full tools |
+| `candidate-recent-compact` | `history_mode: recent`, `history_recent_turns: 6`, `tool_mode: compact`, `tool_compact_max_chars: 320` |
+| `experimental-aggressive-cache` | full history, full tools, `aggressive_cache_points: true` |
 
-Run with:
+For every profile it checks that:
+
+1. the current user text and the current tool result survive;
+2. history entries alternate user and assistant;
+3. every tool result in the history has its tool use earlier in the history, including the current one;
+4. no stored reasoning was attached, so the byte count measures the diet alone;
+5. the number of tool definitions is the expected one (85, or 43 for aggressive cache points).
+
+The candidate passes only if it also:
+
+6. keeps all 85 tool definitions of the control, each description cut to 320 characters or less;
+7. keeps fewer history entries than the control;
+8. emits no cache points;
+9. serializes at least 20% fewer bytes than the control.
+
+The test restores the global config when it ends. Run it with:
 
 ```powershell
-go test . -run TestRequestDietControlledABReplay -v -count=1
+& "C:/Program Files/Go/bin/go.exe" test . -run TestRequestDietControlledABReplay -v -count=1
 ```
 
-This replay measures deterministic translation correctness and wire size. It does not claim to measure backend credits, latency, tool-choice quality, or answer quality.
+On 2026-11-20 (v1.11.0) it logged: control 240,747 bytes and 59 history entries; candidate 132,543 bytes (45% less) and 37 entries; aggressive cache points 141,627 bytes with 43 tool definitions and 42 cache points.
 
-## Live A/B canary
+The replay proves translation correctness and wire size only. It says nothing about credits, latency, tool choice or answer quality.
 
-Use sticky session assignment so every turn in a conversation stays in one arm:
+## Live comparison
 
-- **Control:** `history_mode: full`, `tool_mode: full`, `aggressive_cache_points: false`.
-- **Candidate:** `history_mode: recent`, `history_recent_turns: 6`, `tool_mode: compact`, `tool_compact_max_chars: 320`, `aggressive_cache_points: false`.
+Not run yet. The proxy has no way to split sessions between two arms: it is one user's local process and reads one config. A comparison today is two runs of the same task, each in its own copy of the inputs, one with the control settings and one with the candidate settings, as described in `docs/benchmarks/2026-11-19-task-time-and-model-choice.md`. Each request logs a `Request ...` line with `reqBytes`, `historyLen`, `tools` (definitions plus cache points), `historyMode` and `toolMode`, and each response logs a `Kiro metering` line with its credits.
 
-Start at 5% of eligible internal sessions for 24 hours, then 25% for 48 hours. Eligible sessions must have tools enabled; stratify results by model, tool count, history length, and whether the request carries a tool result. Never assign by individual request.
+Since July the request shape changed: v1.10.0 stopped sending tool results twice and started returning the model's reasoning in the history. Byte savings measured before v1.10.0 do not carry over.
 
-Capture per arm:
+Change the default only if the candidate run finishes the task with:
 
-- backend acceptance and malformed-request rate;
-- `TOOL_USE_RESULT_MISMATCH` and other protocol errors;
-- request bytes, credits, and first-token/end-to-end latency;
-- tool-call success, retry rate, and user cancellation rate;
-- sampled task-quality review using blinded control/candidate transcripts.
+- no `TOOL_USE_RESULT_MISMATCH` or malformed-request error;
+- the same tool calls succeeding;
+- output of the same quality, judged side by side;
+- at least 10% fewer credits.
 
-## Promotion and rollback gates
+## Open work
 
-Promote only if all conditions hold:
-
-- zero confirmed tool ancestry or alternation regressions;
-- malformed-request rate no worse than control by more than 0.1 percentage points;
-- tool-call success no worse than control by more than 1 percentage point;
-- sampled task quality no worse than control by more than 2 percentage points;
-- median request bytes improve by at least 20%;
-- mean credits improve by at least 10% with a confidence interval excluding zero.
-
-Rollback immediately on any confirmed protocol regression, tool-definition loss, or a 1 percentage-point increase in malformed requests over a rolling 100-request window. Rollback is a config change back to the control profile; retain the failed arm's metrics and anonymized request-shape counters for diagnosis.
-
-## Hardening backlog
-
-1. Give cache points a separate policy from the tool-definition budget, or reserve all tool definitions before inserting cache points.
-2. Emit structured counters for source tools, emitted tool definitions, cache points, history entries, protected ancestry entries, and serialized bytes.
-3. Add sanitized production-shape fixtures when new malformed-request classes appear; do not store prompts, credentials, or tool-result payloads.
-4. Keep the offline replay in the regular Go suite and run the live benchmark before changing defaults.
+1. Give cache points their own budget, or place every tool definition before any cache point. Until then `experimental-aggressive-cache` expects 43 definitions; when this is fixed, that expectation changes to 85.
+2. The request log counts cache points inside `tools`; it does not log tool definitions and cache points separately, nor how many history entries were kept to protect tool-use pairs.
+3. When a new malformed-request class appears, add a synthetic fixture for it. Never store prompts, credentials or tool-result content.

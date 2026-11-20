@@ -30,14 +30,15 @@ type requestDietReplayMetrics struct {
 // observed Claude Code workload: 85 large tool definitions, a long history,
 // interposed system messages, historical tool pairs, and a current tool result.
 // It measures wire bytes only; backend credits and response quality still need
-// the live canary described in docs/benchmarks/2026-07-10-request-diet-ab-plan.md.
+// the live comparison described in docs/benchmarks/2026-07-10-request-diet-ab-plan.md.
 func TestRequestDietControlledABReplay(t *testing.T) {
 	fixture := requestDietReplayFixture()
 	profiles := []requestDietReplayProfile{
 		{name: "control-full", historyMode: "full", toolMode: "full", wantToolDefinitions: 85},
 		{name: "candidate-recent-compact", historyMode: "recent", toolMode: "compact", recentTurns: 6, compactChars: 320, wantToolDefinitions: 85},
 		// This profile deliberately documents the cache-point budget interaction.
-		// It is not a rollout candidate until cache points stop displacing tools.
+		// It is not a rollout candidate until cache points stop displacing tools;
+		// when they do, this expectation becomes 85.
 		{name: "experimental-aggressive-cache", historyMode: "full", toolMode: "full", aggressiveCachePoints: true, wantToolDefinitions: 43},
 	}
 
@@ -50,9 +51,16 @@ func TestRequestDietControlledABReplay(t *testing.T) {
 		cfg.Advanced.ToolMode = profile.toolMode
 		cfg.Advanced.ToolCompactMaxChars = profile.compactChars
 		cfg.Advanced.AggressiveCachePoints = profile.aggressiveCachePoints
-		config.Set(cfg)
+		// Restored when the test ends, so later tests in the package never run
+		// with this profile's diet settings.
+		withConfig(t, cfg)
 
 		got := buildCodeWhispererRequest(fixture, TokenData{})
+		// Stored reasoning would add bytes to the history that have nothing to
+		// do with the diet; the fixture's ids are unique, so none may attach.
+		if got.reasoning.turns != 0 {
+			t.Fatalf("%s: %d turns of stored reasoning attached; the byte comparison would not measure the diet alone", profile.name, got.reasoning.turns)
+		}
 		assertRequestDietReplayInvariants(t, profile, got)
 		body, err := json.Marshal(got)
 		if err != nil {
@@ -63,6 +71,9 @@ func TestRequestDietControlledABReplay(t *testing.T) {
 			switch {
 			case tool.ToolSpecification != nil:
 				m.toolDefinitions++
+				if profile.toolMode == "compact" && len(tool.ToolSpecification.Description) > profile.compactChars {
+					t.Errorf("%s: tool %s description is %d chars, want at most %d", profile.name, tool.ToolSpecification.Name, len(tool.ToolSpecification.Description), profile.compactChars)
+				}
 			case tool.CachePoint != nil:
 				m.cachePoints++
 			}
@@ -78,6 +89,13 @@ func TestRequestDietControlledABReplay(t *testing.T) {
 	}
 	if saving := 1 - float64(candidate.bytes)/float64(control.bytes); saving < 0.20 {
 		t.Fatalf("candidate wire-byte saving %.1f%% is below the 20%% offline gate", saving*100)
+	}
+	// The 20% gate alone could be met by one lever; each must act on its own.
+	if candidate.historyEntries >= control.historyEntries {
+		t.Fatalf("recent history kept every entry: candidate=%d control=%d", candidate.historyEntries, control.historyEntries)
+	}
+	if control.cachePoints != 0 || candidate.cachePoints != 0 {
+		t.Fatalf("control and candidate must not emit cache points: control=%d candidate=%d", control.cachePoints, candidate.cachePoints)
 	}
 	if candidate.toolDefinitions != control.toolDefinitions {
 		t.Fatalf("candidate silently changed tool availability: candidate=%d control=%d", candidate.toolDefinitions, control.toolDefinitions)
