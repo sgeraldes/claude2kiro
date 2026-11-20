@@ -242,6 +242,7 @@ It also installs the local **kiro-proxy** plugin, which gives you slash commands
 - `/kiro-proxy:logs`
 - `/kiro-proxy:models`
 - `/kiro-proxy:config`
+- `/kiro-proxy:doctor`
 
 > [!TIP]
 > Claude Code's `/model` dialog only lists the models built into your Claude Code
@@ -318,6 +319,7 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro remote` | Launch Claude Code connected to an already-running proxy (TUI or server) |
 | `claude2kiro desktop` | Install/configure/launch Claude Desktop routed through the proxy (Windows) |
 | `claude2kiro update` | Download and switch to the latest released version |
+| `claude2kiro doctor [--json] [--offline]` | Read-only health report: token, live model catalogue, proxy, Claude Code and Desktop routing, request settings |
 | `claude2kiro agents [session]` | Per-subagent stats (turns, ingested tokens, throughput) from local Claude Code transcripts |
 | `claude2kiro logout` | Remove saved credentials |
 | `claude2kiro server [port]` | Run only the headless proxy for advanced/manual setups |

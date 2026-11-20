@@ -93,6 +93,7 @@ It also installs the local **kiro-proxy** plugin so you can use these slash comm
 - `/kiro-proxy:logs`
 - `/kiro-proxy:models`
 - `/kiro-proxy:config`
+- `/kiro-proxy:doctor`
 
 ### Choosing a model
 
@@ -179,6 +180,7 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro server [port]` | Run the proxy without launching Claude Code |
 | `claude2kiro credits [--web\|--all]` | Show credit usage (`--web` opens the live dashboard, `--all` lists every identity in failover order) |
 | `claude2kiro update` | Download the latest release |
+| `claude2kiro doctor [--json] [--offline]` | Read-only health report (see [Troubleshooting](#claude2kiro-doctor)) |
 | `claude2kiro logout` | Remove saved credentials |
 
 ## Update flow
@@ -288,6 +290,36 @@ burn rate, and projected runout from samples recorded every 15 minutes while
 the proxy runs.
 
 ## Troubleshooting
+
+### `claude2kiro doctor`
+
+Start here when something does not work. `doctor` prints one line per check and
+changes nothing: it does not refresh the token, write any file or send a model
+request.
+
+```bash
+claude2kiro doctor            # text report
+claude2kiro doctor --json     # the same report as JSON, to attach to a bug report
+claude2kiro doctor --offline  # skip the network call to Kiro
+```
+
+| Check | What it looks at |
+|---|---|
+| Config | Which config file the active profile reads, and whether it parses |
+| Kiro token | Token file of the active profile: auth method, provider, region, whether a profile ARN and a refresh token are present, time left on the access token |
+| Fallback `<name>` | The token of each profile in `auth.fallback_profiles` |
+| Model catalogue | Calls `ListAvailableModels` (costs no credits) with the token as it is on disk; reports how many models the account has and whether `auto` is among them |
+| Proxy | The profile's port file and the proxy's `/health`, the same way `run` decides to attach; reports a stale port file or a proxy of another profile |
+| Claude Code | Where the `claude` CLI is, and any persistent routing (`settings.json` env, the kiro-proxy plugin, the proxy account in `.claude.json`) |
+| Claude Desktop | Whether the gateway config written by `claude2kiro desktop` is present (Windows) |
+| Request settings | `history_mode`, `tool_mode`, thinking mode and the other settings that change what is sent to Kiro, with any value changed from the default |
+
+Each line is `OK`, `WARN` or `ERROR`. The command exits with status 1 when any
+check is `ERROR` (for example no token), so a script can use it as a health
+check. Token values, the profile ARN and API keys are never printed; they are
+reported as present or absent.
+
+Inside Claude Code, `/kiro-proxy:doctor` runs the same report.
 
 ### Token file not found
 
