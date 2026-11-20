@@ -255,15 +255,18 @@ func rememberReasoning(kiroModel string, scope reasoningScope, block parser.Reas
 // have stored reasoning of kiroModel, newest first, and skips a turn whose
 // reasoning would take the attached bytes past maxBytes, so one oversized
 // block does not cost every older turn its reasoning. maxBytes 0 attaches
-// nothing. Each
+// nothing. maxBlocks above 0 stops after that many turns. Each
 // turn is looked up by the keys buildCodeWhispererRequest gave it
 // (reasoningScope.keys), the same keys rememberReasoning stored under.
-func attachReasoning(history []any, kiroModel string, maxBytes int) reasoningAttachment {
+func attachReasoning(history []any, kiroModel string, maxBytes, maxBlocks int) reasoningAttachment {
 	var att reasoningAttachment
 	if maxBytes <= 0 {
 		return att
 	}
 	for i := len(history) - 1; i >= 0; i-- {
+		if maxBlocks > 0 && att.turns >= maxBlocks {
+			break
+		}
 		msg, ok := history[i].(HistoryAssistantMessage)
 		if !ok || len(msg.turnKeys) == 0 {
 			continue

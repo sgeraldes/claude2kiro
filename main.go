@@ -2427,7 +2427,7 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest, token TokenData) C
 		// In none_text mode the history holds tool calls as text, not what the
 		// reasoning was signed with, so nothing is attached there.
 		if toolMode != "none_text" {
-			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes)
+			cwReq.reasoning = attachReasoning(cwReq.ConversationState.History, kiroModel, cfg.Advanced.ReasoningHistoryMaxBytes, cfg.Advanced.ReasoningHistoryMaxBlocks)
 		}
 	}
 

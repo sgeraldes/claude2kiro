@@ -83,6 +83,10 @@ type NetworkConfig struct {
 	MaxConcurrentReqs       int           `yaml:"max_concurrent_requests"`   // Max parallel requests to Kiro backend
 	MaxToolsPerRequest      int           `yaml:"max_tools_per_request"`     // Max tools sent per request (Kiro limit)
 	StreamKeepaliveInterval time.Duration `yaml:"stream_keepalive_interval"` // Ping a streaming client after this much silence (0 = no pings)
+	// BackendIdleCutAfter is the backend silence after which a broken
+	// response is taken for Kiro's idle cut (Kiro closes a response after
+	// 240 s without output). Default 230s; 0 or less means the default.
+	BackendIdleCutAfter time.Duration `yaml:"backend_idle_cut_after"`
 }
 
 // AdvancedConfig holds advanced/API settings
@@ -110,13 +114,26 @@ type AdvancedConfig struct {
 	// ReasoningHistoryMaxBytes caps the reasoning the proxy gives back to the
 	// backend in one request's history, newest turns first (default 4 MiB). 0
 	// turns the feature off: no reasoning is kept or sent back.
-	ReasoningHistoryMaxBytes int    `yaml:"reasoning_history_max_bytes"`
-	Profile                  string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+	ReasoningHistoryMaxBytes int `yaml:"reasoning_history_max_bytes"`
+	// ReasoningHistoryMaxBlocks caps how many turns' reasoning one request
+	// carries, newest first. 0 (the default) means no limit.
+	ReasoningHistoryMaxBlocks int `yaml:"reasoning_history_max_blocks"`
+	// IdleCutNote: when Kiro's idle cut breaks a tool call, the proxy closes
+	// the call with the input that arrived and adds a note to that call's
+	// tool result on its way to Kiro, so the model learns why it failed.
+	// Default true. Off: such a cut fails the response instead.
+	IdleCutNote bool   `yaml:"idle_cut_note"`
+	Profile     string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
 }
 
 // DefaultReasoningHistoryMaxBytes is the default of
 // AdvancedConfig.ReasoningHistoryMaxBytes, 4 MiB.
 const DefaultReasoningHistoryMaxBytes = 4 << 20
+
+// DefaultBackendIdleCutAfter is the default of
+// NetworkConfig.BackendIdleCutAfter: a little under Kiro's 240 s, so the
+// measured cuts (240.0 s after the last frame) fall above it.
+const DefaultBackendIdleCutAfter = 230 * time.Second
 
 // Values of AdvancedConfig.ThinkingMode.
 const (
@@ -191,6 +208,7 @@ func Default() *Config {
 			MaxConcurrentReqs:       4,                // Max parallel requests to Kiro backend
 			MaxToolsPerRequest:      85,               // Kiro rejects requests with ~95+ tools
 			StreamKeepaliveInterval: 15 * time.Second, // Keeps a client from giving up while Kiro is silent
+			BackendIdleCutAfter:     DefaultBackendIdleCutAfter,
 		},
 		Advanced: AdvancedConfig{
 			CodeWhispererEndpoint: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
@@ -211,6 +229,7 @@ func Default() *Config {
 			ThinkingMode:          ThinkingModeClient,
 
 			ReasoningHistoryMaxBytes: DefaultReasoningHistoryMaxBytes,
+			IdleCutNote:              true,
 		},
 	}
 }
@@ -268,6 +287,12 @@ func Load() (*Config, error) {
 func (c *Config) normalize() {
 	if c.Network.HTTPTimeout <= 0 {
 		c.Network.HTTPTimeout = Default().Network.HTTPTimeout
+	}
+	if c.Network.BackendIdleCutAfter <= 0 {
+		c.Network.BackendIdleCutAfter = DefaultBackendIdleCutAfter
+	}
+	if c.Advanced.ReasoningHistoryMaxBlocks < 0 {
+		c.Advanced.ReasoningHistoryMaxBlocks = 0
 	}
 }
 

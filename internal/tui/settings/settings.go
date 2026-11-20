@@ -822,6 +822,34 @@ func (m *Model) loadSettings() {
 				DetailedDesc:     "The proxy keeps the model's reasoning (in memory, lost on restart) and gives it back to Kiro in the history of later turns, as the Kiro IDE does, so the model does not plan every step again. This caps the reasoning bytes one request carries, newest turns first. 0 turns the feature off. Range: 0-134217728.",
 			},
 		},
+		{
+			Key:         "advanced.reasoning_history_max_blocks",
+			Label:       "Reasoning History Turns",
+			Description: "Max turns whose reasoning is given back (0 = all)",
+			Type:        TypeNumber,
+			Value:       strconv.Itoa(m.config.Advanced.ReasoningHistoryMaxBlocks),
+			Min:         0,
+			Max:         1000,
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "0",
+				RecommendedValue: "0",
+				Sensitive:        false,
+				DetailedDesc:     "Caps how many earlier turns' reasoning one request carries, newest first, on top of the byte cap. 0 means no limit. For measurements (for example newest only = 1); the default is unchanged. Range: 0-1000.",
+			},
+		},
+		{
+			Key:         "advanced.idle_cut_note",
+			Label:       "Idle Cut Note",
+			Description: "Tell the model when Kiro's idle cut broke a tool call",
+			Type:        TypeToggle,
+			Value:       boolToString(m.config.Advanced.IdleCutNote),
+			ExtendedHelp: ExtendedHelp{
+				DefaultValue:     "true",
+				RecommendedValue: "true",
+				Sensitive:        false,
+				DetailedDesc:     "Kiro closes a response after 240 s without output, which breaks a tool call whose input (a large file) takes longer to write. On: the proxy closes the call with the input that arrived, and adds a short note to that call's tool result on its way to Kiro, so the model splits the work. The note goes to Kiro only; Claude Code never sees it. Off: the response fails as an error instead.",
+			},
+		},
 	}
 }
 
@@ -986,6 +1014,12 @@ func (m *Model) applySetting(s Setting) {
 		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
 			m.config.Advanced.ReasoningHistoryMaxBytes = v
 		}
+	case "advanced.reasoning_history_max_blocks":
+		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+			m.config.Advanced.ReasoningHistoryMaxBlocks = v
+		}
+	case "advanced.idle_cut_note":
+		m.config.Advanced.IdleCutNote = stringToBool(s.Value)
 	}
 }
 

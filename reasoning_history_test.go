@@ -326,3 +326,46 @@ func TestDroppedHistoryTurnsCarryNoReasoning(t *testing.T) {
 		t.Fatalf("reasoning of a dropped turn was sent:\n%s", body)
 	}
 }
+
+// reasoning_history_max_blocks caps how many turns carry reasoning, newest
+// first; 0 (the default) leaves every turn that fits the byte cap.
+func TestReasoningBlockCapKeepsTheNewestTurns(t *testing.T) {
+	for _, tc := range []struct {
+		maxBlocks int
+		want      []bool // per assistant turn, oldest first
+	}{
+		{0, []bool{true, true, true}},
+		{1, []bool{false, false, true}},
+		{2, []bool{false, true, true}},
+		{5, []bool{true, true, true}},
+	} {
+		withReasoningStore(t)
+		withReasoningConfig(t, config.DefaultReasoningHistoryMaxBytes, "full", "full")
+		cfg := *config.Get()
+		cfg.Advanced.ReasoningHistoryMaxBlocks = tc.maxBlocks
+		withConfig(t, &cfg)
+		kiroModel := getKiroModelID(reasoningTestModel)
+		for _, id := range []string{"tu_b1", "tu_b2", "tu_b3"} {
+			rememberResponse(t, kiroModel, toolAnswer("plan "+id, "SIG-"+id, id)...)
+		}
+
+		cw := buildCodeWhispererRequest(manyTurnsRequest("tu_b1", "tu_b2", "tu_b3"), TokenData{})
+		assistants := historyAssistants(cw)
+		if len(assistants) != 3 {
+			t.Fatalf("max_blocks=%d: history has %d assistant turns, want 3", tc.maxBlocks, len(assistants))
+		}
+		attached := 0
+		for i, want := range tc.want {
+			got := assistants[i].AssistantResponseMessage.ReasoningContent != nil
+			if got != want {
+				t.Fatalf("max_blocks=%d: turn %d carries reasoning = %v, want %v", tc.maxBlocks, i, got, want)
+			}
+			if got {
+				attached++
+			}
+		}
+		if cw.reasoning.turns != attached {
+			t.Fatalf("max_blocks=%d: attachment counts %d turns, want %d", tc.maxBlocks, cw.reasoning.turns, attached)
+		}
+	}
+}
