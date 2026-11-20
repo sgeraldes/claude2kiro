@@ -838,16 +838,16 @@ func (m *Model) loadSettings() {
 			},
 		},
 		{
-			Key:         "advanced.idle_cut_note",
-			Label:       "Idle Cut Note",
-			Description: "Tell the model when Kiro's idle cut broke a tool call",
+			Key:         "advanced.interrupted_tool_recovery",
+			Label:       "Interrupted Tool Recovery",
+			Description: "Recover a response Kiro cut inside a tool call",
 			Type:        TypeToggle,
-			Value:       boolToString(m.config.Advanced.IdleCutNote),
+			Value:       boolToString(m.config.Advanced.InterruptedToolRecovery),
 			ExtendedHelp: ExtendedHelp{
 				DefaultValue:     "true",
 				RecommendedValue: "true",
 				Sensitive:        false,
-				DetailedDesc:     "Kiro closes a response after 240 s without output, which breaks a tool call whose input (a large file) takes longer to write. On: the proxy closes the call with the input that arrived, and adds a short note to that call's tool result on its way to Kiro, so the model splits the work. The note goes to Kiro only; Claude Code never sees it. Off: the response fails as an error instead.",
+				DetailedDesc:     "Kiro ends a response after about 240 s without output, which breaks a tool call whose input (a large file) takes longer to write; a tool call can also hit the model's output limit. On: the proxy never passes an incomplete tool call to the client. It answers it with a failed tool result telling the model to split the work, asks Kiro again in the same conversation and streams the new answer as the rest of the same message, at most 3 times per response, as Kiro's own client does. That exchange goes to Kiro only and is put back into the history of later requests. Off: such a response fails as an error.",
 			},
 		},
 	}
@@ -1018,8 +1018,8 @@ func (m *Model) applySetting(s Setting) {
 		if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
 			m.config.Advanced.ReasoningHistoryMaxBlocks = v
 		}
-	case "advanced.idle_cut_note":
-		m.config.Advanced.IdleCutNote = stringToBool(s.Value)
+	case "advanced.interrupted_tool_recovery":
+		m.config.Advanced.InterruptedToolRecovery = stringToBool(s.Value)
 	}
 }
 

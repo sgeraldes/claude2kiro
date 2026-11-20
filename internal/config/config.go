@@ -118,12 +118,13 @@ type AdvancedConfig struct {
 	// ReasoningHistoryMaxBlocks caps how many turns' reasoning one request
 	// carries, newest first. 0 (the default) means no limit.
 	ReasoningHistoryMaxBlocks int `yaml:"reasoning_history_max_blocks"`
-	// IdleCutNote: when Kiro's idle cut breaks a tool call, the proxy closes
-	// the call with the input that arrived and adds a note to that call's
-	// tool result on its way to Kiro, so the model learns why it failed.
-	// Default true. Off: such a cut fails the response instead.
-	IdleCutNote bool   `yaml:"idle_cut_note"`
-	Profile     string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
+	// InterruptedToolRecovery: when a response is interrupted (Kiro's idle
+	// cut, a broken stream) or stops at its output limit inside a tool call,
+	// the proxy answers the interrupted tool calls with failed tool results
+	// and asks Kiro again, as Kiro's own client does, at most 3 times per
+	// response. Default true. Off: such a response fails as an error.
+	InterruptedToolRecovery bool   `yaml:"interrupted_tool_recovery"`
+	Profile                 string `yaml:"profile"` // Isolate Claude Code into ~/.claude-profiles/<name> (absolute path also accepted); empty = shared default ~/.claude
 }
 
 // DefaultReasoningHistoryMaxBytes is the default of
@@ -229,7 +230,7 @@ func Default() *Config {
 			ThinkingMode:          ThinkingModeClient,
 
 			ReasoningHistoryMaxBytes: DefaultReasoningHistoryMaxBytes,
-			IdleCutNote:              true,
+			InterruptedToolRecovery:  true,
 		},
 	}
 }
