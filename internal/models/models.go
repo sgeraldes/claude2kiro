@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -35,6 +36,74 @@ type KiroModel struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	// RequestFields is the schema of the model-specific request options the
+	// backend accepts (additionalModelRequestFields). Nil for models that take
+	// none, such as "auto".
+	RequestFields *RequestFieldsSchema `json:"additionalModelRequestFieldsSchema"`
+}
+
+// RequestFieldsSchema is the part of a model's additionalModelRequestFields
+// JSON schema the proxy reads: the reasoning effort levels, the thinking types
+// and the max_tokens range the model accepts.
+type RequestFieldsSchema struct {
+	Properties struct {
+		OutputConfig struct {
+			Properties struct {
+				Effort struct {
+					Enum    []string `json:"enum"`
+					Default string   `json:"default"`
+				} `json:"effort"`
+			} `json:"properties"`
+		} `json:"output_config"`
+		Thinking struct {
+			Properties struct {
+				Type struct {
+					Enum []string `json:"enum"`
+				} `json:"type"`
+			} `json:"properties"`
+		} `json:"thinking"`
+		// MaxTokens is nil when the schema does not declare max_tokens. The
+		// bounds are floats because JSON schema numbers need not be integers.
+		MaxTokens *struct {
+			Minimum *float64 `json:"minimum"`
+			Maximum *float64 `json:"maximum"`
+		} `json:"max_tokens"`
+	} `json:"properties"`
+}
+
+// EffortLevels returns the reasoning effort levels the model accepts, in the
+// order the backend lists them (lowest first). Empty when it accepts none.
+func (m KiroModel) EffortLevels() []string {
+	if m.RequestFields == nil {
+		return nil
+	}
+	return m.RequestFields.Properties.OutputConfig.Properties.Effort.Enum
+}
+
+// ThinkingTypes returns the thinking.type values the model accepts (for
+// example "adaptive", "disabled"), in the order the backend lists them. Empty
+// when the model takes no thinking field.
+func (m KiroModel) ThinkingTypes() []string {
+	if m.RequestFields == nil {
+		return nil
+	}
+	return m.RequestFields.Properties.Thinking.Properties.Type.Enum
+}
+
+// MaxTokensRange reports whether the model accepts max_tokens and the bounds
+// the schema puts on it. A bound of 0 means the schema sets none.
+func (m KiroModel) MaxTokensRange() (minimum, maximum int, accepted bool) {
+	if m.RequestFields == nil || m.RequestFields.Properties.MaxTokens == nil {
+		return 0, 0, false
+	}
+	mt := m.RequestFields.Properties.MaxTokens
+	if mt.Minimum != nil && *mt.Minimum > 0 {
+		minimum = int(math.Ceil(*mt.Minimum))
+	}
+	if mt.Maximum != nil && *mt.Maximum > 0 {
+		maximum = int(math.Floor(*mt.Maximum))
+	}
+	return minimum, maximum, true
 }
 
 type listResponse struct {
@@ -119,11 +188,13 @@ type Catalog struct {
 	models    []KiroModel
 	ids       map[string]bool
 	fetchedAt time.Time
-	gen       uint64 // bumped by Invalidate; a fetch started before it is discarded
+	gen       uint64    // bumped by Invalidate; a fetch started before it is discarded
+	failedAt  time.Time // last failed fetch; zero after a success or Invalidate
 
-	fetchMu sync.Mutex // serializes refresh to avoid a fetch stampede
-	ttl     time.Duration
-	fetch   func() ([]KiroModel, error)
+	fetchMu        sync.Mutex // serializes refresh to avoid a fetch stampede
+	ttl            time.Duration
+	failureBackoff time.Duration // no new fetch this long after a failed one
+	fetch          func() ([]KiroModel, error)
 
 	onChange    func([]KiroModel) // fired when the model set changes
 	fingerprint string            // fingerprint of the last seen model set
@@ -133,8 +204,13 @@ type Catalog struct {
 // than ttl. fetch supplies the live model list (typically a closure that reads
 // the auth token + config and calls Fetch).
 func NewCatalog(ttl time.Duration, fetch func() ([]KiroModel, error)) *Catalog {
-	return &Catalog{ttl: ttl, fetch: fetch, ids: map[string]bool{}}
+	return &Catalog{ttl: ttl, failureBackoff: fetchFailureBackoff, fetch: fetch, ids: map[string]bool{}}
 }
+
+// fetchFailureBackoff is how long the catalog waits after a failed fetch before
+// it fetches again. Without it, while ListAvailableModels is unreachable every
+// lookup on the request path would refetch and wait out the HTTP timeout.
+const fetchFailureBackoff = 30 * time.Second
 
 // Invalidate forgets the cached list so the next use refetches. The proxy
 // calls it when it moves to another Kiro identity: the models one account can
@@ -149,6 +225,7 @@ func (c *Catalog) Invalidate() {
 	}
 	c.mu.Lock()
 	c.fetchedAt = time.Time{}
+	c.failedAt = time.Time{}
 	c.models = nil
 	c.ids = map[string]bool{}
 	c.gen++
@@ -168,31 +245,28 @@ func (c *Catalog) SetOnChange(fn func([]KiroModel)) {
 }
 
 // refreshIfStale refetches when the cache is empty or older than the TTL.
-// A fetch failure is swallowed when usable cached data already exists.
+// A fetch failure is swallowed: the last good data (if any) stays in use, and
+// no fetch is tried again for failureBackoff.
 func (c *Catalog) refreshIfStale() {
 	if c == nil || c.fetch == nil {
 		return
 	}
 
-	c.mu.RLock()
-	fresh := len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
-	hadData := len(c.models) > 0
-	c.mu.RUnlock()
-	if fresh {
+	if c.skipRefresh() {
 		return
 	}
 
 	c.fetchMu.Lock()
 	defer c.fetchMu.Unlock()
 
-	// Another goroutine may have refreshed while we waited for the fetch lock.
-	c.mu.RLock()
-	fresh = len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl
-	gen := c.gen
-	c.mu.RUnlock()
-	if fresh {
+	// Another goroutine may have refreshed (or failed) while we waited for the
+	// fetch lock.
+	if c.skipRefresh() {
 		return
 	}
+	c.mu.RLock()
+	gen := c.gen
+	c.mu.RUnlock()
 
 	var models []KiroModel
 	confirmed := false
@@ -201,8 +275,13 @@ func (c *Catalog) refreshIfStale() {
 		models, err = c.fetch()
 		if err != nil {
 			// Keep serving stale-but-usable data; only the first fetch failure
-			// (with nothing cached) leaves the catalog empty.
-			_ = hadData
+			// (with nothing cached) leaves the catalog empty. A failure for an
+			// identity that was invalidated meanwhile is not recorded.
+			c.mu.Lock()
+			if c.gen == gen {
+				c.failedAt = time.Now()
+			}
+			c.mu.Unlock()
 			return
 		}
 		c.mu.RLock()
@@ -235,6 +314,7 @@ func (c *Catalog) refreshIfStale() {
 	c.models = models
 	c.ids = ids
 	c.fetchedAt = time.Now()
+	c.failedAt = time.Time{}
 	changed := fp != c.fingerprint
 	c.fingerprint = fp
 	c.mu.Unlock()
@@ -245,6 +325,17 @@ func (c *Catalog) refreshIfStale() {
 		copy(snapshot, models)
 		c.onChange(snapshot)
 	}
+}
+
+// skipRefresh reports whether no fetch is due: the cache is fresh, or a fetch
+// failed less than failureBackoff ago.
+func (c *Catalog) skipRefresh() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.models) > 0 && time.Since(c.fetchedAt) < c.ttl {
+		return true
+	}
+	return !c.failedAt.IsZero() && time.Since(c.failedAt) < c.failureBackoff
 }
 
 // Warm forces an initial fetch (best-effort). Safe to call from a goroutine at
@@ -283,6 +374,48 @@ func (c *Catalog) Has(modelID string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.ids[modelID]
+}
+
+// EffortLevels returns the reasoning effort levels modelID accepts according
+// to the live list. known is false when the catalog does not hold that model
+// (never fetched, or the model is not offered), so the caller can fall back.
+func (c *Catalog) EffortLevels(modelID string) (levels []string, known bool) {
+	if m, ok := c.Lookup(modelID); ok {
+		return m.EffortLevels(), true
+	}
+	return nil, false
+}
+
+// ThinkingTypes returns the thinking.type values modelID accepts according to
+// the live list. known is false when the catalog does not hold that model; the
+// caller then sends no thinking field.
+func (c *Catalog) ThinkingTypes(modelID string) (types []string, known bool) {
+	if m, ok := c.Lookup(modelID); ok {
+		return m.ThinkingTypes(), true
+	}
+	return nil, false
+}
+
+// MaxTokensRange reports whether modelID accepts max_tokens according to the
+// live list, and the bounds on it (0 means unbounded). known is false, and
+// accepted with it, when the catalog does not hold that model.
+func (c *Catalog) MaxTokensRange(modelID string) (minimum, maximum int, accepted, known bool) {
+	if m, ok := c.Lookup(modelID); ok {
+		minimum, maximum, accepted = m.MaxTokensRange()
+		return minimum, maximum, accepted, true
+	}
+	return 0, 0, false, false
+}
+
+// Lookup returns the catalog entry for modelID (refreshing if stale). ok is
+// false when the catalog does not hold that model.
+func (c *Catalog) Lookup(modelID string) (KiroModel, bool) {
+	for _, m := range c.Models() {
+		if m.ModelID == modelID {
+			return m, true
+		}
+	}
+	return KiroModel{}, false
 }
 
 // Available reports whether the catalog currently holds any model data.

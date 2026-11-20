@@ -300,6 +300,9 @@ func TestRejectedBearersDoNotRetryWithoutEnd(t *testing.T) {
 				io.WriteString(w, invalidBearer)
 			}))
 			t.Cleanup(backend.Close)
+			// The backend counts every request it sees; a cold catalog's
+			// ListAvailableModels call must not be one of them.
+			withOfflineCatalog(t)
 			cfg := *config.Get()
 			cfg.Advanced.CodeWhispererEndpoint = backend.URL
 			withConfig(t, &cfg)

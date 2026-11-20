@@ -326,6 +326,7 @@ Use this when you want to upgrade without reinstalling manually.
 - [Protocol translation](docs/PROTOCOL_TRANSLATION.md)
 - [Anthropic SSE format](docs/ANTHROPIC_SSE_FORMAT.md)
 - [CodeWhisperer binary format](docs/CODEWHISPERER_BINARY_FORMAT.md)
+- [Task time and model choice (2026-11-19)](docs/benchmarks/2026-11-19-task-time-and-model-choice.md)
 
 ## Adoption
 
@@ -348,6 +349,12 @@ Claude2Kiro is useful if you:
 **Dashboard and server** both start a persistent proxy on a fixed port (default 8080). Additional Claude Code sessions attach automatically via `claude2kiro run`, or explicitly with `claude2kiro remote`. All requests are logged to the same files on disk.
 
 The proxy keeps no session data: it reads the auth token from disk on every request (a short-lived cache is checked against the file each time) and holds only the identity failover state in memory. This means you can freely switch between dashboard and server mode on the same port without affecting connected clients. Only a request that is actively streaming at the exact moment of the switch would need to retry.
+
+### Streaming
+
+Kiro ends a response it has sent nothing on for about 240 seconds, and it sends a tool call's input only when the call is complete, so a large file written in one `Write` call can be cut; a tool call can also hit the model's output limit. The proxy never passes an incomplete tool call to Claude Code. It recovers the response the way Kiro's own client does: it answers the cut call with a failed tool result that tells the model to write the file in smaller pieces, asks Kiro again in the same conversation, and streams the new answer as the rest of the same message (at most 3 times per response; `advanced.interrupted_tool_recovery`, on by default). Details in [docs/USAGE.md](docs/USAGE.md).
+
+Streaming responses are forwarded as Kiro produces them. While Kiro is silent (it can take minutes before the first byte on a long step) the proxy sends a `ping` every `network.stream_keepalive_interval` (default 15s, `0` turns the pings off; editable in the settings screen), so the client does not give up and resend the request. If the client disconnects, the proxy cancels the request to Kiro and frees its concurrency slot. Details in [docs/PROTOCOL_TRANSLATION.md](docs/PROTOCOL_TRANSLATION.md).
 
 ## License
 

@@ -284,6 +284,7 @@ func TestBuildCodeWhispererRequestAddsNativeEffort(t *testing.T) {
 		"model": "claude-sonnet-4-6",
 		"max_tokens": 64,
 		"messages": [{"role": "user", "content": "think lightly"}],
+		"thinking": {"type": "enabled"},
 		"output_config": {"effort": "xhigh"}
 	}`), &req)
 	if err != nil {

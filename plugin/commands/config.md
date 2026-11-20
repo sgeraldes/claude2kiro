@@ -19,6 +19,7 @@ Available settings and their defaults:
 |---------|-----------|---------|-------------|
 | port | server.port | 8080 | Proxy listen port (TUI mode) |
 | delay | network.streaming_delay_max | 0 | Streaming delay between SSE events (ms) |
+| keepalive | network.stream_keepalive_interval | 15s | Ping a streaming client after this much silence (0 = no pings) |
 | timeout | network.http_timeout | 30s | HTTP timeout for Kiro requests |
 | log-dir | logging.directory | ~/.claude2kiro/logs/ | Log file directory |
 | log-enabled | logging.enabled | true | Enable file logging |
@@ -26,8 +27,8 @@ Available settings and their defaults:
 | skip-perms | advanced.skip_permissions | true | Pass --dangerously-skip-permissions to claude |
 | comparison | advanced.comparison_mode | false | Debug: send to both Anthropic and Kiro |
 | direct | advanced.anthropic_direct | false | Bypass: send only to Anthropic |
-
-Note: Max concurrent Kiro requests (4) and max tools per request (85) are hardcoded and cannot be changed via config.
+| concurrency | network.max_concurrent_requests | 4 | Parallel requests to the Kiro backend (1 or more) |
+| max-tools | network.max_tools_per_request | 85 | Max tools sent per request (Kiro limit) |
 
 Steps:
 1. Read the config file for the active profile (see above; create if missing)
