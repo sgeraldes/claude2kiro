@@ -5923,7 +5923,7 @@ const desktopGatewayConfigID = "c14211b2-08e2-4c99-9c7b-e3d5e2b442fa"
 // gateway config to satisfy its custom3p validator. The local proxy performs no
 // auth on incoming requests, so the value is never checked — it only needs to be
 // non-empty.
-const desktopGatewayDummyAPIKey = "claude2kiro"
+const desktopGatewayDummyAPIKey = exportProxyAPIKey
 
 // ensureDesktopGatewayConfig writes Claude Desktop's managed gateway config
 // (%LOCALAPPDATA%\Claude-3p\configLibrary) pointing every Desktop surface

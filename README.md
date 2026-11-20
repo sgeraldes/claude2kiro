@@ -319,6 +319,7 @@ Use this when you want to upgrade without reinstalling manually.
 | `claude2kiro desktop` | Install/configure/launch Claude Desktop routed through the proxy (Windows) |
 | `claude2kiro update` | Download and switch to the latest released version |
 | `claude2kiro agents [session]` | Per-subagent stats (turns, ingested tokens, throughput) from local Claude Code transcripts |
+| `claude2kiro export [--show-token]` | Print env vars that point a shell at the proxy (proxy key by default; `--show-token` prints the Kiro token) |
 | `claude2kiro logout` | Remove saved credentials |
 | `claude2kiro server [port]` | Run only the headless proxy for advanced/manual setups |
 

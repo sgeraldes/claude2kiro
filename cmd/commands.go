@@ -323,7 +323,8 @@ func ViewTokenCmd() tea.Msg {
 
 // ExportEnvCmd returns the env export line for the TUI. Like `claude2kiro
 // export`, it shows the proxy key, never any part of the Kiro access token:
-// the proxy does not read the client's key.
+// the proxy does not read the client's key. "claude2kiro" is the value of
+// exportProxyAPIKey in package main, which this package cannot import.
 func ExportEnvCmd() tea.Msg {
 	port := config.Get().Server.Port
 	var msg string
