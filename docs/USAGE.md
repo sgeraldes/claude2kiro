@@ -267,12 +267,12 @@ both the way Kiro's own client does:
 The failed call and its tool result go to Kiro only: Claude Code never receives
 them and they are not in its transcript. So that Kiro sees a consistent
 conversation, the proxy keeps that exchange in memory (per conversation, at most
-256 responses, six hours, lost on restart) and puts it back into the history of
+256 responses and 16 MiB, six hours, lost on restart) and puts it back into the history of
 every later request, before the message Claude Code recorded for that response.
 
 | Setting | Values | Effect |
 |---|---|---|
-| `advanced.interrupted_tool_recovery` | bool (default true) | The recovery above. `false`: an interrupted response fails as an error (retryable when streaming). |
+| `advanced.interrupted_tool_recovery` | bool (default true) | The recovery above. `false`: an interrupted response fails as an error. An idle cut or a call cut by the output limit gets an error Claude Code does not resend, since sending it again would end the same way; another broken stream stays retryable. |
 | `network.backend_idle_cut_after` | duration (default `230s`) | Backend silence after which a broken response is reported as Kiro's idle cut in the log and the error. |
 
 The live web dashboard (`claude2kiro credits --web`) charts credit history,
