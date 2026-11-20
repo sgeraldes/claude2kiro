@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -295,24 +296,60 @@ type recoveredExchange struct {
 	LeadTexts []string
 }
 
-// recoveredTurns keeps the exchanges, per conversation, bounded and expiring.
-var recoveredTurns = newRecoveredStore(256, 6*time.Hour)
+// recoveredMaxBytes bounds the bytes of all kept exchanges together. A
+// recovery after MAX_TOKENS keeps the tool input that arrived, which can be as
+// large as the model's output limit.
+const recoveredMaxBytes = 16 << 20
 
-type recoveredEntry struct {
+// recoveredTurns keeps the exchanges, per conversation: at most 256, at most
+// recoveredMaxBytes together, six hours each. Past a bound the oldest go first,
+// as in the reasoning store.
+var recoveredTurns = newRecoveredStore(256, recoveredMaxBytes, 6*time.Hour)
+
+type recoveredItem struct {
+	keys  []string
 	ex    recoveredExchange
+	size  int
 	added time.Time
 }
 
 type recoveredStore struct {
-	mu      sync.Mutex
-	max     int
-	ttl     time.Duration
-	entries map[string]recoveredEntry
-	now     func() time.Time
+	mu       sync.Mutex
+	max      int
+	maxBytes int
+	ttl      time.Duration
+	used     int
+	order    *list.List // *recoveredItem, newest at the front
+	byKey    map[string]*list.Element
+	now      func() time.Time
 }
 
-func newRecoveredStore(max int, ttl time.Duration) *recoveredStore {
-	return &recoveredStore{max: max, ttl: ttl, entries: map[string]recoveredEntry{}, now: time.Now}
+func newRecoveredStore(max, maxBytes int, ttl time.Duration) *recoveredStore {
+	return &recoveredStore{max: max, maxBytes: maxBytes, ttl: ttl, order: list.New(), byKey: map[string]*list.Element{}, now: time.Now}
+}
+
+// size is what an exchange holds in memory, near enough: its turns as JSON
+// and its texts.
+func (ex recoveredExchange) size() int {
+	n := 0
+	if raw, err := json.Marshal(ex.Turns); err == nil {
+		n += len(raw)
+	}
+	for _, t := range ex.LeadTexts {
+		n += len(t)
+	}
+	return n
+}
+
+func (s *recoveredStore) remove(el *list.Element) {
+	it := el.Value.(*recoveredItem)
+	for _, k := range it.keys {
+		if s.byKey[k] == el {
+			delete(s.byKey, k)
+		}
+	}
+	s.used -= it.size
+	s.order.Remove(el)
 }
 
 // recoveryKeys identify the assistant message a client records for a
@@ -334,25 +371,35 @@ func recoveryKeys(scope string, toolIDs []string, text string) []string {
 }
 
 func (s *recoveredStore) put(keys []string, ex recoveredExchange) {
+	if len(keys) == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	for k, e := range s.entries {
-		if now.Sub(e.added) > s.ttl {
-			delete(s.entries, k)
+	for el := s.order.Back(); el != nil; {
+		prev := el.Prev()
+		if now.Sub(el.Value.(*recoveredItem).added) > s.ttl {
+			s.remove(el)
 		}
+		el = prev
 	}
 	for _, k := range keys {
-		s.entries[k] = recoveredEntry{ex: ex, added: now}
-	}
-	for len(s.entries) > s.max {
-		oldestKey, oldest := "", now
-		for k, e := range s.entries {
-			if oldestKey == "" || e.added.Before(oldest) {
-				oldestKey, oldest = k, e.added
-			}
+		if el, ok := s.byKey[k]; ok {
+			s.remove(el)
 		}
-		delete(s.entries, oldestKey)
+	}
+	size := ex.size()
+	if size > s.maxBytes {
+		return
+	}
+	el := s.order.PushFront(&recoveredItem{keys: append([]string(nil), keys...), ex: ex, size: size, added: now})
+	for _, k := range keys {
+		s.byKey[k] = el
+	}
+	s.used += size
+	for s.used > s.maxBytes || s.order.Len() > s.max {
+		s.remove(s.order.Back())
 	}
 }
 
@@ -360,17 +407,28 @@ func (s *recoveredStore) get(keys []string) (recoveredExchange, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, k := range keys {
-		if e, ok := s.entries[k]; ok && s.now().Sub(e.added) <= s.ttl {
-			return e.ex, true
+		if el, ok := s.byKey[k]; ok {
+			it := el.Value.(*recoveredItem)
+			if s.now().Sub(it.added) <= s.ttl {
+				return it.ex, true
+			}
 		}
 	}
 	return recoveredExchange{}, false
 }
 
+// len is the number of exchanges kept, expired ones included.
 func (s *recoveredStore) len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.entries)
+	return s.order.Len()
+}
+
+// bytes is the size of all exchanges kept.
+func (s *recoveredStore) bytes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.used
 }
 
 // recoveryScope is the store scope of req's conversation (as the reasoning
@@ -487,6 +545,9 @@ func interruptionKind(readErr error, silence, idleCutAfter time.Duration, tr *pa
 	if errors.Is(readErr, io.ErrUnexpectedEOF) && !isBackendIdleCut(readErr, silence, idleCutAfter) {
 		return interruptNone
 	}
+	// Any other read error counts, whatever the silence before it: Kiro's
+	// client recovers every transient error and connection reset the same
+	// way, and the failed result is true (the client never got the call).
 	if em.toolSeen() {
 		return interruptTool
 	}
@@ -593,4 +654,13 @@ func sendRecoveryRequest(ctx context.Context, cfg *config.Config, token TokenDat
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 	return resp, nil
+}
+
+// shortID is the first eight bytes of a conversation id, for the log, or the
+// whole id when it is shorter.
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }

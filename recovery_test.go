@@ -42,7 +42,7 @@ func withRecovery(t *testing.T, on bool) {
 func withRecoveredStore(t *testing.T) {
 	t.Helper()
 	orig := recoveredTurns
-	recoveredTurns = newRecoveredStore(256, 6*time.Hour)
+	recoveredTurns = newRecoveredStore(256, recoveredMaxBytes, 6*time.Hour)
 	t.Cleanup(func() { recoveredTurns = orig })
 }
 
@@ -380,8 +380,8 @@ func TestStreamRecoveryStopsAfterThree(t *testing.T) {
 	}
 }
 
-// With the switch off the interrupted response fails as before: retryable,
-// no recovery request.
+// With the switch off an idle-cut response fails at once, as an error the
+// client does not resend, and no recovery request goes out.
 func TestStreamRecoveryOffFails(t *testing.T) {
 	withRecoveredStore(t)
 	log := &bodyLog{}
@@ -395,7 +395,11 @@ func TestStreamRecoveryOffFails(t *testing.T) {
 	if *n != 1 {
 		t.Fatalf("backend saw %d requests, want 1", *n)
 	}
-	assertStreamFailed(t, body)
+	// An idle cut would only be cut again if resent: not retryable, with the
+	// same message as the non-streaming path.
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, `"invalid_request_error"`) || !strings.Contains(body, "240 s") {
+		t.Fatalf("want a non-retryable idle cut error; body: %s", body)
+	}
 	if e := linesOf(lg, logger.LogTypeErr); !strings.Contains(e, "path 3") || !strings.Contains(e, "recovery is off") {
 		t.Fatalf("want an ERR line for path 3; got: %s", e)
 	}
@@ -481,7 +485,7 @@ func TestNonStreamRecoveryStopsAfterThree(t *testing.T) {
 // The store forgets entries after their expiry and keeps at most max.
 func TestRecoveredStoreExpiresAndIsBounded(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
-	s := newRecoveredStore(2, time.Hour)
+	s := newRecoveredStore(2, 1<<20, time.Hour)
 	s.now = func() time.Time { return now }
 	ex := recoveredExchange{LeadTexts: []string{"x"}}
 	s.put([]string{"a"}, ex)
@@ -514,5 +518,159 @@ func TestIdleCutFileWriteGetsTheSplitGuidanceWithLittleInput(t *testing.T) {
 	}
 	if other := interruptedResultText(&heldTool{name: "Bash"}, false, true); other != interruptedGenericResult {
 		t.Fatalf("a tool that is not a file write keeps the generic text, got %s", other)
+	}
+}
+
+// Entries are bounded by total bytes too: the oldest go first, and an entry
+// larger than the whole bound is not kept.
+func TestRecoveredStoreIsBoundedByBytes(t *testing.T) {
+	big := func(n int) recoveredExchange {
+		return recoveredExchange{LeadTexts: []string{strings.Repeat("x", n)}}
+	}
+	s := newRecoveredStore(100, 1000, time.Hour)
+	s.put([]string{"a"}, big(400))
+	s.put([]string{"b"}, big(400))
+	s.put([]string{"c"}, big(400))
+	if _, ok := s.get([]string{"a"}); ok {
+		t.Fatal("the oldest entry must go when the bytes are over the bound")
+	}
+	if _, ok := s.get([]string{"c"}); !ok {
+		t.Fatal("the newest entry must stay")
+	}
+	if s.bytes() > 1000 {
+		t.Fatalf("store holds %d bytes, bound 1000", s.bytes())
+	}
+	s.put([]string{"d"}, big(5000))
+	if _, ok := s.get([]string{"d"}); ok {
+		t.Fatal("an entry larger than the bound must not be kept")
+	}
+}
+
+// Short conversation ids are logged whole instead of panicking.
+func TestShortIDNeverPanics(t *testing.T) {
+	for in, want := range map[string]string{"": "", "abc": "abc", "1234567890": "12345678"} {
+		if got := shortID(in); got != want {
+			t.Fatalf("shortID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Non-streaming: the text of an interrupted attempt stays its own block, so
+// the next request's history carries it once (in the hidden turn), not twice.
+func TestNonStreamRecoveredTextAppearsOnceInTheNextHistory(t *testing.T) {
+	withRecoveredStore(t)
+	log := &bodyLog{}
+	next := answerWith(`{"content":"Writing it in parts."}`,
+		`{"name":"Write","toolUseId":"tu_part1","input":"{\"file_path\": \"big.html\", \"content\": \"<html>\"}"}`,
+		`{"name":"Write","toolUseId":"tu_part1","stop":true}`,
+		`{"stopReason":"TOOL_USE"}`)
+	backend, _ := stepBackend(log, cutAfter(frameText, frameToolStart), next, writtenAnswer)
+	streamTestSetup(t, backend)
+	withRecovery(t, true)
+	lg := logger.NewLogger(100)
+
+	rec := httptest.NewRecorder()
+	handleNonStreamRequest(rec, testRequest(), lg, "sess", "req")
+	var answer struct {
+		Content []map[string]any `json:"content"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("answer is not JSON: %v %s", err, rec.Body.String())
+	}
+	var texts []string
+	for _, b := range answer.Content {
+		if b["type"] == "text" {
+			texts = append(texts, b["text"].(string))
+		}
+	}
+	if len(texts) != 2 || texts[0] != "Here is the plan. " || texts[1] != "Writing it in parts." {
+		t.Fatalf("each attempt's text must be its own block, got %q", texts)
+	}
+
+	// Claude Code records the answer as it came and sends it back.
+	followUp := testRequest()
+	followUp.Messages = append(followUp.Messages,
+		AnthropicRequestMessage{Role: "assistant", Content: toAnySlice(answer.Content)},
+		AnthropicRequestMessage{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_part1", "content": "File created successfully"},
+		}})
+	runNonStream(t, followUp, lg)
+	third := log.all()[2]
+	assertWellFormed(t, decodeCW(t, third))
+	if strings.Count(third, "Here is the plan.") != 1 {
+		t.Fatalf("the first text must appear once in the next request:\n%s", third)
+	}
+}
+
+func toAnySlice(blocks []map[string]any) []any {
+	out := make([]any, len(blocks))
+	for i, b := range blocks {
+		out[i] = b
+	}
+	return out
+}
+
+// A text-only recovery (continue after the text already sent) keeps the
+// model's reasoning: the turn the reasoning was stored under at the end of the
+// recovered response is the turn the next request gives it back on.
+func TestReasoningOfATextOnlyRecoveryIsGivenBack(t *testing.T) {
+	withRecoveredStore(t)
+	withReasoningStore(t)
+	log := &bodyLog{}
+	finalAnswer := answerWith(`{"text":"I will finish the summary."}`, `{"signature":"SIG-TEXT"}`,
+		`{"content":"Summary done."}`, `{"stopReason":"END_TURN","modelId":"claude-sonnet-4.6"}`)
+	backend, _ := stepBackend(log, cutAfter(frameText), finalAnswer, writtenAnswer)
+	reasoningHandlerSetup(t, backend)
+	withRecovery(t, true)
+	lg := logger.NewLogger(100)
+	session := map[string]any{"user_id": `{"session_id":"sess-text-recovery"}`}
+
+	first := AnthropicRequest{Model: reasoningTestModel, MaxTokens: 64, Metadata: session,
+		Messages: []AnthropicRequestMessage{{Role: "user", Content: "summarize the file"}}}
+	body := runStream(t, first, lg)
+	assertStreamEndedCleanly(t, body, "end_turn")
+
+	next := first
+	next.Messages = append(append([]AnthropicRequestMessage(nil), first.Messages...),
+		AnthropicRequestMessage{Role: "assistant", Content: []any{
+			map[string]any{"type": "text", "text": "Here is the plan. "},
+			map[string]any{"type": "text", "text": "Summary done."},
+		}},
+		AnthropicRequestMessage{Role: "user", Content: "thanks, go on"})
+	runStream(t, next, lg)
+	third := log.all()[2]
+	if !strings.Contains(third, "SIG-TEXT") {
+		t.Fatalf("the reasoning of the recovered turn must be given back:\n%s", third)
+	}
+	if strings.Count(third, "Here is the plan.") != 1 {
+		t.Fatalf("the first text must appear once:\n%s", third)
+	}
+}
+
+// The credits of every attempt of a recovered stream are logged, not only the
+// last one's.
+func TestStreamRecoveryLogsTheCreditsOfEveryAttempt(t *testing.T) {
+	withRecoveredStore(t)
+	log := &bodyLog{}
+	metered := func(credits string) string {
+		return `{"unit":"credit","unitPlural":"credits","usage":` + credits + `}`
+	}
+	backend, _ := stepBackend(log,
+		answerWith(frameToolStart, `{"stopReason":"MAX_TOKENS"}`, metered("1.5")),
+		answerWith(`{"content":"The file is written."}`, `{"stopReason":"END_TURN"}`, metered("0.25")))
+	streamTestSetup(t, backend)
+	withRecovery(t, true)
+	lg := logger.NewLogger(100)
+
+	runStream(t, testRequest(), lg)
+
+	var lines []string
+	for _, e := range lg.GetEntries() {
+		if strings.HasPrefix(e.Body, "Kiro metering") {
+			lines = append(lines, e.Body)
+		}
+	}
+	if len(lines) != 2 || !strings.Contains(lines[0], "1.5") || !strings.Contains(lines[1], "0.25") {
+		t.Fatalf("want one metering line per attempt (1.5, then 0.25), got %q", lines)
 	}
 }

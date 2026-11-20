@@ -4796,7 +4796,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			return false
 		}
 		lg.LogInfo(fmt.Sprintf("Client disconnected %s convId=%s after %s — backend request cancelled",
-			stage, cwReq.ConversationState.ConversationId[:8], time.Since(queuedAt).Round(time.Millisecond)))
+			stage, shortID(cwReq.ConversationState.ConversationId), time.Since(queuedAt).Round(time.Millisecond)))
 		return true
 	}
 	if !kiroSema.acquireCtx(ctx) {
@@ -4899,12 +4899,12 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 				if ferr == nil {
 					ferr = fmt.Errorf("identity switches exhausted after %d", switches)
 				}
-				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel(), reason, ferr))
+				lg.LogError(fmt.Sprintf("Credits exhausted convId=%s identity=%s reason=%s: %v", shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel(), reason, ferr))
 				sendNonRetryableErrorEvent(w, flusher, quotaExhaustedMessage(reason, ferr))
 				return ""
 			}
 			switches++
-			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+			lg.LogInfo(fmt.Sprintf("Credits exhausted (%s) convId=%s — switched to identity %s, retrying transparently", reason, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 			if err := adopt(fallback, next); err != nil {
 				sendErrorEvent(w, flusher, "Failed to serialize request", err)
 				return ""
@@ -4929,7 +4929,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			}
 			cwReqBody = stripped
 			lg.LogInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
-				cwReq.ConversationState.ConversationId[:8], turns, size))
+				shortID(cwReq.ConversationState.ConversationId), turns, size))
 			attempt--
 			skipBackoff = true
 			continue
@@ -4964,7 +4964,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			// an identity switch, not a transient retry, so it costs no attempt.
 			if tok, id, terr := tokenForRequest(); terr == nil {
 				switches++
-				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+				lg.LogInfo(fmt.Sprintf("403 from identity %s after failover convId=%s — retrying with identity %s", ident.Name, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 				if err := adopt(tok, id); err != nil {
 					sendErrorEvent(w, flusher, "Failed to serialize request", err)
 					return ""
@@ -4978,7 +4978,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			tok, id, moved, rerr := recoverFromInvalidBearer(ident, token, refreshedFor, switches < maxSwitches)
 			if rerr != nil {
 				lastRecoverErr = rerr
-				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", cwReq.ConversationState.ConversationId[:8], rerr))
+				lg.LogError(fmt.Sprintf("Token refresh on 403 failed convId=%s: %v", shortID(cwReq.ConversationState.ConversationId), rerr))
 				// Fall through to the terminal 403 handler, which surfaces a
 				// clear "refresh failed, please re-login" to the client.
 			} else {
@@ -4990,9 +4990,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 					switches++
 					attempt--
 					skipBackoff = true
-					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, cwReq.ConversationState.ConversationId[:8], profile.ActiveLabel()))
+					lg.LogInfo(fmt.Sprintf("Bearer of identity %s rejected convId=%s — moved to identity %s, retrying transparently", ident.Name, shortID(cwReq.ConversationState.ConversationId), profile.ActiveLabel()))
 				} else {
-					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", cwReq.ConversationState.ConversationId[:8]))
+					lg.LogInfo(fmt.Sprintf("Token refreshed after 403 convId=%s — retrying transparently", shortID(cwReq.ConversationState.ConversationId)))
 				}
 				continue
 			}
@@ -5000,9 +5000,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 
 		if attempt < maxAttempts-1 && (overloaded || (resp.StatusCode == 400 && !contextTooLong && !requestBodyInvalid && !invalidModel && !signatureInvalid)) {
 			if overloaded {
-				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, cwReq.ConversationState.ConversationId[:8], attempt+1, maxAttempts, strings.TrimSpace(string(body))))
+				lg.LogInfo(fmt.Sprintf("Backend overloaded status=%d convId=%s attempt=%d/%d — backing off: %s", resp.StatusCode, shortID(cwReq.ConversationState.ConversationId), attempt+1, maxAttempts, strings.TrimSpace(string(body))))
 			} else {
-				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", cwReq.ConversationState.ConversationId[:8], attempt+1, len(cwReqBody), string(body)))
+				lg.LogInfo(fmt.Sprintf("400 error convId=%s attempt=%d reqSize=%d: %s", shortID(cwReq.ConversationState.ConversationId), attempt+1, len(cwReqBody), string(body)))
 			}
 			continue
 		}
@@ -5011,7 +5011,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		if cfg.Advanced.DebugMode {
 			debug.WriteDebugFileWithScrub("cw-FAILED", cwReqBody)
 		}
-		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", cwReq.ConversationState.ConversationId[:8], resp.StatusCode, string(body)))
+		lg.LogError(fmt.Sprintf("FINAL ERROR convId=%s status=%d: %s", shortID(cwReq.ConversationState.ConversationId), resp.StatusCode, string(body)))
 
 		if resp.StatusCode == 403 && isInvalidBearerToken(body) {
 			switch {
@@ -5066,7 +5066,12 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	}
 	// resp changes when an interrupted response is recovered; close whichever
 	// is current.
-	defer func() { resp.Body.Close() }()
+	// resp is nil while a recovery request is out, so the body is closed once.
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
 
 	// Forward the response as it arrives: each backend frame is translated and
 	// sent before the next one is read, except tool calls, which are held
@@ -5137,11 +5142,22 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 		}
 	}
 	emitter := newBlockEmitter(forward)
+	// logMetering logs the credits of the attempt in rawResp; every attempt of
+	// a recovered response is logged, as without streaming.
+	logMetering := func() {
+		if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(rawResp.Bytes())); usageMsg != "" {
+			if cfg.Advanced.ComparisonMode {
+				lg.LogComparison(sessionID, requestID, usageMsg)
+			} else {
+				lg.LogInfo(usageMsg)
+			}
+		}
+	}
 
 	// The request as Kiro saw it; recoveries extend it.
 	currentReq := anthropicReq
 	var hidden recoveredExchange
-	convID := cwReq.ConversationState.ConversationId[:8]
+	convID := shortID(cwReq.ConversationState.ConversationId)
 	var readErr error
 	var silence time.Duration // how long the backend had been silent when the read failed
 	for recoveries := 0; ; {
@@ -5184,7 +5200,9 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			}
 			lg.LogError(fmt.Sprintf("Interrupted response convId=%s (%s), backend silent %s, %s since sent, after %d events - path 3, %s: failing the response: %v",
 				convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount, why, readErr))
-			if kind == interruptTruncated || recoveries >= maxRecoveries {
+			if kind == interruptTruncated || recoveries >= maxRecoveries || isBackendIdleCut(readErr, silence, cfg.Network.BackendIdleCutAfter) {
+				// Resending as it is cannot help (an idle cut is cut again):
+				// an error the client does not resend, as without streaming.
 				sendNonRetryableErrorEvent(w, flusher, interruptionErrorMessage(kind, silence, recoveries))
 			} else {
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("CodeWhisperer Error: the response was interrupted (%s): %v", cause, readErr))
@@ -5220,6 +5238,8 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 			convID, cause, silence.Round(time.Millisecond), time.Since(sentAt).Round(time.Millisecond), eventCount,
 			recoveryPath(kind, text), recoveries, maxRecoveries, what))
 		resp.Body.Close()
+		resp = nil
+		logMetering()
 		sentAt = time.Now()
 		next, err := sendRecoveryRequest(ctx, cfg, token, cwReqBody)
 		if err != nil {
@@ -5248,13 +5268,7 @@ func handleStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthropi
 	if cfg.Advanced.DebugMode {
 		debug.WriteDebugFile("cw-response", rawResp.Bytes())
 	}
-	if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(rawResp.Bytes())); usageMsg != "" {
-		if cfg.Advanced.ComparisonMode {
-			lg.LogComparison(sessionID, requestID, usageMsg)
-		} else {
-			lg.LogInfo(usageMsg)
-		}
-	}
+	logMetering()
 
 	if clientGone("mid-response") {
 		return responseText.String()
@@ -7714,7 +7728,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 				break
 			}
 			logError(fmt.Sprintf("CodeWhisperer response read failed (non-stream) convId=%s status=%d after %d bytes, %s since sent, backend silent %s: %v",
-				cwReq.ConversationState.ConversationId[:8], resp.StatusCode, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
+				shortID(cwReq.ConversationState.ConversationId), resp.StatusCode, len(cwRespBody), time.Since(sentAt).Round(time.Millisecond), silence.Round(time.Millisecond), err))
 			return writeNonStreamError(w, lg, http.StatusInternalServerError, "api_error",
 				fmt.Sprintf("CodeWhisperer Error: the response ended before it was complete: %v", err))
 		}
@@ -7726,7 +7740,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 			turns, size := cwReq.reasoning.turns, cwReq.reasoning.bytes
 			reasoningStore.Evict(cwReq.stripReasoning()...)
 			logInfo(fmt.Sprintf("THINKING_SIGNATURE_INVALID (non-stream) convId=%s — resending once without the reasoning of %d turns (%d bytes); those turns are forgotten",
-				cwReq.ConversationState.ConversationId[:8], turns, size))
+				shortID(cwReq.ConversationState.ConversationId), turns, size))
 			if err := adopt(token, ident); err != nil {
 				http.Error(w, fmt.Sprintf("Failed to rebuild request: %v", err), http.StatusInternalServerError)
 				return http.StatusInternalServerError
@@ -7842,7 +7856,7 @@ func handleNonStreamRequestCtx(ctx context.Context, w http.ResponseWriter, anthr
 	var hidden recoveredExchange
 	var finalTools []*heldTool
 	var allText strings.Builder
-	convID := cwReq.ConversationState.ConversationId[:8]
+	convID := shortID(cwReq.ConversationState.ConversationId)
 	for recoveries := 0; ; {
 		if usageMsg := formatMeteringUsage(parser.ParseMeteringEvents(cwRespBody)); usageMsg != "" && lg != nil {
 			lg.LogInfo(fmt.Sprintf("%s [%s:%s]", usageMsg, sessionID, requestID))
@@ -8061,6 +8075,10 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 	}
 	var order []pending
 	toolsByIndex := map[any]*toolBlock{}
+	// A text block keeps its own text: an answer recovered after an
+	// interruption has one text block per attempt (recovery.go), and the
+	// history of later requests relies on finding the first one whole.
+	textByIndex := map[any]*strings.Builder{}
 	appendText := func(text string) {
 		outputChars += len(text)
 		if n := len(order); n > 0 && order[n-1].text != nil {
@@ -8080,6 +8098,12 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 		switch event.Event {
 		case "content_block_start":
 			cb, ok := dataMap["content_block"].(map[string]any)
+			if ok && cb["type"] == "text" {
+				b := &strings.Builder{}
+				textByIndex[dataMap["index"]] = b
+				order = append(order, pending{text: b})
+				continue
+			}
 			if !ok || cb["type"] != "tool_use" {
 				continue
 			}
@@ -8091,7 +8115,12 @@ func nonStreamContentBlocks(events []parser.SSEEvent) (blocks []map[string]any, 
 				switch delta["type"] {
 				case "text_delta":
 					if text, ok := delta["text"].(string); ok {
-						appendText(text)
+						if b := textByIndex[dataMap["index"]]; b != nil {
+							outputChars += len(text)
+							b.WriteString(text)
+						} else {
+							appendText(text)
+						}
 					}
 				case "input_json_delta":
 					if pj, ok := delta["partial_json"].(string); ok {
