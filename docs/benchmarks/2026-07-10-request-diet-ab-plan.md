@@ -48,7 +48,7 @@ Both tests restore the global config when they end. Run them with:
 
 On 2026-11-20 (v1.11.0) the gate logged: control 239,734 bytes and 57 history entries; candidate 131,530 bytes (45.1% less) and 35 entries; aggressive cache points 140,614 bytes with 43 tool definitions and 42 cache points.
 
-`recent` history saves less than its name suggests on a tool-heavy session. A kept user message that carries a tool result needs its assistant turn, and that turn needs the user message before it, which answers the turn before. In the fixture every user turn answers the previous one, so the candidate keeps all 14 tool turns and drops only the injected system messages. Most of the 45% comes from compact tool descriptions.
+`recent` history saves less than its name suggests on a tool-heavy session. A kept user message that carries a tool result needs its assistant turn, and that turn needs the user message before it, which answers the turn before. In the fixture every user turn answers the previous one, so the candidate keeps all 14 tool turns. It drops only the injected system messages outside the window and the filler assistant turns the translator puts after each of them. Measured on the same fixture, compact tool descriptions alone save 44.1% and recent history alone 1.0%.
 
 The replay proves translation correctness and wire size only. It says nothing about credits, latency, tool choice or answer quality.
 
